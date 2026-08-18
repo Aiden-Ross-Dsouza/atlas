@@ -9,7 +9,6 @@ from atlas.stats import normalised_recovery, paired_bootstrap, success_rate_ci
 
 def test_normalised_recovery_basic():
     nr = normalised_recovery(sr_fit=0.7, sr_oracle=0.9, sr_random=0.5)
-    assert abs(nr - 1.0) < 1e-6  # (0.7-0.5)/(0.9-0.5) = 0.5/0.4 = ... wait
     # (0.7 - 0.5) / (0.9 - 0.5) = 0.2 / 0.4 = 0.5
     assert abs(nr - 0.5) < 1e-6
 

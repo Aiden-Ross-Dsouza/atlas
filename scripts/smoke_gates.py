@@ -205,18 +205,6 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    import torch
-    print("Loading dino_wm_pusht...")
-    model, prep = torch.hub.load(
-        "facebookresearch/jepa-wms", "dino_wm_pusht",
-        force_reload=False, trust_repo=True,
-    )
-    predictor = model.predictor
-    encoder = model.encoder
-    for p in encoder.parameters():
-        p.requires_grad_(False)
-
     run = args.gate
     run_all = args.all
 
@@ -230,9 +218,23 @@ def main() -> None:
                 print(f"  ✗ {e}")
                 failed.append(name)
 
-    run_gate("G2", gate_g2, predictor, encoder)
+    # G5 does not require loading the model checkpoint
     run_gate("G5", gate_g5)
-    run_gate("G6", gate_g6, predictor)
+
+    if run_all or run in ("G2", "G6"):
+        import torch
+        print("Loading dino_wm_pusht...")
+        model, prep = torch.hub.load(
+            "facebookresearch/jepa-wms", "dino_wm_pusht",
+            force_reload=False, trust_repo=True,
+        )
+        predictor = model.predictor
+        encoder = model.encoder
+        for p in encoder.parameters():
+            p.requires_grad_(False)
+
+        run_gate("G2", gate_g2, predictor, encoder)
+        run_gate("G6", gate_g6, predictor)
 
     if run_all or run in ("G1", "G4"):
         print("\nNote: G1 and G4 require a running Push-T environment.")
