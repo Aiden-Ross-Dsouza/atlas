@@ -1,0 +1,16 @@
+# E1 — Fitness routing experiment config
+defaults:
+  - default
+
+e1:
+  # Charts loaded from E0 output; chart kind determined by E0 pass criterion.
+  routers: [umf, e1, sdyn, random, oracle_id]
+  n_warmup_replans: 2
+  episodes: 60
+  seeds: 3
+  regimes: [R1]         # routing between R0 and R1
+  # Pre-registered pass criterion:
+  # normalised_recovery(UMF) >= 0.80, reported only when oracle-random >= 10 pp
+  pass_normalised_recovery: 0.80
+  pass_min_spread: 0.10
+  out_subdir: e1

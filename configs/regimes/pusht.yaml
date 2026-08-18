@@ -1,0 +1,25 @@
+# Push-T physics regime configurations
+# Values are exact as specified in implementation plan §6.1
+
+regimes:
+  R0:
+    description: "Default Push-T — shipped parameters, no modifications"
+    physics: {}
+
+  R1:
+    description: "Light block — T-block mass × 0.2 (gain-like shift)"
+    physics:
+      mass_scale: 0.2      # applied to both body.mass and body.moment
+
+  R2:
+    description: >
+      High damping — space.damping = 0.3 (contact-like shift).
+      NOTE: pymunk damping is a per-second RETENTION factor (1.0 = no damping).
+      Decreasing it (0.9 → 0.3) INCREASES damping. Get the sign right.
+    physics:
+      damping: 0.3
+
+# Which regimes are used in each experiment:
+#   E0: R1, R2  (two regimes to test adapter capacity on two shift kinds)
+#   S2: R0, R1  (alternating stream for E4/E3)
+#   E2: see e2.yaml  (2×2 cells combining regimes and corruptions)

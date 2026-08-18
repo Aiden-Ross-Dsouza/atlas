@@ -1,0 +1,176 @@
+"""
+chart.py — Chart: a small persistent adapter on the frozen JEPA predictor.
+
+Three kinds (E0 picks one):
+  ln_act  — LN affine parameters + action encoder  (~10.4 k params)
+  lora4   — LoRA r=4 on attention qkv + proj       (~55 k params)
+  full    — all predictor parameters               (~1.8 M params)
+
+API:
+  chart.apply_(predictor)    — swap chart params into predictor in-place
+  chart.restore_(predictor)  — swap original params back
+  chart.clone()              — deep copy; starts with the SAME weights (identity)
+  chart.save(path)           — save to disk
+  Chart.load(path, predictor, kind) — restore from disk
+  chart.n_params()           — count trainable parameters
+
+Non-negotiables enforced here:
+  1. Identity initialisation: clones start with pretrained weights (LoRA B=0).
+  2. apply/restore rather than model copies: only ~10–55 k floats swapped.
+  3. Charts are DISJOINT parameter sets — updating one chart cannot touch another.
+"""
+
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+from typing import Literal
+
+import torch
+import torch.nn as nn
+
+
+ChartKind = Literal["ln_act", "lora4", "full"]
+
+
+class Chart:
+    """
+    A persistent adapter for the JEPA predictor.
+
+    Stores a dict mapping parameter names → tensors (the chart's values).
+    The predictor's own parameters are the "baseline" that gets swapped out.
+    """
+
+    KINDS = ("ln_act", "lora4", "full")
+
+    def __init__(self, predictor: nn.Module, kind: ChartKind = "ln_act") -> None:
+        if kind not in self.KINDS:
+            raise ValueError(f"kind must be one of {self.KINDS}, got {kind!r}")
+        self.kind = kind
+        self._param_names: list[str] = _select_param_names(predictor, kind)
+        if not self._param_names:
+            raise RuntimeError(
+                f"No parameters selected for kind={kind!r}. "
+                "Check that the predictor checkpoint matches the expected architecture. "
+                "Run `scripts/dump_params.py` to inspect available parameter names."
+            )
+        # Copy current predictor weights as the chart's initial state.
+        self._params: dict[str, torch.Tensor] = {
+            n: p.data.clone() for n, p in predictor.named_parameters() if n in self._param_names
+        }
+        # For LoRA: inject the adapters if not already present.
+        if kind == "lora4":
+            _inject_lora(predictor, self._param_names, self._params)
+
+    # ── Swap interface ────────────────────────────────────────────────────────
+
+    def apply_(self, predictor: nn.Module) -> None:
+        """Swap this chart's parameters INTO the predictor in-place."""
+        state = dict(predictor.named_parameters())
+        for name, value in self._params.items():
+            if name not in state:
+                raise KeyError(
+                    f"Chart parameter {name!r} not found in predictor. "
+                    "Was the predictor modified after this chart was created?"
+                )
+            state[name].data.copy_(value)
+
+    def restore_(self, predictor: nn.Module) -> None:
+        """Swap THIS chart's parameters back into the predictor in-place.
+
+        Typical usage pattern:
+            c_star.apply_(predictor)       # apply selected chart
+            ... forward pass ...
+            c0.restore_(predictor)         # restore to identity baseline
+        """
+        self.apply_(predictor)  # restoring = applying this chart's own params
+
+    # ── Clone / persistence ───────────────────────────────────────────────────
+
+    def clone(self) -> "Chart":
+        """Return a deep copy with identical weights (identity initialisation)."""
+        new = object.__new__(Chart)
+        new.kind = self.kind
+        new._param_names = list(self._param_names)
+        new._params = {k: v.clone() for k, v in self._params.items()}
+        return new
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"kind": self.kind, "params": self._params}, path)
+
+    @classmethod
+    def load(cls, path: str | Path, predictor: nn.Module) -> "Chart":
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Chart file not found: {path}")
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        kind = data["kind"]
+        chart = object.__new__(cls)
+        chart.kind = kind
+        chart._param_names = list(data["params"].keys())
+        chart._params = data["params"]
+        return chart
+
+    def n_params(self) -> int:
+        return sum(v.numel() for v in self._params.values())
+
+    def update_from_predictor_(self, predictor: nn.Module) -> None:
+        """Pull current predictor weights back into the chart (after refinement)."""
+        state = dict(predictor.named_parameters())
+        for name in self._param_names:
+            self._params[name] = state[name].data.clone()
+
+    def __repr__(self) -> str:
+        return f"Chart(kind={self.kind!r}, n_params={self.n_params():,})"
+
+
+# ── Parameter selection ────────────────────────────────────────────────────────
+
+def _select_param_names(predictor: nn.Module, kind: ChartKind) -> list[str]:
+    """Return parameter names to include in a chart of the given kind."""
+    names = []
+    for n, p in predictor.named_parameters():
+        if kind == "full":
+            names.append(n)
+        elif kind == "ln_act":
+            # LN affine: 1-D tensors belonging to norm layers.
+            # Action encoder: anything whose module path includes 'action'.
+            is_ln_affine = (p.ndim == 1) and ("norm" in n or "ln" in n)
+            is_action = "action" in n
+            if is_ln_affine or is_action:
+                names.append(n)
+        elif kind == "lora4":
+            # LoRA adapters are injected separately; here we select the base
+            # qkv/proj weights that will be (additively) modified.
+            if any(k in n for k in ("qkv", "proj", "q_proj", "k_proj", "v_proj", "out_proj")):
+                names.append(n)
+    return names
+
+
+# ── LoRA injection ─────────────────────────────────────────────────────────────
+
+def _inject_lora(
+    predictor: nn.Module,
+    param_names: list[str],
+    chart_params: dict[str, torch.Tensor],
+    rank: int = 4,
+) -> None:
+    """
+    Inject LoRA A/B adapter tensors into *chart_params* for every selected
+    linear layer.  B is initialised to 0 so the adapter starts identity.
+    The effective weight is  W + B @ A  (applied in apply_()).
+
+    This modifies chart_params in-place; the predictor itself is NOT modified
+    (LoRA adapters live only inside the chart).
+    """
+    state = dict(predictor.named_parameters())
+    for name in param_names:
+        W = state[name]
+        out_features, in_features = W.shape[0], W.numel() // W.shape[0]
+        A_key = name + ".lora_A"
+        B_key = name + ".lora_B"
+        # A ~ N(0, 1/r); B = 0  →  B@A = 0 initially.
+        chart_params[A_key] = torch.randn(rank, in_features) / rank
+        chart_params[B_key] = torch.zeros(out_features, rank)

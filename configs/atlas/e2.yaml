@@ -1,0 +1,14 @@
+# E2 — Appearance vs dynamics (2×2) config
+defaults:
+  - default
+
+e2:
+  cells:
+    A: {regime_a: R0, regime_b: R0, corruption_a: none, corruption_b: none}
+    B: {regime_a: R0, regime_b: R1, corruption_a: none, corruption_b: none}
+    C: {regime_a: R0, regime_b: R0, corruption_a: none, corruption_b: colour_change}
+    D: {regime_a: R0, regime_b: R1, corruption_a: none, corruption_b: colour_change}
+  routers: [umf, sdyn]
+  episodes: 40
+  seeds: 3
+  out_subdir: e2

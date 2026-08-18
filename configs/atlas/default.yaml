@@ -1,0 +1,27 @@
+# ATLAS default hyperparameters (implementation plan §7.7)
+# All values are fixed; only the sensitivity run sweeps τ and q.
+
+atlas:
+  tau: 0.5          # UMF adequacy threshold
+  q: 3              # consecutive informative strikes before arming the probe
+  hysteresis: 0.05  # margin m: keep current chart unless beaten by > m
+  n_probe: 20       # gradient steps to fit the expansion candidate
+  k_max: 10         # hard library cap
+  lr: 5e-4          # AdaJEPA learning rate (chart refinement and probe fitting)
+  router: umf       # default router; overridden per-experiment
+
+adajepa:
+  lr: 5e-4
+  buffer_size: 5    # most recent transitions
+  refine_steps: 1   # gradient steps per replan
+
+planner:
+  cem_samples: 200
+  cem_opt_steps: 10
+  horizon: 25
+  executed_actions: 5
+  max_mpc_steps: 30
+
+# Informative-chunk gate computed from training data (10th percentile of displacement)
+# Set to null to disable the gate; it will be computed and cached on first run.
+motion_gate: null

@@ -1,0 +1,14 @@
+# E0 — Adapter capacity experiment config
+defaults:
+  - default
+
+e0:
+  kinds: [ln_act, lora4, full]
+  regimes: [R1, R2]
+  n_steps: 2000
+  lr: 5e-4
+  # Pre-registered pass criterion (implementation plan §7.1):
+  # smallest kind reaching ≥ 90% of full-predictor gain in BOTH UMF reduction
+  # AND success, in BOTH regimes.
+  pass_threshold: 0.90
+  out_subdir: e0

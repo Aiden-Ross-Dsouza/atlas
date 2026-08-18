@@ -1,0 +1,10 @@
+name: atlas
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - ffmpeg=7          # needed by torchcodec / video I/O
+  - pip
+  - pip:
+      - uv             # fast installer — run `uv pip install -e .[dev]` after activation

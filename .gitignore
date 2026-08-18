@@ -1,0 +1,58 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Environments ──────────────────────────────────────────────────────────────
+.venv/
+venv/
+.conda/
+
+# ── uv ────────────────────────────────────────────────────────────────────────
+.uv/
+
+# ── Editors / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── ATLAS local data (ALL large files live here, never in git) ─────────────────
+data/
+ckpts/
+logs/
+atlas_out/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Pytest / coverage ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Secrets / local overrides ────────────────────────────────────────────────
+.env
+.env.*
+
+# ── torch.hub cache (can be large) ───────────────────────────────────────────
+hub/
+
+# ── Project specific / intermediate artifacts ────────────────────────────────
+*.tar
+*.tar.gz
+*.pth
+*.pt
+*.parquet
+*.pdf
+logs/
+ckpts/
+data/
+atlas_out/

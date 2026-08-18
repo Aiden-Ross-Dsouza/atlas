@@ -1,0 +1,24 @@
+# E4 — Continual stream + E3 expansion ablation config
+defaults:
+  - default
+
+e4:
+  stream: s2
+  episodes_per_segment: 20
+  seeds: 3
+  arms:
+    - frozen
+    - adajepa
+    - adajepa_persist
+    - atlas_fixed      # expansion_mode: fixed
+    - atlas_detect     # expansion_mode: detect_only
+    - atlas            # expansion_mode: atlas (full verification)
+    - oracle_id
+  out_subdir: e4
+
+  # Budget calibration (plan §7.0): if > 40 s/episode, cut in this order:
+  # 1. cem_opt_steps: 10 → 6
+  # 2. episodes_per_segment: 20 → 15
+  # 3. max_mpc_steps: 30 → 20
+  # 4. drop atlas_fixed arm
+  # These cuts are applied manually after profiling; do not set auto-cut here.
