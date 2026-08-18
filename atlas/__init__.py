@@ -13,7 +13,13 @@ Import order: this __init__ sets up paths from env vars before anything else.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+# Windows compatibility fallback for Linux-only imports in third-party substrates (e.g. clusterscope/fcntl)
+if sys.platform == "win32" and "fcntl" not in sys.modules:
+    from unittest.mock import MagicMock
+    sys.modules["fcntl"] = MagicMock()
 
 # ── Resolve ATLAS_HOME ────────────────────────────────────────────────────────
 # Load .env if present (not required — contributors can set vars themselves).
