@@ -61,23 +61,31 @@ def download_dataset() -> None:
         return
 
     print(f"Downloading Push-T dataset to {atlas.DATA_DIR}...")
-    # jepa-wms ships a download script; invoke it with the correct destination.
+    # Find jepa-wms download script from installed module or local hub cache.
+    dl_script = None
     try:
-        import jepa_wms  # noqa: F401
+        import jepa_wms
         jepa_wms_root = Path(jepa_wms.__file__).parent.parent
         dl_script = jepa_wms_root / "src" / "scripts" / "download_data.py"
-        if not dl_script.exists():
-            raise FileNotFoundError(f"jepa-wms download script not found at {dl_script}")
-        subprocess.run(
-            [sys.executable, str(dl_script), "--dataset", "pusht",
-             "--out", str(atlas.DATA_DIR)],
-            check=True,
-        )
     except ImportError:
-        raise ImportError(
-            "jepa-wms is not installed. Run: uv pip install -e . "
-            "to install it from pyproject.toml."
+        pass
+
+    if dl_script is None or not dl_script.exists():
+        hub_dl_script = atlas.ATLAS_HOME / "hub" / "hub" / "facebookresearch_jepa-wms_main" / "src" / "scripts" / "download_data.py"
+        if hub_dl_script.exists():
+            dl_script = hub_dl_script
+
+    if dl_script is None or not dl_script.exists():
+        raise FileNotFoundError(
+            "jepa-wms download script not found in environment or local hub cache. "
+            "Please run python scripts/download_data.py after loading the checkpoint."
         )
+
+    subprocess.run(
+        [sys.executable, str(dl_script), "--dataset", "pusht",
+         "--dataset-root", str(atlas.DATA_DIR)],
+        check=True,
+    )
     print(f"  Dataset saved to {atlas.DATA_DIR}")
 
 

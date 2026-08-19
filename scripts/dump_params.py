@@ -20,7 +20,8 @@ def main() -> None:
         "facebookresearch/jepa-wms", "dino_wm_pusht",
         force_reload=False, trust_repo=True,
     )
-    predictor = model.predictor
+    wm = model.model if hasattr(model, "model") else model
+    predictor = wm.predictor
     total = sum(p.numel() for p in predictor.parameters())
     print(f"\nPredictor total params: {total:,}")
 
