@@ -43,7 +43,10 @@ LOGS_DIR: Path   = Path(os.environ.get("JEPAWM_LOGS",  str(ATLAS_HOME / "logs"))
 CKPT_DIR: Path   = Path(os.environ.get("JEPAWM_CKPT",  str(ATLAS_HOME / "ckpts"))).resolve()
 OUT_DIR: Path    = Path(os.environ.get("ATLAS_OUT",    str(ATLAS_HOME / "atlas_out"))).resolve()
 
-# Forward torch.hub cache into the repo so nothing leaks outside.
+# Export environment variables into os.environ for jepa-wms YAML expansion
+os.environ["JEPAWM_DSET"] = str(DATA_DIR)
+os.environ["JEPAWM_LOGS"] = str(LOGS_DIR)
+os.environ["JEPAWM_CKPT"] = str(CKPT_DIR)
 os.environ.setdefault("TORCH_HOME", str(ATLAS_HOME / "hub"))
 
 # Create directories on first import so contributors never hit a FileNotFoundError.

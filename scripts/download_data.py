@@ -34,16 +34,17 @@ def download_checkpoint() -> None:
         force_reload=False,
         trust_repo=True,
     )
-    print(f"  OK — encoder: {type(model.encoder).__name__}, "
-          f"predictor: {type(model.predictor).__name__}")
+    wm = model.model if hasattr(model, "model") else model
+    print(f"  OK — encoder: {type(wm.encoder).__name__}, "
+          f"predictor: {type(wm.predictor).__name__}")
 
     # Save a local copy for faster re-loading without going through TorchHub.
     ckpt_path = atlas.CKPT_DIR / "dino_wm_pusht.pth.tar"
     if not ckpt_path.exists():
         import torch
         torch.save({
-            "encoder": model.encoder.state_dict(),
-            "predictor": model.predictor.state_dict(),
+            "encoder": wm.encoder.state_dict(),
+            "predictor": wm.predictor.state_dict(),
         }, ckpt_path)
         print(f"  Saved local copy: {ckpt_path}")
     else:

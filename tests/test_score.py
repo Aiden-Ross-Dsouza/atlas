@@ -9,14 +9,15 @@ from unittest.mock import MagicMock
 from atlas.score import umf, compute_motion_gate
 
 
-def make_dummy_predictor(output_shape):
-    """A predictor that returns zeros of the specified shape."""
-    predictor = MagicMock()
-    predictor.named_parameters.return_value = []
-    predictor.return_value = torch.zeros(*output_shape).unsqueeze(0)
-    predictor.side_effect = lambda z, a: torch.zeros_like(z)
-    return predictor
-
+def make_dummy_world_model(grid_size):
+    wm = MagicMock()
+    wm.grid_size = grid_size
+    wm.action_dim = 2
+    wm.proprio_encoder = None
+    wm.encode_act.side_effect = lambda a: a
+    wm.forward_pred.side_effect = lambda z, a, p: (z, None, None)
+    wm.predictor = MagicMock()
+    return wm
 
 def make_dummy_chart():
     chart = MagicMock()
@@ -27,51 +28,51 @@ def make_dummy_chart():
 
 
 def test_umf_static_chunk_returns_none():
-    """Static chunk (no motion) → denominator 0 → UMF returns None."""
-    N, D, T = 10, 16, 3
+    """Static chunk (no motion) -> denominator 0 -> UMF returns None."""
+    grid, D, T = 4, 16, 3
+    N = grid * grid
     z0 = torch.randn(N, D)
     encoder_output = z0.unsqueeze(0).expand(T + 1, -1, -1).clone()
     actions = torch.zeros(T, 2)
 
     chart = make_dummy_chart()
-    predictor = MagicMock()
-    predictor.side_effect = lambda z, a: z  # identity predictor
+    wm = make_dummy_world_model(grid)
 
-    result = umf(chart, predictor, encoder_output, actions, motion_gate=None)
+    result = umf(chart, wm, encoder_output, actions, motion_gate=None)
     assert result is None, f"Expected None for static chunk, got {result}"
 
 
 def test_umf_gated_chunk_returns_none():
-    """Chunk below motion_gate → returns None."""
-    N, D, T = 10, 16, 3
+    """Chunk below motion_gate -> returns None."""
+    grid, D, T = 4, 16, 3
+    N = grid * grid
     z0 = torch.randn(N, D)
     z_end = z0 + 0.001  # tiny displacement
     encoder_output = torch.stack([z0] + [z0] * (T - 1) + [z_end])
     actions = torch.zeros(T, 2)
 
     chart = make_dummy_chart()
-    predictor = MagicMock()
-    predictor.side_effect = lambda z, a: z
+    wm = make_dummy_world_model(grid)
 
-    # Gate is larger than the displacement → should be gated.
-    result = umf(chart, predictor, encoder_output, actions, motion_gate=1.0)
+    # Gate is larger than the displacement -> should be gated.
+    result = umf(chart, wm, encoder_output, actions, motion_gate=1.0)
     assert result is None
 
 
 def test_umf_shape_validation():
     """Wrong encoder_output shape raises ValueError."""
     chart = make_dummy_chart()
-    predictor = MagicMock()
+    wm = make_dummy_world_model(4)
     with pytest.raises(ValueError, match="encoder_output must be"):
-        umf(chart, predictor, torch.randn(5, 16), torch.zeros(3, 2))
+        umf(chart, wm, torch.randn(5, 16), torch.zeros(3, 2))
 
 
 def test_umf_frame_count_mismatch():
     """T+1 frame count mismatch raises ValueError."""
     chart = make_dummy_chart()
-    predictor = MagicMock()
+    wm = make_dummy_world_model(4)
     with pytest.raises(ValueError, match="frames"):
-        umf(chart, predictor, torch.randn(5, 10, 16), torch.zeros(3, 2))
+        umf(chart, wm, torch.randn(5, 10, 16), torch.zeros(3, 2))
 
 
 def test_compute_motion_gate_empty():

@@ -28,7 +28,7 @@ RouterKind = Literal["umf", "e1", "sdyn", "random", "oracle_id"]
 def route(
     kind: RouterKind,
     library: Library,
-    predictor,
+    world_model,
     encoder_output: torch.Tensor,
     actions: torch.Tensor,
     current_idx: int,
@@ -44,14 +44,14 @@ def route(
     Args:
         kind:           Which router to use.
         library:        The current chart library.
-        predictor:      Frozen JEPA predictor.
+        world_model:    VideoWM instance (EncPredWM.model from torch.hub).
         encoder_output: Pre-encoded chunk [T+1, N, D].
         actions:        Executed actions [T, action_dim].
         current_idx:    Index of the currently active chart (for hysteresis).
         motion_gate:    Informative-chunk threshold (None = skip gate).
         hysteresis:     Keep current chart unless competitor beats by this margin.
         regime_label:   True regime ID (oracle only).
-        label_to_chart: Map regime_id → chart_idx (oracle only).
+        label_to_chart: Map regime_id -> chart_idx (oracle only).
 
     Returns:
         (selected_idx, info_dict)
@@ -63,7 +63,7 @@ def route(
     if kind == "random":
         return _route_random(library)
 
-    scores = _score_all(kind, library, predictor, encoder_output, actions, motion_gate)
+    scores = _score_all(kind, library, world_model, encoder_output, actions, motion_gate)
 
     # If all scores are None the chunk is uninformative — keep current chart.
     valid = {i: s for i, s in enumerate(scores) if s is not None}
@@ -86,7 +86,7 @@ def route(
 def _score_all(
     kind: RouterKind,
     library: Library,
-    predictor,
+    world_model,
     encoder_output: torch.Tensor,
     actions: torch.Tensor,
     motion_gate: float | None,
@@ -95,11 +95,13 @@ def _score_all(
     scores: list[float | None] = []
     for chart in library:
         if kind == "umf":
-            s = compute_umf(chart, predictor, encoder_output, actions, motion_gate)
+            s = compute_umf(chart, world_model, encoder_output, actions, motion_gate)
         elif kind == "e1":
-            s = _e1_score(chart, predictor, encoder_output, actions, motion_gate)
+            # TODO(E1): update _e1_score to use world_model.forward_pred()
+            s = _e1_score(chart, world_model.predictor, encoder_output, actions, motion_gate)
         elif kind == "sdyn":
-            s = _sdyn_score(chart, predictor, encoder_output, actions, motion_gate)
+            # TODO(E1): update _sdyn_score to use world_model.forward_pred()
+            s = _sdyn_score(chart, world_model.predictor, encoder_output, actions, motion_gate)
         else:
             raise ValueError(f"Unknown router kind: {kind!r}")
         scores.append(s)

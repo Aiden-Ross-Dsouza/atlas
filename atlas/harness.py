@@ -136,7 +136,7 @@ def run_e1_episode(
 
 def build_cross_policy_matrix(
     library: Library,
-    predictor,
+    world_model,
     chunks_per_chart: list[list[dict]],   # chunks_per_chart[j] = chunks from chart j's plans
     motion_gate: float | None,
 ) -> torch.Tensor:
@@ -145,7 +145,7 @@ def build_cross_policy_matrix(
 
     Args:
         library:          Chart library with K charts.
-        predictor:        Frozen JEPA predictor.
+        world_model:      VideoWM instance (EncPredWM.model from torch.hub).
         chunks_per_chart: List of K lists; chunks_per_chart[j] are the encoded
                           chunks collected while chart j was active.
         motion_gate:      Informative-chunk gate.
@@ -163,7 +163,7 @@ def build_cross_policy_matrix(
         for j, chunk_list in enumerate(chunks_per_chart):
             scores = []
             for chunk in chunk_list:
-                s = compute_umf(chart_i, predictor,
+                s = compute_umf(chart_i, world_model,
                                 chunk["encoder_output"], chunk["actions"], motion_gate)
                 if s is not None:
                     scores.append(s)
