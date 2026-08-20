@@ -121,13 +121,14 @@ def run_e0_finetune(
         avg_loss = total_loss.item() / len(trajectories)
         loss_log.append(avg_loss)
 
-        # [WandB Logging] Log to active WandB run if initialized
+        # [WandB Logging] Log step and loss to active WandB run if initialized
         try:
             import wandb
             if wandb.run is not None:
                 wandb.log({
-                    f"e0/{regime}/{kind}/loss": avg_loss,
-                    "e0/step": step + 1,
+                    "step": step + 1,
+                    "loss": avg_loss,
+                    f"loss_{kind}_{regime}": avg_loss,
                     "kind": kind,
                     "regime": regime,
                 })

@@ -125,14 +125,17 @@ def run_e0_remote(kinds: list[str], regimes: list[str], steps: int, use_wandb: b
         # Always commit completed output files to the persistent volume
         volume.commit()
 
-    # Return generated text files back to the local machine
+    # Return generated files (text and binary plots) back to local machine
     results_dir = Path("/root/atlas/atlas_out/e0")
     files = {}
     if results_dir.exists():
-        for p in results_dir.glob("*.json"):
-            files[p.name] = p.read_text(encoding="utf-8")
-        if (results_dir / "results.md").exists():
-            files["results.md"] = (results_dir / "results.md").read_text(encoding="utf-8")
+        for p in results_dir.glob("*"):
+            if p.is_file():
+                if p.suffix in [".json", ".md"]:
+                    files[p.name] = ("text", p.read_text(encoding="utf-8"))
+                elif p.suffix in [".png", ".pdf"]:
+                    import base64
+                    files[p.name] = ("binary", base64.b64encode(p.read_bytes()).decode("ascii"))
     return files
 
 
@@ -140,6 +143,7 @@ def run_e0_remote(kinds: list[str], regimes: list[str], steps: int, use_wandb: b
 def main(steps: int = 2000, wandb: bool = False):
     import os
     import netrc
+    import base64
 
     wandb_key = os.environ.get("WANDB_API_KEY", None)
     if not wandb_key and wandb:
@@ -167,10 +171,16 @@ def main(steps: int = 2000, wandb: bool = False):
     local_out.mkdir(parents=True, exist_ok=True)
     
     if remote_files:
-        for filename, content in remote_files.items():
-            (local_out / filename).write_text(content)
-            print(f"💾 Saved {filename} to {local_out / filename}")
-        print("\n📊 E0 Results (Markdown):")
-        print(remote_files.get("results.md", ""))
+        for filename, (file_type, data) in remote_files.items():
+            out_file = local_out / filename
+            if file_type == "text":
+                out_file.write_text(data, encoding="utf-8")
+            else:
+                out_file.write_bytes(base64.b64decode(data))
+            print(f"💾 Saved {filename} to {out_file}")
+        
+        if "results.md" in remote_files:
+            print("\n📊 E0 Results (Markdown):")
+            print(remote_files["results.md"][1])
     
-    print("✅ Modal E0 run completed successfully!")
+    print("\n✅ Modal E0 run completed successfully!")

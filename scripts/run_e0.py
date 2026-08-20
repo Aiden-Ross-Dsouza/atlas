@@ -100,22 +100,7 @@ def main() -> None:
     parser.add_argument("--wandb-project", type=str, default="atlas-e0", help="WandB project name")
     args = parser.parse_args()
 
-    if args.wandb:
-        try:
-            import wandb
-            wandb.init(
-                project=args.wandb_project,
-                name=f"e0_{'-'.join(args.regimes)}_s{args.steps}",
-                config={
-                    "kinds": args.kinds,
-                    "regimes": args.regimes,
-                    "steps": args.steps,
-                    "lr": args.lr,
-                },
-            )
-            print(f"📊 WandB logging enabled: Project '{args.wandb_project}'", flush=True)
-        except Exception as e:
-            print(f"⚠️ WandB initialization failed ({e}). Continuing run without WandB logging.", flush=True)
+    wandb_group = f"e0_experiment_{int(time.time())}"
 
     print("Loading dino_wm_pusht from local hub...")
     hub_path = str(Path(__file__).parent.parent / "hub" / "hub" / "facebookresearch_jepa-wms_main")
@@ -169,6 +154,28 @@ def main() -> None:
                 print(f"    Done {kind}_{regime} (Cached): Final Loss = {final_loss:.6f}", flush=True)
                 continue
 
+            # Initialize separate WandB run for this fine-tuning session under the shared group
+            if args.wandb:
+                try:
+                    import wandb
+                    wandb.init(
+                        project=args.wandb_project,
+                        group=wandb_group,
+                        name=f"{kind}_{regime}",
+                        reinit=True,
+                        config={
+                            "kind": kind,
+                            "regime": regime,
+                            "steps": args.steps,
+                            "lr": args.lr,
+                        },
+                    )
+                    wandb.define_metric("step")
+                    wandb.define_metric("loss", step_metric="step")
+                    wandb.define_metric(f"loss_{kind}_{regime}", step_metric="step")
+                except Exception as e:
+                    print(f"⚠️ WandB init failed for {kind}_{regime}: {e}", flush=True)
+
             # [Debug print statement] Print fine-tuning start
             print(f"  Fine-tuning {kind} on {regime} ({args.steps} steps)...", flush=True)
             chart = run_e0_finetune(
@@ -180,6 +187,14 @@ def main() -> None:
                 lr=args.lr,
                 out_dir=args.out,
             )
+            
+            if args.wandb:
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.finish()
+                except Exception:
+                    pass
             
             # Compute evaluation metrics (loss & final UMF score on held-out chunk)
             losses = json.loads(loss_file.read_text())
@@ -211,6 +226,56 @@ def main() -> None:
     
     results_md = args.out / "results.md"
     results_md.write_text("\n".join(md_lines))
+
+    # Generate local loss curves plot from saved JSON files
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(7, 4), dpi=300)
+        colors = {
+            "ln_act": "#1f77b4",
+            "lora4": "#ff7f0e",
+            "full": "#2ca02c",
+        }
+        linestyles = {
+            "R1": "-",
+            "R2": "--",
+        }
+
+        for regime in args.regimes:
+            for kind in args.kinds:
+                loss_file = args.out / f"loss_{kind}_{regime}.json"
+                if loss_file.exists():
+                    losses = json.loads(loss_file.read_text())
+                    steps = list(range(1, len(losses) + 1))
+                    plt.plot(
+                        steps,
+                        losses,
+                        label=f"{kind} ({regime})",
+                        color=colors.get(kind, None),
+                        linestyle=linestyles.get(regime, "-"),
+                        alpha=0.85,
+                        linewidth=1.5,
+                    )
+
+        plt.xlabel("Gradient Step (1..2000)")
+        plt.ylabel("Prediction Loss")
+        plt.title("E0 Adapter Capacity: Fine-Tuning Loss Curves")
+        plt.legend(loc="upper right", frameon=True)
+        plt.grid(True, linestyle=":", alpha=0.5)
+        plt.tight_layout()
+
+        plot_png = args.out / "e0_loss_curves.png"
+        plot_pdf = args.out / "e0_loss_curves.pdf"
+        plt.savefig(plot_png)
+        plt.savefig(plot_pdf)
+        plt.close()
+        print(f"  - Loss Plot PNG: {plot_png}")
+        print(f"  - Loss Plot PDF: {plot_pdf}")
+    except Exception as e:
+        print(f"⚠️ Loss plot generation skipped: {e}")
 
     print(f"\n✅ E0 Experiment complete! Results saved to {args.out}")
     print(f"  - Summary JSON : {results_json}")
