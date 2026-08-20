@@ -56,3 +56,6 @@ logs/
 ckpts/
 data/
 atlas_out/
+
+# ── Weights & Biases ──────────────────────────────────────────────────────────
+wandb/
