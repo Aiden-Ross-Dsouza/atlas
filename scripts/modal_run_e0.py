@@ -82,10 +82,14 @@ image = (
 )
 
 
+volume = modal.Volume.from_name("atlas-e0-results", create_if_missing=True)
+
+
 @app.function(
     image=image,
     gpu="T4",
-    timeout=3600,
+    timeout=7200,
+    volumes={"/root/atlas/atlas_out/e0": volume},
 )
 def run_e0_remote(kinds: list[str], regimes: list[str], steps: int, use_wandb: bool = False, wandb_api_key: str | None = None):
     import os
@@ -115,15 +119,20 @@ def run_e0_remote(kinds: list[str], regimes: list[str], steps: int, use_wandb: b
         cmd.append("--wandb")
 
     print(f"Executing: {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True, env=env)
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    finally:
+        # Always commit completed output files to the persistent volume
+        volume.commit()
 
-    # Return the generated files back to the local machine
+    # Return generated text files back to the local machine
     results_dir = Path("/root/atlas/atlas_out/e0")
     files = {}
-    if (results_dir / "results.json").exists():
-        files["results.json"] = (results_dir / "results.json").read_text()
-    if (results_dir / "results.md").exists():
-        files["results.md"] = (results_dir / "results.md").read_text()
+    if results_dir.exists():
+        for p in results_dir.glob("*.json"):
+            files[p.name] = p.read_text(encoding="utf-8")
+        if (results_dir / "results.md").exists():
+            files["results.md"] = (results_dir / "results.md").read_text(encoding="utf-8")
     return files
 
 

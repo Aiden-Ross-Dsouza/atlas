@@ -148,6 +148,27 @@ def main() -> None:
         print(f"  [Debug] Loaded {len(trajectories)} trajectories for {regime}", flush=True)
 
         for kind in args.kinds:
+            loss_file = args.out / f"loss_{kind}_{regime}.json"
+            chart_file = args.out / f"chart_{kind}_{regime}.pt"
+
+            if loss_file.exists() and chart_file.exists():
+                # [Resume support] Skip fine-tuning if results already exist on disk / volume
+                print(f"  ⏩ [Resume] {kind}_{regime} already completed. Loading cached result...", flush=True)
+                losses = json.loads(loss_file.read_text())
+                final_loss = losses[-1] if losses else float("nan")
+                try:
+                    chart = Chart.load(chart_file, wm.predictor)
+                    n_params = len(chart._param_names)
+                except Exception:
+                    n_params = 0
+                results[regime][kind] = {
+                    "final_loss": final_loss,
+                    "params": n_params,
+                    "status": "completed (cached)",
+                }
+                print(f"    Done {kind}_{regime} (Cached): Final Loss = {final_loss:.6f}", flush=True)
+                continue
+
             # [Debug print statement] Print fine-tuning start
             print(f"  Fine-tuning {kind} on {regime} ({args.steps} steps)...", flush=True)
             chart = run_e0_finetune(
@@ -161,7 +182,6 @@ def main() -> None:
             )
             
             # Compute evaluation metrics (loss & final UMF score on held-out chunk)
-            loss_file = args.out / f"loss_{kind}_{regime}.json"
             losses = json.loads(loss_file.read_text())
             final_loss = losses[-1] if losses else float("nan")
             results[regime][kind] = {
