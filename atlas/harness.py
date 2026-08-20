@@ -31,11 +31,35 @@ from atlas.router import route, RouterKind
 from atlas import LOGS_DIR
 
 
+def compute_trajectory_loss(world_model, z_preds: torch.Tensor, z_targets: torch.Tensor) -> torch.Tensor:
+    """Computes loss on latent predictions following VideoWM.compute_loss configuration."""
+    import torch.nn.functional as F
+    if getattr(world_model, "cfgs_loss", None):
+        cfgs = world_model.cfgs_loss
+        cos_w = cfgs.get("cos_loss_weight", 0.0)
+        l1_w = cfgs.get("l1_loss_weight", 0.0)
+        l2_w = cfgs.get("l2_loss_weight", 1.0)
+        smooth_w = cfgs.get("smooth_l1_loss_weight", 0.0)
+        
+        loss = torch.tensor(0.0, device=z_preds.device)
+        if l2_w > 0:
+            loss = loss + l2_w * (z_preds - z_targets).pow(2).mean(dim=-1).mean()
+        if l1_w > 0:
+            loss = loss + l1_w * (z_preds - z_targets).abs().mean(dim=-1).mean()
+        if cos_w > 0:
+            cos_sim = F.cosine_similarity(z_preds, z_targets, dim=-1)
+            loss = loss + cos_w * (-cos_sim).mean()
+        if smooth_w > 0:
+            loss = loss + smooth_w * F.smooth_l1_loss(z_preds, z_targets, reduction="mean")
+        return loss
+    else:
+        return (z_preds - z_targets).pow(2).mean(dim=-1).mean()
+
+
 # ── E0 — Adapter capacity ─────────────────────────────────────────────────────
 
 def run_e0_finetune(
-    predictor,
-    encoder,
+    world_model,
     trajectories: list[dict],   # list of {encoder_output, actions} dicts
     kind: ChartKind,
     regime: str,
@@ -47,8 +71,7 @@ def run_e0_finetune(
     Offline fine-tune a chart of the given kind on provided trajectories.
 
     Args:
-        predictor:    Frozen JEPA predictor.
-        encoder:      Frozen DINOv2 encoder.
+        world_model:  VideoWM instance (EncPredWM.model from torch.hub).
         trajectories: List of trajectory dicts with pre-encoded data.
         kind:         Chart kind to fine-tune.
         regime:       Regime name (for logging).
@@ -60,32 +83,60 @@ def run_e0_finetune(
         The fine-tuned Chart.
     """
     import torch.optim as optim
+    from atlas.score import _open_loop_rollout
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    predictor = world_model.predictor
     chart = Chart(predictor, kind)
     chart.apply_(predictor)
-    params = [p for n, p in predictor.named_parameters() if n in chart._param_names]
+    
+    # Freeze non-chart parameters and enable gradients ONLY on chart parameters
+    for n, p in predictor.named_parameters():
+        if kind == "lora4" and ("lora_A" in n or "lora_B" in n):
+            p.requires_grad_(True)
+        elif kind != "lora4" and n in chart._param_names:
+            p.requires_grad_(True)
+        else:
+            p.requires_grad_(False)
+
+    params = [p for n, p in predictor.named_parameters() if p.requires_grad]
     optimizer = optim.Adam(params, lr=lr)
 
     loss_log: list[float] = []
     for step in range(n_steps):
         optimizer.zero_grad()
-        total_loss = torch.tensor(0.0)
+        total_loss = torch.tensor(0.0, device=next(predictor.parameters()).device)
         for traj in trajectories:
-            enc_out: torch.Tensor = traj["encoder_output"]
-            actions: torch.Tensor = traj["actions"]
-            T = actions.shape[0]
-            z_cur = enc_out[0].unsqueeze(0)
-            loss = torch.tensor(0.0, device=z_cur.device)
-            for t in range(T):
-                a_t = actions[t].unsqueeze(0)
-                z_next_hat = predictor(z_cur, a_t)
-                loss = loss + (z_next_hat - enc_out[t + 1].unsqueeze(0)).pow(2).mean()
-                z_cur = z_next_hat.detach()
-            total_loss = total_loss + loss / T
+            enc_out: torch.Tensor = traj["encoder_output"]  # [T+1, N, D]
+            actions: torch.Tensor = traj["actions"]         # [T, action_dim]
+            z_vis = enc_out[0]
+            
+            # Predict visual latents open-loop
+            z_preds = _open_loop_rollout(world_model, z_vis, actions) # [T, N, D]
+            loss = compute_trajectory_loss(world_model, z_preds, enc_out[1:])
+            total_loss = total_loss + loss
+            
         (total_loss / len(trajectories)).backward()
         optimizer.step()
-        loss_log.append(total_loss.item() / len(trajectories))
+        avg_loss = total_loss.item() / len(trajectories)
+        loss_log.append(avg_loss)
+
+        # [WandB Logging] Log to active WandB run if initialized
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({
+                    f"e0/{regime}/{kind}/loss": avg_loss,
+                    "e0/step": step + 1,
+                    "kind": kind,
+                    "regime": regime,
+                })
+        except ImportError:
+            pass
+
+        # [Debug print statement] Print progress every 100 steps and on step 1
+        if (step + 1) == 1 or (step + 1) % 100 == 0 or (step + 1) == n_steps:
+            print(f"    [Debug] [{kind}_{regime}] Step {step+1}/{n_steps} - Loss: {avg_loss:.6f}", flush=True)
 
     chart.update_from_predictor_(predictor)
     chart.restore_(predictor)

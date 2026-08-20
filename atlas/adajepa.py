@@ -114,4 +114,14 @@ class AdaJEPA:
         total_loss = total_loss / len(self._buffer)
         total_loss.backward()
         self._optimizer.step()
-        return total_loss.item()
+        loss_val = total_loss.item()
+
+        # [WandB Logging] Log to active WandB run if initialized
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({"adajepa/adapt_loss": loss_val})
+        except ImportError:
+            pass
+
+        return loss_val

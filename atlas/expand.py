@@ -207,8 +207,21 @@ def _fit_candidate(
                 z_next_hat = pred_vis.reshape(grid * grid, D)   # [N, D]
                 loss = loss + (z_next_hat - z[t + 1]).pow(2).mean()
             total_loss = total_loss + loss / T
+        step_loss = (total_loss / len(deficit_chunks)).item()
         (total_loss / len(deficit_chunks)).backward()
         optimizer.step()
+
+        # [WandB Logging] Log to active WandB run if initialized
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "expand/refine_loss": step_loss,
+                    "expand/step": step + 1,
+                    "kind": kind,
+                })
+        except ImportError:
+            pass
 
     # Pull updated weights back into the chart, then restore predictor.
     candidate.update_from_predictor_(predictor)

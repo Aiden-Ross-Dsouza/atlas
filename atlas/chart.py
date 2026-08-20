@@ -67,23 +67,58 @@ class Chart:
     def apply_(self, predictor: nn.Module) -> None:
         """Swap this chart's parameters INTO the predictor in-place."""
         state = dict(predictor.named_parameters())
-        for name, value in self._params.items():
-            if name not in state:
-                raise KeyError(
-                    f"Chart parameter {name!r} not found in predictor. "
-                    "Was the predictor modified after this chart was created?"
-                )
-            state[name].data.copy_(value)
+        
+        if self.kind == "lora4":
+            for name in self._param_names:
+                if name not in state:
+                    raise KeyError(f"Chart parameter {name!r} not found in predictor.")
+                
+                parts = name.split(".")
+                mod = predictor
+                for p in parts[:-1]:
+                    mod = getattr(mod, p)
+                attr = parts[-1]
+                
+                A = self._params[name + ".lora_A"]
+                B = self._params[name + ".lora_B"]
+                
+                # Check if it's already parameterized
+                device = getattr(mod, attr).device
+                if not parametrize.is_parametrized(mod, attr):
+                    # We pass the cloned A and B tensors directly, and move to device
+                    lora_param = _LoRAParametrization(A, B).to(device)
+                    parametrize.register_parametrization(mod, attr, lora_param)
+                else:
+                    # Just update the parameters of the existing parametrization
+                    mod.parametrizations[attr][0].lora_A.data.copy_(A.to(device))
+                    mod.parametrizations[attr][0].lora_B.data.copy_(B.to(device))
+        else:
+            for name, value in self._params.items():
+                if name not in state:
+                    raise KeyError(f"Chart parameter {name!r} not found in predictor.")
+                state[name].data.copy_(value)
 
     def restore_(self, predictor: nn.Module) -> None:
         """Swap THIS chart's parameters back into the predictor in-place.
-
+        
         Typical usage pattern:
             c_star.apply_(predictor)       # apply selected chart
             ... forward pass ...
             c0.restore_(predictor)         # restore to identity baseline
         """
-        self.apply_(predictor)  # restoring = applying this chart's own params
+        if self.kind == "lora4":
+            for name in self._param_names:
+                parts = name.split(".")
+                mod = predictor
+                for p in parts[:-1]:
+                    mod = getattr(mod, p)
+                attr = parts[-1]
+                
+                if parametrize.is_parametrized(mod, attr):
+                    # Remove the parametrization but keep the original weight intact
+                    parametrize.remove_parametrizations(mod, attr, leave_parametrized=False)
+        else:
+            self.apply_(predictor)
 
     # ── Clone / persistence ───────────────────────────────────────────────────
 
@@ -119,8 +154,22 @@ class Chart:
     def update_from_predictor_(self, predictor: nn.Module) -> None:
         """Pull current predictor weights back into the chart (after refinement)."""
         state = dict(predictor.named_parameters())
-        for name in self._param_names:
-            self._params[name] = state[name].data.clone()
+        if self.kind == "lora4":
+            for name in self._param_names:
+                parts = name.split(".")
+                mod = predictor
+                for p in parts[:-1]:
+                    mod = getattr(mod, p)
+                attr = parts[-1]
+                if parametrize.is_parametrized(mod, attr):
+                    # Save the trained lora_A and lora_B back to the chart
+                    A = mod.parametrizations[attr][0].lora_A
+                    B = mod.parametrizations[attr][0].lora_B
+                    self._params[name + ".lora_A"] = A.data.clone()
+                    self._params[name + ".lora_B"] = B.data.clone()
+        else:
+            for name in self._param_names:
+                self._params[name] = state[name].data.clone()
 
     def __repr__(self) -> str:
         return f"Chart(kind={self.kind!r}, n_params={self.n_params():,})"
@@ -149,7 +198,16 @@ def _select_param_names(predictor: nn.Module, kind: ChartKind) -> list[str]:
     return names
 
 
-# ── LoRA injection ─────────────────────────────────────────────────────────────
+import torch.nn.utils.parametrize as parametrize
+
+class _LoRAParametrization(nn.Module):
+    def __init__(self, A: torch.Tensor, B: torch.Tensor):
+        super().__init__()
+        self.lora_A = nn.Parameter(A)
+        self.lora_B = nn.Parameter(B)
+
+    def forward(self, original_weight):
+        return original_weight + self.lora_B @ self.lora_A
 
 def _inject_lora(
     predictor: nn.Module,
@@ -159,11 +217,7 @@ def _inject_lora(
 ) -> None:
     """
     Inject LoRA A/B adapter tensors into *chart_params* for every selected
-    linear layer.  B is initialised to 0 so the adapter starts identity.
-    The effective weight is  W + B @ A  (applied in apply_()).
-
-    This modifies chart_params in-place; the predictor itself is NOT modified
-    (LoRA adapters live only inside the chart).
+    linear layer. B is initialised to 0 so the adapter starts identity.
     """
     state = dict(predictor.named_parameters())
     for name in param_names:
@@ -171,6 +225,8 @@ def _inject_lora(
         out_features, in_features = W.shape[0], W.numel() // W.shape[0]
         A_key = name + ".lora_A"
         B_key = name + ".lora_B"
-        # A ~ N(0, 1/r); B = 0  →  B@A = 0 initially.
-        chart_params[A_key] = torch.randn(rank, in_features) / rank
-        chart_params[B_key] = torch.zeros(out_features, rank)
+        
+        A = torch.randn(rank, in_features) / rank
+        B = torch.zeros(out_features, rank)
+        chart_params[A_key] = A
+        chart_params[B_key] = B

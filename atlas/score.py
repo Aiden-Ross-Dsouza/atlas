@@ -94,7 +94,6 @@ def umf(
     return numerator / displacement
 
 
-@torch.no_grad()
 def _open_loop_rollout(world_model, z_vis: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
     """
     Roll out the predictor open-loop from z_vis for len(actions) steps.
@@ -132,11 +131,8 @@ def _open_loop_rollout(world_model, z_vis: torch.Tensor, actions: torch.Tensor) 
     proprio_buf = None
     if getattr(world_model, "proprio_encoder", None) is not None:
         prop_dim = world_model.proprio_encoder.embed_dim
-        # Create a dummy proprio feature of shape [1, 1, 1, prop_dim]
-        # and repeat it to [1, 1, N_patches, prop_dim] if conditioning requires it
-        prop_feat = torch.zeros(1, 1, 1, prop_dim, device=z_vis.device)
-        if world_model.proprio_encoding == "feature":
-            prop_feat = prop_feat.repeat(1, 1, grid * grid, 1)
+        # Create a dummy proprio feature of shape [1, 1, grid * grid, prop_dim]
+        prop_feat = torch.zeros(1, 1, grid * grid, prop_dim, device=z_vis.device)
         proprio_buf = prop_feat
 
     for t in range(T):

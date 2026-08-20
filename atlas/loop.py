@@ -196,6 +196,18 @@ def atlas_refine(
     optimizer.step()
 
     scalar_loss = (loss / T).item()
+    
+    # [WandB Logging] Log to active WandB run if initialized
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.log({
+                "loop/probe_refine_loss": scalar_loss,
+                "kind": chart.kind,
+            })
+    except ImportError:
+        pass
+
     chart.update_from_predictor_(predictor)
     chart.restore_(predictor)  # restore predictor to chart's baseline weights
     return scalar_loss
