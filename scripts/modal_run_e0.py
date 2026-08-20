@@ -133,7 +133,7 @@ def run_e0_remote(kinds: list[str], regimes: list[str], steps: int, use_wandb: b
             if p.is_file():
                 if p.suffix in [".json", ".md"]:
                     files[p.name] = ("text", p.read_text(encoding="utf-8"))
-                elif p.suffix in [".png", ".pdf"]:
+                elif p.suffix in [".png", ".pdf", ".pt"]:
                     import base64
                     files[p.name] = ("binary", base64.b64encode(p.read_bytes()).decode("ascii"))
     return files
