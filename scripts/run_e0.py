@@ -88,6 +88,38 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     return trajectories
 
 
+def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict]) -> tuple[float, float]:
+    """
+    Evaluates a fine-tuned chart on held-out validation trajectories.
+    Returns (avg_eval_loss, avg_eval_umf).
+    """
+    import numpy as np
+    from atlas.harness import compute_trajectory_loss
+    from atlas.score import _open_loop_rollout, umf
+
+    chart.apply_(world_model.predictor)
+    losses = []
+    umf_scores = []
+    
+    with torch.no_grad():
+        for traj in val_trajectories:
+            enc_out = traj["encoder_output"]
+            actions = traj["actions"]
+            z_vis = enc_out[0]
+            z_preds = _open_loop_rollout(world_model, z_vis, actions)
+            loss = compute_trajectory_loss(world_model, z_preds, enc_out[1:])
+            losses.append(loss.item())
+
+            score = umf(chart, world_model, enc_out, actions)
+            if score is not None:
+                umf_scores.append(score)
+
+    chart.restore_(world_model.predictor)
+    avg_eval_loss = float(np.mean(losses)) if losses else float("nan")
+    avg_eval_umf = float(np.mean(umf_scores)) if umf_scores else float("nan")
+    return avg_eval_loss, avg_eval_umf
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="E0: Adapter capacity fine-tune.")
     parser.add_argument("--kinds", nargs="+", default=["ln_act", "lora4", "full"],
@@ -128,9 +160,11 @@ def main() -> None:
         # [Debug print statement] Print regime start
         print(f"\n── Regime {regime} ─────────────────────────────────────────────", flush=True)
         print(f"  Loading trajectories for regime {regime}...", flush=True)
-        trajectories = load_regime_trajectories(wm, prep, regime, num_trajs=3, traj_len=10, device=device)
+        all_trajectories = load_regime_trajectories(wm, prep, regime, num_trajs=5, traj_len=10, device=device)
+        train_trajectories = all_trajectories[:3]
+        val_trajectories = all_trajectories[3:]
         # [Debug print statement] Print trajectories loaded
-        print(f"  [Debug] Loaded {len(trajectories)} trajectories for {regime}", flush=True)
+        print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
 
         for kind in args.kinds:
             loss_file = args.out / f"loss_{kind}_{regime}.json"
@@ -144,14 +178,18 @@ def main() -> None:
                 try:
                     chart = Chart.load(chart_file, wm.predictor)
                     n_params = len(chart._param_names)
+                    eval_loss, eval_umf = evaluate_e0_chart(wm, chart, val_trajectories)
                 except Exception:
                     n_params = 0
+                    eval_loss, eval_umf = float("nan"), float("nan")
                 results[regime][kind] = {
-                    "final_loss": final_loss,
+                    "train_loss": final_loss,
+                    "eval_loss": eval_loss,
+                    "eval_umf": eval_umf,
                     "params": n_params,
                     "status": "completed (cached)",
                 }
-                print(f"    Done {kind}_{regime} (Cached): Final Loss = {final_loss:.6f}", flush=True)
+                print(f"    Done {kind}_{regime} (Cached): Train Loss = {final_loss:.6f} | Eval Loss = {eval_loss:.6f} | Eval UMF = {eval_umf:.4f}", flush=True)
                 continue
 
             # Initialize separate WandB run for this fine-tuning session under the shared group
@@ -180,7 +218,7 @@ def main() -> None:
             print(f"  Fine-tuning {kind} on {regime} ({args.steps} steps)...", flush=True)
             chart = run_e0_finetune(
                 world_model=wm,
-                trajectories=trajectories,
+                trajectories=train_trajectories,
                 kind=kind,
                 regime=regime,
                 n_steps=args.steps,
@@ -188,24 +226,30 @@ def main() -> None:
                 out_dir=args.out,
             )
             
+            # Held-out Evaluation on Validation Trajectories
+            eval_loss, eval_umf = evaluate_e0_chart(wm, chart, val_trajectories)
+
             if args.wandb:
                 try:
                     import wandb
                     if wandb.run is not None:
+                        wandb.log({"eval_loss": eval_loss, "eval_umf": eval_umf})
                         wandb.finish()
                 except Exception:
                     pass
             
-            # Compute evaluation metrics (loss & final UMF score on held-out chunk)
+            # Compute evaluation metrics
             losses = json.loads(loss_file.read_text())
             final_loss = losses[-1] if losses else float("nan")
             results[regime][kind] = {
-                "final_loss": final_loss,
+                "train_loss": final_loss,
+                "eval_loss": eval_loss,
+                "eval_umf": eval_umf,
                 "params": len(chart._param_names),
                 "status": "completed",
             }
-            # [Debug print statement] Print fine-tuning completed
-            print(f"    Done {kind}_{regime}: Final Loss = {final_loss:.6f}", flush=True)
+            # [Debug print statement] Print fine-tuning & eval completed
+            print(f"    Done {kind}_{regime}: Train Loss = {final_loss:.6f} | Eval Loss = {eval_loss:.6f} | Eval UMF = {eval_umf:.4f}", flush=True)
 
     # Save summary results
     results_json = args.out / "results.json"
@@ -215,13 +259,13 @@ def main() -> None:
     md_lines = [
         "# Table T5: E0 Adapter Capacity Benchmarks",
         "",
-        "| Regime | Adapter Kind | Target Params | Final Loss | Status |",
-        "|---|---|---|---|---|",
+        "| Regime | Adapter Kind | Target Params | Train Loss | Eval Loss | Eval UMF | Status |",
+        "|---|---|---|---|---|---|---|",
     ]
     for regime, kinds in results.items():
         for kind, metrics in kinds.items():
             md_lines.append(
-                f"| {regime} | `{kind}` | {metrics['params']:,} | {metrics['final_loss']:.6f} | {metrics['status']} |"
+                f"| {regime} | `{kind}` | {metrics['params']:,} | {metrics['train_loss']:.6f} | {metrics['eval_loss']:.6f} | {metrics['eval_umf']:.4f} | {metrics['status']} |"
             )
     
     results_md = args.out / "results.md"
