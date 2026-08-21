@@ -98,10 +98,6 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict]) -
     from atlas.harness import compute_trajectory_loss
     from atlas.score import _open_loop_rollout, umf
 
-    try:
-        chart.apply_(world_model.predictor)
-    except KeyError as e:
-        print(f"[Warning] chart.apply_ skipped: {e}")
     losses = []
     umf_scores = []
     
@@ -110,18 +106,23 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict]) -
             enc_out = traj["encoder_output"]
             actions = traj["actions"]
             z_vis = enc_out[0]
-            z_preds = _open_loop_rollout(world_model, z_vis, actions)
+            
+            # Apply chart specifically for the open-loop rollout, then restore
+            chart.apply_(world_model.predictor)
+            try:
+                z_preds = _open_loop_rollout(world_model, z_vis, actions)
+            finally:
+                chart.restore_(world_model.predictor)
+            
             loss = compute_trajectory_loss(world_model, z_preds, enc_out[1:])
             losses.append(loss.item())
 
+            # umf internally handles applying and restoring the chart,
+            # expecting the predictor to start in baseline state.
             score = umf(chart, world_model, enc_out, actions)
             if score is not None:
                 umf_scores.append(score)
 
-    try:
-        chart.restore_(world_model.predictor)
-    except KeyError as e:
-        print(f"[Warning] chart.restore_ skipped: {e}")
     avg_eval_loss = float(np.mean(losses)) if losses else float("nan")
     avg_eval_umf = float(np.mean(umf_scores)) if umf_scores else float("nan")
     return avg_eval_loss, avg_eval_umf
