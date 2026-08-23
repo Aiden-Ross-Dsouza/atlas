@@ -97,6 +97,21 @@ def make_obs_td(visual_hw3_uint8: np.ndarray, proprio_vec: np.ndarray, device: s
     return TensorDict({"visual": visual, "proprio": proprio}, batch_size=[]).to(device)
 
 
+def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
+    # wrapper.eval_state() compares state[:4] = [agent_x, agent_y, T_x, T_y] together,
+    # which is only meaningful when goal/init come from a correlated real trajectory
+    # (goal_source=dset upstream). Our goals are independently random (no dataset
+    # dependency by design), so the agent-position term is pure noise -- success
+    # would require the pusher to land within 20px of an unrelated random point.
+    # Push-T's actual objective (and IBC/Diffusion Policy's own metric) is block
+    # position/orientation only -- state indices [T_x, T_y, angle] = [2, 3, 4].
+    pos_diff = np.linalg.norm(goal_state[2:4] - cur_state[2:4])
+    angle_diff = np.abs(goal_state[4] - cur_state[4])
+    angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
+    success = pos_diff < 20 and angle_diff < np.pi / 9
+    return {"success": success, "block_pos_diff": float(pos_diff), "block_angle_diff": float(angle_diff)}
+
+
 def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regime: PhysicsRegime,
                  seed: int, max_steps: int) -> dict:
     device = agent.device
@@ -113,6 +128,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
     elapsed = 0
     success = False
     replans = 0
+    final_check = {"block_pos_diff": None, "block_angle_diff": None}
     t_start = time.time()
     while elapsed < max_steps and not success:
         obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
@@ -127,10 +143,12 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                 break
             obs, reward, done, info = base_env.step(a)
             elapsed += 1
-            if wrapper.eval_state(goal_state, info["state"])["success"]:
+            final_check = block_success(goal_state, info["state"])
+            if final_check["success"]:
                 success = True
                 break
-    return {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start}
+    return {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
+            **{k: v for k, v in final_check.items() if k != "success"}}
 
 
 def main() -> None:
