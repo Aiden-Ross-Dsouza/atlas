@@ -22,6 +22,9 @@ venv/
 *.swp
 .DS_Store
 Thumbs.db
+.claude/
+graphify-out/
+
 
 # ── ATLAS local data (ALL large files live here, never in git) ─────────────────
 data/
@@ -59,3 +62,7 @@ atlas_out/
 
 # ── Weights & Biases ──────────────────────────────────────────────────────────
 wandb/
+claude.md
+code-review.md
+ACTION_SAMPLING_REVIEW.md
+REGIME_DESIGN_REVIEW.md

@@ -18,6 +18,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
@@ -28,13 +29,30 @@ from atlas.chart import Chart, ChartKind
 from atlas.harness import run_e0_finetune, log_episode
 
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 20, device: str = "cpu") -> list[dict]:
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0) -> list[dict]:
     """
-    Collects real trajectories from PushTEnv under the specified regime (R1 or R2)
-    and encodes them through the frozen vision backbone.
+    Collects real trajectories from PushTEnv under the specified regime and
+    encodes them through the frozen vision backbone.
 
-    R1: Standard / Light Push-T dynamics (damping = 1.0)
-    R2: High damping Push-T dynamics (damping = 0.1)
+    Physics regime is applied via atlas.regimes.PhysicsRegime — R0=default,
+    R1=high friction, R2=high restitution. R1/R2 are NOT mass/damping-based:
+    see ATLAS_implementation_plan_v2.md §6.1a and REGIME_DESIGN_REVIEW.md —
+    Push-T's kinematic pusher makes mass-based shifts physically impossible to
+    detect at any scale, so R1/R2 were re-targeted onto shape.friction and
+    shape.elasticity, which are not subject to the same cancellation.
+
+    Actions are NOT sampled IID per step. A single random target near the
+    block is chosen once per trajectory, and the agent aims at it every step
+    (small Gaussian noise added for diversity) — pure per-step IID random
+    actions (the previous scheme) were empirically found to produce
+    agent-block contact in only ~13-17% of rollouts, since a memoryless random
+    walk rarely displaces net position over a short horizon. This mirrors how
+    every public Push-T lineage (IBC, Diffusion Policy, DINO-WM) generates
+    data — none uses fresh per-step random actions either; see
+    ACTION_SAMPLING_REVIEW.md. Each trajectory is retried with a new seed (up
+    to max_tries) if it produces zero total contact, as a hard guarantee on
+    top of the aimed sampling (which only raises the expected contact rate,
+    it doesn't guarantee it for every seed/spawn configuration).
 
     Returns a list of dicts: [{'encoder_output': [T+1, N, D], 'actions': [T, action_dim]}]
     """
@@ -48,24 +66,66 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
         sys.path.insert(0, hub_path)
 
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
+    from atlas.regimes import PhysicsRegime
 
-    damping = 1.0 if regime == "R1" else 0.1
-    env = PushTEnv(render_size=224, damping=damping)
+    # Disjoint seed ranges per regime (unchanged spirit from the original code,
+    # extended to cover R0 too since PhysicsRegime now supports all three).
+    # seed_offset additionally separates independent calls for the same regime
+    # (e.g. train vs. eval trajectories) so they never draw the same seeds --
+    # without it, two calls both starting traj_idx at 0 would silently overlap.
+    seed_base = {"R0": 2000, "R1": 0, "R2": 1000}.get(regime, 0) + seed_offset
 
     trajectories = []
     for traj_idx in range(num_trajs):
-        seed = 42 + traj_idx + (0 if regime == "R1" else 1000)
-        env.seed(seed)
-        obs, state = env.reset()
-        imgs = [obs["visual"]]  # RGB array [224, 224, 3]
-        raw_actions = []
+        for attempt in range(max_tries):
+            seed = seed_base + traj_idx * max_tries + attempt
+            env = PhysicsRegime(PushTEnv(render_size=224), regime)
+            env.seed(seed)
+            obs, state = env.reset()
+            imgs = [obs["visual"]]  # RGB array [224, 224, 3]
+            raw_actions = []
+            total_contacts = 0
 
-        rs = np.random.RandomState(seed)
-        for _ in range(traj_len):
-            act = rs.uniform(-1.0, 1.0, size=(2,))
-            obs, reward, done, info = env.step(act)
-            imgs.append(obs["visual"])
-            raw_actions.append(act)
+            rs = np.random.RandomState(seed)
+            block_xy = state[2:4]
+            # One persistent random target near the block, sampled once per
+            # trajectory — NOT resampled every step, which is what keeps the
+            # walk "aimed" instead of cancelling out like the old scheme.
+            target = block_xy + rs.uniform(-40.0, 40.0, size=(2,))
+            agent_xy = obs["proprio"][:2]
+
+            for _ in range(traj_len):
+                # Undo the env's own act*action_scale (+= agent.position when
+                # relative=True, the default) to get a raw action that aims
+                # the agent at `target` this step.
+                direction = (target - agent_xy) / env.action_scale
+                noise = rs.normal(0.0, 0.15, size=(2,))
+                # ACTION_GAIN: without this, "aim hard at the target every
+                # step" produces raw actions with std ~[0.46, 0.43] (often
+                # saturating at the +-1 clip bound while the agent is still
+                # far away) -- but the checkpoint's own preprocessor.action_std
+                # is ~[0.20, 0.20] (real demonstration data takes gentler,
+                # smaller per-step actions), so un-scaled actions land ~2.2x
+                # outside the distribution the model was calibrated on, which
+                # after normalize_actions stretches to std ~2.1-2.3 and values
+                # up to +-5 std. Confirmed via direct audit (code-review.md
+                # Bug #6d). ACTION_GAIN=0.25 was tuned empirically (clipping
+                # is nonlinear, so std doesn't scale linearly with gain) to
+                # bring raw action std to ~[0.215, 0.204], matching the
+                # checkpoint's ~[0.202, 0.200] almost exactly. This alone
+                # drops single-attempt contact rate to ~43%, but the
+                # rejection-sampling retry above (max_tries=8) still reaches
+                # ~99% expected overall success (1-(1-0.43)^8).
+                ACTION_GAIN = 0.25
+                act = np.clip((direction + noise) * ACTION_GAIN, -1.0, 1.0)
+                obs, reward, done, info = env.step(act)
+                agent_xy = obs["proprio"][:2]
+                total_contacts += info["n_contacts"]
+                imgs.append(obs["visual"])
+                raw_actions.append(act)
+
+            if total_contacts > 0 or attempt == max_tries - 1:
+                break  # accept: real contact happened, or retries exhausted
 
         imgs_np = np.stack(imgs, axis=0)        # [T+1, 224, 224, 3]
         acts_np = np.stack(raw_actions, axis=0) # [T, 2]
@@ -84,6 +144,9 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
         trajectories.append({
             "encoder_output": enc_out,
             "actions": act_tensor,
+            "seed": seed,  # the ACCEPTED seed (whichever attempt broke the retry loop) --
+                            # written to e0_seed_manifest.json so E1/downstream experiments
+                            # can be audited for zero overlap with E0's train/eval seeds.
         })
 
     return trajectories
@@ -107,9 +170,15 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict]) -
             actions = traj["actions"]
             z_vis = enc_out[0]
             
-            # Apply chart specifically for the open-loop rollout, then restore
-            chart.apply_(world_model.predictor)
+            # Apply chart specifically for the open-loop rollout, then restore.
+            # apply_() is INSIDE the try too (not just the rollout) -- if
+            # apply_() itself raises partway through (e.g. a lora4 chart with
+            # a corrupted _param_names list), restore_() must still run or the
+            # predictor is left with a permanent, never-cleaned-up partial
+            # parametrization that corrupts every subsequent chart/fine-tune
+            # sharing this predictor object. See code-review.md Bug #6f.
             try:
+                chart.apply_(world_model.predictor)
                 z_preds = _open_loop_rollout(world_model, z_vis, actions)
             finally:
                 chart.restore_(world_model.predictor)
@@ -134,6 +203,19 @@ def main() -> None:
                         choices=["ln_act", "lora4", "full"])
     parser.add_argument("--regimes", nargs="+", default=["R1", "R2"])
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--train-traj-len", type=int, default=10,
+                         help="Steps per TRAINING trajectory. run_e0_finetune() backprops "
+                              "through the full open-loop unroll, so GPU memory scales "
+                              "~linearly with this (measured ~0.27GB/step for kind=full on "
+                              "this predictor) -- kept short to fit a 6GB GPU. See "
+                              "code-review.md Bug #6e.")
+    parser.add_argument("--eval-traj-len", type=int, default=50,
+                         help="Steps per EVAL (held-out) trajectory. Runs under torch.no_grad "
+                              "so length is cheap here -- needs to be long because 10 was too "
+                              "short for properly-calibrated (gentle) actions to accumulate "
+                              "enough displacement for UMF to be well-behaved. See "
+                              "code-review.md Bug #6d. DINO-WM's own training trajectories "
+                              "are ~100 steps.")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--out", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -155,6 +237,14 @@ def main() -> None:
     for p in wm.encoder.parameters():
         p.requires_grad_(False)
 
+    # Pristine snapshot of the predictor, taken once before any fine-tuning.
+    # run_e0_finetune() mutates wm.predictor in-place for ln_act/full charts and
+    # never restores it (Chart.restore_ just re-applies the already-updated chart
+    # params, not the original checkpoint weights) — without reloading this
+    # snapshot before every fine-tune, later charts would train on top of earlier
+    # charts' weights instead of the pretrained baseline. See code-review.md #1.
+    pristine_predictor_state = copy.deepcopy(wm.predictor.state_dict())
+
     # [Debug print statement] Print setup info
     print(f"\nE0: {len(args.kinds)} kinds × {len(args.regimes)} regimes "
           f"= {len(args.kinds) * len(args.regimes)} fine-tunes", flush=True)
@@ -162,19 +252,39 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     results: dict = {}
+    seed_manifest: dict = {}  # regime -> {"train": [...], "eval": [...]} accepted seeds --
+                              # written to e0_seed_manifest.json so downstream experiments
+                              # (E1) can be audited for zero seed overlap with E0.
 
     for regime in args.regimes:
         results[regime] = {}
         # [Debug print statement] Print regime start
         print(f"\n── Regime {regime} ─────────────────────────────────────────────", flush=True)
         print(f"  Loading trajectories for regime {regime}...", flush=True)
-        all_trajectories = load_regime_trajectories(wm, prep, regime, num_trajs=5, traj_len=10, device=device)
-        train_trajectories = all_trajectories[:3]
-        val_trajectories = all_trajectories[3:]
+        # Separate lengths: training backprops through the full unroll (memory
+        # scales with length, kept short); eval runs under no_grad (cheap, kept
+        # long since UMF needs real accumulated displacement). See --train-traj-len
+        # / --eval-traj-len help text and code-review.md Bug #6d/#6e.
+        train_trajectories = load_regime_trajectories(
+            wm, prep, regime, num_trajs=3, traj_len=args.train_traj_len, device=device,
+            seed_offset=0)
+        val_trajectories = load_regime_trajectories(
+            wm, prep, regime, num_trajs=2, traj_len=args.eval_traj_len, device=device,
+            seed_offset=10_000)
+        seed_manifest[regime] = {
+            "train": [t["seed"] for t in train_trajectories],
+            "eval": [t["seed"] for t in val_trajectories],
+        }
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
 
         for kind in args.kinds:
+            # Reset the predictor to its pristine pretrained state before every
+            # kind's fine-tune/eval. Without this, later charts train on top of
+            # earlier charts' weights instead of the checkpoint baseline — see
+            # code-review.md #1.
+            wm.predictor.load_state_dict(pristine_predictor_state)
+
             loss_file = args.out / f"loss_{kind}_{regime}.json"
             chart_file = args.out / f"chart_{kind}_{regime}.pt"
 
@@ -187,7 +297,18 @@ def main() -> None:
                     chart = Chart.load(chart_file, wm.predictor)
                     n_params = len(chart._param_names)
                     eval_loss, eval_umf = evaluate_e0_chart(wm, chart, val_trajectories)
-                except Exception:
+                except Exception as e:
+                    # Print the real error instead of silently returning NaN --
+                    # a swallowed exception here previously masked a real bug
+                    # (Chart.load()'s corrupted _param_names for lora4, see
+                    # code-review.md Bug #6f) that also left the shared
+                    # predictor in a corrupted state for every subsequent
+                    # kind/regime, only surfacing as a confusing crash much
+                    # later. Reset the predictor defensively so a failure here
+                    # can't cascade the same way even if a new bug appears.
+                    print(f"    ⚠️ [Resume] Failed to re-evaluate cached {kind}_{regime}: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                    wm.predictor.load_state_dict(pristine_predictor_state)
                     n_params = 0
                     eval_loss, eval_umf = float("nan"), float("nan")
                 results[regime][kind] = {
@@ -262,6 +383,15 @@ def main() -> None:
     # Save summary results
     results_json = args.out / "results.json"
     results_json.write_text(json.dumps(results, indent=2))
+
+    # Seed manifest: audit trail proving E1 (or any downstream experiment) uses
+    # seeds disjoint from every trajectory that went into fine-tuning/evaluating
+    # these charts. E1's own seeds (atlas.streams.paired_seed, SHA256-derived)
+    # live in a completely different space from these small deterministic
+    # integers, but this manifest makes that an auditable fact, not a claim.
+    seed_manifest_json = args.out / "e0_seed_manifest.json"
+    seed_manifest_json.write_text(json.dumps(seed_manifest, indent=2))
+    print(f"  - Seed manifest : {seed_manifest_json}")
 
     # Generate Markdown Table T5
     md_lines = [

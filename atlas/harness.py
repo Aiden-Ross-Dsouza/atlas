@@ -83,6 +83,7 @@ def run_e0_finetune(
         The fine-tuned Chart.
     """
     import torch.optim as optim
+    from tqdm import tqdm
     from atlas.score import _open_loop_rollout
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +104,8 @@ def run_e0_finetune(
     optimizer = optim.Adam(params, lr=lr)
 
     loss_log: list[float] = []
-    for step in range(n_steps):
+    pbar = tqdm(range(n_steps), desc=f"{kind}_{regime}", unit="step")
+    for step in pbar:
         optimizer.zero_grad()
         total_loss = torch.tensor(0.0, device=next(predictor.parameters()).device)
         for traj in trajectories:
@@ -120,6 +122,7 @@ def run_e0_finetune(
         optimizer.step()
         avg_loss = total_loss.item() / len(trajectories)
         loss_log.append(avg_loss)
+        pbar.set_postfix(loss=f"{avg_loss:.6f}")
 
         # [WandB Logging] Log step and loss to active WandB run if initialized
         try:
@@ -135,9 +138,10 @@ def run_e0_finetune(
         except ImportError:
             pass
 
-        # [Debug print statement] Print progress every 100 steps and on step 1
+        # [Debug print statement] Print progress every 100 steps and on step 1.
+        # pbar.write (not print) so it doesn't corrupt the tqdm bar's line.
         if (step + 1) == 1 or (step + 1) % 100 == 0 or (step + 1) == n_steps:
-            print(f"    [Debug] [{kind}_{regime}] Step {step+1}/{n_steps} - Loss: {avg_loss:.6f}", flush=True)
+            pbar.write(f"    [Debug] [{kind}_{regime}] Step {step+1}/{n_steps} - Loss: {avg_loss:.6f}")
 
     chart.update_from_predictor_(predictor)
     chart.restore_(predictor)
@@ -150,14 +154,46 @@ def run_e0_finetune(
 
 # ── E1 — Fitness routing ──────────────────────────────────────────────────────
 
+def _make_obs_td(visual_hw3_uint8, proprio_vec, device: str):
+    """Build a batchless-per-field TensorDict; GC_Agent.set_goal()/.act() add
+    their own leading batch dim internally (see scripts/run_e0_planning.py)."""
+    import numpy as np
+    from tensordict import TensorDict
+
+    visual = torch.from_numpy(visual_hw3_uint8.copy()).permute(2, 0, 1).float().unsqueeze(0)
+    proprio = torch.from_numpy(np.asarray(proprio_vec, dtype=np.float32)).unsqueeze(0)
+    return TensorDict({"visual": visual, "proprio": proprio}, batch_size=[]).to(device)
+
+
+def _prepare_env(base_env, regime, seed: int, state) -> tuple[dict, dict]:
+    """
+    Reset to a controlled state with physics reapplied.
+
+    Uses regime.reset() (PhysicsRegime.reset(), which calls _apply_physics()
+    automatically) rather than PushTWrapper's reset()/step() — PushTWrapper
+    discards obs["visual"] (it expects a separate PixelWrapper to re-render),
+    which E1 needs for encoding. reset_to_state is set on base_env directly
+    (not on the regime wrapper) since gym.Wrapper does not proxy attribute
+    writes to the wrapped env.
+    """
+    base_env.seed(seed)
+    base_env.reset_to_state = state
+    return regime.reset()
+
+
 def run_e1_episode(
     library: Library,
-    predictor,
-    encoder,
-    env,
+    agent,                      # GC_Agent, pre-configured with E1's CEM hyperparameters
+    world_model,                # VideoWM: has .predictor, .encode_obs, .encode_act, .forward_pred
+    base_env,                   # raw PushTEnv
+    regime,                     # PhysicsRegime(base_env, ...) — physics fixed for the whole episode
+    goal_utils,                 # PushTWrapper(base_env) — only .sample_random_init_goal_states/.eval_state used
     router: RouterKind,
     episode_seed: int,
     n_warmup_replans: int,
+    n_replans_target: int,
+    frameskip: int,
+    num_act_stepped: int,       # model-chunk units -- matches agent's CEMPlanner.horizon units
     motion_gate: float | None,
     hysteresis: float,
     out_dir: Path,
@@ -169,19 +205,111 @@ def run_e1_episode(
     """
     Run one E1 episode with a specified router.
 
-    Warmup: 2 replans under c₀. Then route using *router* for the rest.
-    Returns per-episode metrics dict (also written to JSONL).
+    Prequential order per replan (never reorder — see loop.py's module docstring
+    for the same invariant in the full ATLAS loop): SCORE the chunk executed by
+    the PREVIOUS replan -> SELECT a chart -> EXECUTE this replan with it. The
+    first `n_warmup_replans` replans skip scoring/selection entirely and stay on
+    library[0] (c0) — this is deliberate: E1 tests whether the router can find
+    the right chart using only c0's warmup data, not whether c0 itself is a good
+    fit. Charts are frozen throughout (no atlas_refine call) — E1's charts come
+    fixed from E0 ("Charts from E0, fixed" per the proposal); this also means
+    E1 never touches atlas.loop.atlas_step()/atlas_refine() at all.
 
-    This function is a HARNESS STUB — the actual planning loop depends on
-    the jepa-wms CEM planner API. The caller must integrate this with the
-    upstream planning eval code from jepa-wms. See scripts/run_e1.py for
-    the integration point.
+    Regime is FIXED for the whole episode (set via `regime` before this is
+    called) — E1 does not switch regimes mid-episode; that's E3/E4's stream.
     """
-    raise NotImplementedError(
-        "run_e1_episode() is an integration stub. "
-        "Wire this into the jepa-wms planning eval loop in scripts/run_e1.py. "
-        "See the implementation plan §7.2 for the required episode structure."
-    )
+    device = agent.device
+    predictor = world_model.predictor
+
+    init_state, goal_state = goal_utils.sample_random_init_goal_states(episode_seed)
+
+    goal_obs, _ = _prepare_env(base_env, regime, episode_seed, goal_state)
+    agent.set_goal(_make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
+
+    obs, _ = _prepare_env(base_env, regime, episode_seed, init_state)
+
+    current_idx = 0  # c0, always the starting chart
+    elapsed = 0
+    success = False
+    selected_trace: list[int] = []
+    umf_trace: list[list[float | None]] = []
+    raw_steps_per_replan: list[int] = []
+    prev_chunk: tuple[torch.Tensor, torch.Tensor] | None = None  # (encoder_output, actions)
+
+    for replan_idx in range(n_replans_target):
+        if replan_idx >= n_warmup_replans and prev_chunk is not None:
+            enc_out, acts = prev_chunk
+            current_idx, route_info = route(
+                kind=router, library=library, world_model=world_model,
+                encoder_output=enc_out, actions=acts, current_idx=current_idx,
+                motion_gate=motion_gate, hysteresis=hysteresis,
+                regime_label=regime_label, label_to_chart=label_to_chart,
+            )
+            umf_trace.append(route_info["scores"])
+        else:
+            umf_trace.append([None] * len(library))  # warmup: no scoring, stays on c0
+        selected_trace.append(current_idx)
+
+        chart = library[current_idx]
+        chart.apply_(predictor)
+        try:
+            obs_td = _make_obs_td(obs["visual"], obs["proprio"], device)
+            # steps_left must be in MODEL-chunk units -- CEMPlanner.plan() does
+            # plan_length = min(self.horizon, steps_left), and self.horizon is
+            # unambiguously model-chunk units. Multiplying by frameskip here
+            # (an earlier version of this code did) mixes units with horizon --
+            # fixed to match num_act_stepped's units instead.
+            steps_left_model = (n_replans_target - replan_idx) * num_act_stepped
+            action = agent.act(obs_td, steps_left=max(steps_left_model, 1))
+        finally:
+            chart.restore_(predictor)  # chart only needs to be applied during planning
+
+        from einops import rearrange
+        raw_actions = rearrange(action.cpu(), "t (f d) -> (t f) d", d=2)
+        raw_actions = agent.preprocessor.denormalize_actions(raw_actions).numpy()
+
+        imgs = [obs["visual"]]
+        step_actions = []
+        for a in raw_actions:
+            obs, reward, done, info = base_env.step(a)
+            imgs.append(obs["visual"])
+            step_actions.append(a)
+            elapsed += 1
+            if goal_utils.eval_state(goal_state, info["state"])["success"]:
+                success = True
+                break
+        raw_steps_per_replan.append(len(step_actions))
+
+        # Encode the just-executed chunk so the NEXT replan can score against it.
+        import numpy as np
+        imgs_np = np.stack(imgs, axis=0)[None]                      # [1, T+1, H, W, 3]
+        acts_np = np.stack(step_actions, axis=0)                    # [T, 2]
+        img_tensor = agent.preprocessor.transform_obs_visual(imgs_np).to(device)
+        act_tensor = agent.preprocessor.normalize_actions(
+            torch.from_numpy(acts_np).float().unsqueeze(0)
+        ).squeeze(0).to(device)
+        with torch.no_grad():
+            enc_out_dict = world_model.encode_obs({"visual": img_tensor})
+            enc_out = enc_out_dict["visual"].squeeze(0).squeeze(1).flatten(1, 2)  # [T+1, N, D]
+        prev_chunk = (enc_out, act_tensor)
+
+        if success:
+            break
+
+    record = {
+        "episode_id": episode_id,
+        "router": router,
+        "seed": episode_seed,
+        "success": success,
+        "elapsed_raw_steps": elapsed,
+        "n_replans": len(selected_trace),
+        "raw_steps_per_replan": raw_steps_per_replan,
+        "selected_trace": selected_trace,
+        "umf_trace": umf_trace,
+        "regime_label": regime_label,
+    }
+    log_episode(out_dir, record)
+    return record
 
 
 # ── E5 — Cross-policy matrix ──────────────────────────────────────────────────

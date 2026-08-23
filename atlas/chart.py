@@ -144,7 +144,19 @@ class Chart:
         kind = data["kind"]
         chart = object.__new__(cls)
         chart.kind = kind
-        chart._param_names = list(data["params"].keys())
+        if kind == "lora4":
+            # For lora4, data["params"].keys() includes the base weight names
+            # PLUS the injected ".lora_A"/".lora_B" pseudo-keys (see
+            # _inject_lora) -- using them directly as _param_names makes
+            # apply_()'s lora4 loop treat ".lora_A"/".lora_B" strings as real
+            # predictor parameter names, which they aren't, raising a KeyError
+            # partway through (leaving the predictor with a partially-applied,
+            # never-cleaned-up parametrization -- see code-review.md Bug #6f).
+            # Recompute the true base-weight name list deterministically
+            # instead of trusting the saved dict's keys.
+            chart._param_names = _select_param_names(predictor, kind)
+        else:
+            chart._param_names = list(data["params"].keys())
         chart._params = data["params"]
         return chart
 
@@ -180,20 +192,42 @@ class Chart:
 def _select_param_names(predictor: nn.Module, kind: ChartKind) -> list[str]:
     """Return parameter names to include in a chart of the given kind."""
     names = []
+    if kind == "ln_act":
+        # LN affine: identify actual nn.LayerNorm modules structurally rather
+        # than by name substring. A name-substring check ("norm" in n) misses
+        # LayerNorms that sit at a numeric Sequential index (e.g. this
+        # predictor's FeedForward pre-norm is `transformer.layers.N.1.net.0`,
+        # which has no "norm"/"ln" in its parameter name at all) — confirmed
+        # empirically via scripts/dump_params.py, which found only ~5.8k LN
+        # params via the old substring check vs. the plan's expected ~10.4k
+        # (the missing half being exactly these unnamed FeedForward norms).
+        ln_param_ids = set()
+        for _, module in predictor.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                for p in module.parameters(recurse=False):
+                    ln_param_ids.add(id(p))
+        for n, p in predictor.named_parameters():
+            if id(p) in ln_param_ids or "action" in n:
+                names.append(n)
+        return names
     for n, p in predictor.named_parameters():
         if kind == "full":
             names.append(n)
-        elif kind == "ln_act":
-            # LN affine: 1-D tensors belonging to norm layers.
-            # Action encoder: anything whose module path includes 'action'.
-            is_ln_affine = (p.ndim == 1) and ("norm" in n or "ln" in n)
-            is_action = "action" in n
-            if is_ln_affine or is_action:
-                names.append(n)
         elif kind == "lora4":
             # LoRA adapters are injected separately; here we select the base
-            # qkv/proj weights that will be (additively) modified.
-            if any(k in n for k in ("qkv", "proj", "q_proj", "k_proj", "v_proj", "out_proj")):
+            # qkv/proj WEIGHT matrices that will be (additively) modified.
+            # Biases are excluded deliberately: _inject_lora's rank/in_features
+            # math assumes a 2-D weight (out_features, in_features) — matching
+            # a 1-D bias would produce a shape mismatch in the LoRA forward
+            # (B @ A vs. the bias's own shape).
+            # "to_qkv"/"to_out" added for this predictor's lucidrains-style ViT
+            # naming (Attention.to_qkv, Attention.to_out) — without them only
+            # to_qkv matched and the attention output projection (to_out.0)
+            # was silently skipped, confirmed via scripts/dump_params.py.
+            if n.endswith(".weight") and any(
+                k in n for k in
+                ("qkv", "proj", "q_proj", "k_proj", "v_proj", "out_proj", "to_qkv", "to_out")
+            ):
                 names.append(n)
     return names
 

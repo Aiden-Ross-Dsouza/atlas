@@ -2,9 +2,28 @@
 regimes.py — Physics regime wrappers and visual corruption wrappers for Push-T.
 
 Three dynamics regimes (primary, matched appearance):
-  R0  default — shipped parameters
-  R1  light block — T-block mass × 0.2 (mass, moment both scaled)
-  R2  high damping — space.damping decreased (pymunk damping is a RETENTION factor)
+  R0  default — shipped parameters (friction=0.0, elasticity=0.0 everywhere)
+  R1  high friction — agent+block shape.friction raised (was: mass x0.2 — see below)
+  R2  high restitution — agent+block shape.elasticity raised (was: space.damping)
+
+CORRECTNESS-CRITICAL BUG FOUND 2026-08-23, see REGIME_DESIGN_REVIEW.md and
+ATLAS_implementation_plan_v2.md §6.1a: R1 was originally specified as a T-block
+mass x0.2 scaling. Empirically and analytically confirmed dead — Push-T's pusher
+agent is a `pymunk.Body(body_type=pymunk.Body.KINEMATIC)`, and Chipmunk2D's
+impulse solver treats a kinematic body as having infinite mass, which makes the
+post-collision velocity of the body it hits algebraically INDEPENDENT of that
+body's own mass/moment, at any scale (0.001x to 1000x tested, byte-identical
+trajectories every time). No mass value can ever produce a regime shift here.
+Re-targeted onto shape.friction (R1) and shape.elasticity (R2) instead — both
+are dimensionless coefficients, not mass-like quantities, so they are NOT
+subject to the same cancellation (confirmed empirically, see below).
+
+NON-OBVIOUS TRAP: pymunk combines two colliding shapes' friction/elasticity
+multiplicatively-ish (empirically: if EITHER shape's friction/elasticity is
+0.0, the combined effect is 0.0 regardless of the other shape's value). Since
+the agent's shape defaults to friction=elasticity=0.0 same as the block's,
+_apply_physics() must set both the AGENT's shapes and the BLOCK's shapes —
+setting only the block (the naive choice) has no effect at all.
 
 Visual corruptions (E2 only — appearance differs, dynamics unchanged):
   blur, salt_pepper, dark, colour_change
@@ -18,16 +37,25 @@ from __future__ import annotations
 
 from typing import Literal
 
-import gymnasium as gym
+# NOT gymnasium: PushTEnv (evals/simu_env_planning/envs/pusht_env/pusht_env.py)
+# and jepa-wms's own PushTWrapper both subclass the legacy `gym` package
+# (0.23.1) — gymnasium.Wrapper.__init__ asserts isinstance(env, gymnasium.Env)
+# and raises immediately on a legacy-gym env, so this module never actually
+# worked against the real Push-T environment until this was corrected.
+import gym
 import numpy as np
 
 RegimeName = Literal["R0", "R1", "R2"]
 
-# Physics parameter values — exact values from the plan.
+# Physics parameter values. R1/R2 re-targeted 2026-08-23 (mass_scale/damping
+# proven non-functional against a kinematic pusher — see module docstring).
+# Values chosen well above the shipped 0.0 baseline for both parameters, and
+# empirically confirmed (test_physicsregime-style direct repro) to produce a
+# visible collision-response difference once contact occurs.
 REGIME_CONFIGS: dict[str, dict] = {
     "R0": {},                              # default: no modifications
-    "R1": {"mass_scale": 0.2},            # light block: mass × 0.2
-    "R2": {"damping": 0.3},               # high damping: space.damping = 0.3 (from 0.9 default)
+    "R1": {"friction": 0.8},              # high friction: shape.friction = 0.8 (from 0.0)
+    "R2": {"elasticity": 0.9},            # high restitution: shape.elasticity = 0.9 (from 0.0)
 }
 
 
@@ -64,28 +92,26 @@ class PhysicsRegime(gym.Wrapper):
         if not self._cfg:
             return  # R0: no modifications
 
-        # Locate the pymunk space. Try common attribute paths used in DINO-WM / Push-T.
-        space = self._get_space()
+        if "friction" in self._cfg:
+            self._set_shape_property("friction", self._cfg["friction"])
 
-        if "mass_scale" in self._cfg:
-            block = self._get_block()
-            original_mass = getattr(block, "_original_mass", None)
-            original_moment = getattr(block, "_original_moment", None)
-            if original_mass is None:
-                # First time: cache the original values.
-                block._original_mass = block.mass
-                block._original_moment = block.moment
-                original_mass = block._original_mass
-                original_moment = block._original_moment
-            block.mass = original_mass * self._cfg["mass_scale"]
-            block.moment = original_moment * self._cfg["mass_scale"]
+        if "elasticity" in self._cfg:
+            self._set_shape_property("elasticity", self._cfg["elasticity"])
 
-        if "damping" in self._cfg:
-            space.damping = self._cfg["damping"]
+    def _set_shape_property(self, name: str, value: float) -> None:
+        """Set a pymunk Shape property (friction/elasticity) on BOTH the agent's
+        and the block's shapes. Both must be set: pymunk combines two colliding
+        shapes' friction/elasticity such that if EITHER is 0.0 (the shipped
+        default for both agent and block here), the combined effect is 0.0
+        regardless of the other shape's value — confirmed empirically. Setting
+        only the block (the naive choice) silently produces no regime shift."""
+        for body in (self._get_agent(), self._get_block()):
+            for shape in body.shapes:
+                setattr(shape, name, value)
 
-    def _get_space(self):
-        """Locate the pymunk space object through common env attribute paths."""
-        for attr_path in ("env.space", "space", "env.env.space", "unwrapped.space"):
+    def _get_agent(self):
+        """Locate the pusher agent body."""
+        for attr_path in ("env.agent", "agent", "env.env.agent", "unwrapped.agent"):
             obj = self.env
             try:
                 for attr in attr_path.split("."):
@@ -94,9 +120,9 @@ class PhysicsRegime(gym.Wrapper):
             except AttributeError:
                 continue
         raise RuntimeError(
-            "Could not locate pymunk Space on the environment. "
+            "Could not locate agent body on the environment. "
             "Check the env's attribute structure with `vars(env.unwrapped)` and "
-            "update _get_space() in regimes.py."
+            "update _get_agent() in regimes.py."
         )
 
     def _get_block(self):

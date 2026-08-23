@@ -97,11 +97,9 @@ def _score_all(
         if kind == "umf":
             s = compute_umf(chart, world_model, encoder_output, actions, motion_gate)
         elif kind == "e1":
-            # TODO(E1): update _e1_score to use world_model.forward_pred()
-            s = _e1_score(chart, world_model.predictor, encoder_output, actions, motion_gate)
+            s = _e1_score(chart, world_model, encoder_output, actions, motion_gate)
         elif kind == "sdyn":
-            # TODO(E1): update _sdyn_score to use world_model.forward_pred()
-            s = _sdyn_score(chart, world_model.predictor, encoder_output, actions, motion_gate)
+            s = _sdyn_score(chart, world_model, encoder_output, actions, motion_gate)
         else:
             raise ValueError(f"Unknown router kind: {kind!r}")
         scores.append(s)
@@ -109,39 +107,57 @@ def _score_all(
 
 
 @torch.no_grad()
-def _e1_score(chart, predictor, encoder_output, actions, motion_gate) -> float | None:
-    """One-step prediction error: ‖ẑ₁ − z₁‖² (ablation: horizon-1 only)."""
+def _e1_score(chart, world_model, encoder_output, actions, motion_gate) -> float | None:
+    """
+    One-step prediction error: ‖ẑ₁ − z₁‖² (ablation of UMF: no normalisation,
+    scores only the first predicted step).
+
+    Runs the FULL open-loop rollout over *actions* (not a 1-action slice) and
+    only scores z_hat[0] — VideoWM.encode_act() reshapes actions into chunks of
+    `frameskip` raw actions (e.g. 5 raw 2-dim actions -> one 10-dim model
+    action), so a single raw action cannot be encoded on its own; the caller's
+    full *actions* array is always frameskip-divisible (same array `umf()`
+    scores), so this reuses that guarantee instead of re-deriving frameskip.
+    """
+    from atlas.score import _open_loop_rollout
+
     z = encoder_output
     z0, z1 = z[0], z[1]
     observed_disp = (z[-1] - z[0]).norm(p="fro").item()
     if motion_gate is not None and observed_disp <= motion_gate:
         return None
-    a0 = actions[0].unsqueeze(0)
+    predictor = world_model.predictor
     chart.apply_(predictor)
     try:
-        z1_hat = predictor(z0.unsqueeze(0), a0).squeeze(0)
+        z_hat = _open_loop_rollout(world_model, z0, actions)
     finally:
         chart.restore_(predictor)
+    return (z_hat[0] - z1).pow(2).sum().item()
 
 
 @torch.no_grad()
-def _sdyn_score(chart, predictor, encoder_output, actions, motion_gate) -> float | None:
+def _sdyn_score(chart, world_model, encoder_output, actions, motion_gate) -> float | None:
     """
     Dynamics fingerprint routing (S-dyn baseline).
-    Score = negative cosine similarity between observed Δz and predicted Δz.
+    Score = negative cosine similarity between observed Δz and predicted Δz,
+    using the first predicted step of the full open-loop rollout (see
+    _e1_score's docstring for why a 1-action slice can't be encoded directly).
     Lower = better (matches UMF convention).
     """
+    from atlas.score import _open_loop_rollout
+
     z = encoder_output
     observed_disp = (z[-1] - z[0]).norm(p="fro").item()
     if motion_gate is not None and observed_disp <= motion_gate:
         return None
     z0, z1_obs = z[0], z[1]
-    a0 = actions[0].unsqueeze(0)
+    predictor = world_model.predictor
     chart.apply_(predictor)
     try:
-        z1_hat = predictor(z0.unsqueeze(0), a0).squeeze(0)
+        z_hat = _open_loop_rollout(world_model, z0, actions)
     finally:
         chart.restore_(predictor)
+    z1_hat = z_hat[0]
     delta_obs = (z1_obs - z0).flatten()
     delta_pred = (z1_hat - z0).flatten()
     cos_sim = torch.nn.functional.cosine_similarity(delta_obs, delta_pred, dim=0).item()

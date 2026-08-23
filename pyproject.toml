@@ -29,10 +29,15 @@ dependencies = [
     "imageio>=2.34",
     "opencv-python-headless>=4.9",
 
-    # ── jepa-wms — the frozen substrate (pinned to a specific commit) ─────────
-    # Installs the jepa_wms package (models, datasets, planning eval) from source.
-    # Pin to a specific commit once you have confirmed reproducibility.
-    "jepa-wms @ git+https://github.com/facebookresearch/jepa-wms.git",
+    # jepa-wms is intentionally NOT listed here -- uv/pip can't reliably
+    # resolve a relative `file:` path for a dependency of this project's own
+    # wheel, and a hardcoded absolute path isn't portable (breaks on any other
+    # machine or in a container). Install it separately:
+    #   pip install -e vendor/jepa-wms
+    # vendor/jepa-wms is a local clone of github.com/facebookresearch/jepa-wms
+    # with one patch — its [tool.uv.sources] pin for metaworld/d4rl to a git
+    # "master" branch that no longer exists upstream is removed (see
+    # code-review.md). No jepa-wms model/eval code was touched.
 ]
 
 [project.optional-dependencies]
