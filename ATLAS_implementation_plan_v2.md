@@ -145,7 +145,7 @@ Two non-negotiables: **identity initialisation** (LoRA `B=0`; LN at pretrained v
 
 ## 6. Regimes
 
-### 6.1 Push-T dynamics variants (primary, matched appearance)
+### 6.1 Push-T dynamics variants (primary, matched appearance) — ORIGINAL SPEC, SUPERSEDED, see §6.1a
 
 Push-T is `pymunk`-based. Confirm attribute paths in `ml-dino-wm`, then:
 
@@ -167,6 +167,52 @@ class PhysicsRegime(gym.Wrapper):
 ```
 
 **S2 uses R0 and R1 only.** R2 exists for E0 (two regimes, to check adapter capacity on a second kind of shift).
+
+### 6.1a CORRECTION (2026-08-23): R1 mass scaling is physically dead — re-targeted onto friction/elasticity
+
+**§6.1's mass-based R1 does not work and cannot be made to work at any scale.** Confirmed both
+analytically and empirically (full writeup: `REGIME_DESIGN_REVIEW.md` at the repo root):
+
+Push-T's pusher agent is constructed as `pymunk.Body(body_type=pymunk.Body.KINEMATIC)`
+(`pusht_env.py`, `add_circle()`). Chipmunk2D's impulse-based collision solver treats a kinematic
+body as having **infinite mass** — it isn't affected by collisions, and the velocity it imparts to
+whatever it hits is algebraically **independent of that body's own mass/moment**, for any mass
+value (the mass terms cancel exactly in the impulse formula, not just under proportional scaling).
+This was verified directly: scaling the T-block's mass from ×0.001 to ×1000 produced **byte-
+identical rendered trajectories** in every test, including on seeds where a different parameter
+(damping) demonstrably did produce a difference — proving the block was moving/being touched, yet
+mass still had zero effect. This is the standard classical-mechanics limit of "colliding with an
+infinitely massive object" (the small body's outcome depends on the massive object's velocity, not
+its own mass) — not an engine bug, and not fixable by choosing a more extreme scale factor.
+
+**Fix applied in `atlas/regimes.py`:** R1 and R2 are re-targeted onto two parameters that are
+*not* mass-like and are therefore not subject to this cancellation — both confirmed empirically to
+produce real, different collision outcomes:
+
+| Regime | Parameter | Value | Why it works (unlike mass) |
+|---|---|---|---|
+| **R0** default | — | shipped (friction=0.0, elasticity=0.0 everywhere) | — |
+| **R1** high friction | `shape.friction` (agent **and** block shapes) | 0.0 → 0.8 | Coulomb friction coefficient is a dimensionless ratio, not built from mass — no cancellation |
+| **R2** high restitution | `shape.elasticity` (agent **and** block shapes) | 0.0 → 0.9 | Restitution enters as a multiplicative `(1+e)` factor on impulse magnitude, not a mass ratio |
+
+**Non-obvious implementation trap:** pymunk combines two colliding shapes' friction/elasticity
+such that if **either** shape's value is 0.0 (the shipped default for both the agent and the
+block), the combined effect is 0.0 regardless of the other shape's value. Both the agent's and the
+block's shapes must be set — setting only the block (the naive reading of "block friction") has no
+effect at all. `atlas/regimes.py`'s `_set_shape_property()` handles this.
+
+**Downstream impact — this is not E0-only.** §6.3's E2 2×2 table defines Cell B ("decisive") as
+`R0 vs R1`, and §169 above states S2 (the continual stream, E3/E4) uses R0 and R1. Both now mean
+"R0 vs. high-friction," not "R0 vs. light-block" — re-read any results or writing that assumes the
+original mass-based framing before this correction.
+
+**A separate, independent problem also found (fix in progress):** even with a working physics
+parameter, `scripts/run_e0.py`'s trajectory generator samples fully random per-step actions
+(`rs.uniform(-1, 1)`), which was empirically found to produce agent-block contact in only
+**13–17% of rollouts** (measured via the env's own `n_contact_points` counter across 30 seeds, at
+rollout lengths up to 50 steps) — meaning most trajectories never exercise the shifted parameter at
+all regardless of which one it is. See `ACTION_SAMPLING_REVIEW.md` (once written) and
+`code-review.md` for the resolution.
 
 ### 6.2 Visual corruptions (E2 only)
 
