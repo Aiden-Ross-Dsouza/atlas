@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -43,12 +45,15 @@ from tqdm import tqdm
 # denormalize_actions/env.step(), which expect the raw 2-dim space.
 FRAMESKIP = 5
 
+# frameskip * goal_H + 1 (plan_evaluator.py's own goal_source=dset formula) --
+# goal_H=6 matches the shipped config's planner.horizon/num_act_stepped.
+GOAL_TRAJ_LEN = FRAMESKIP * 6 + 1
+
 # Raw ATLAS_HOME env var, NOT atlas.ATLAS_HOME: that's .resolve()'d, which on
 # Modal follows the volume mount (/atlas_root) down to its internal storage
 # path (/__modal/volumes/vo-xxx/...) -- a path that isn't itself mounted
 # anywhere, so torch.hub's file access on the resolved path 404s even though
 # the file is really there under /atlas_root.
-import os
 _atlas_home = os.environ.get("ATLAS_HOME", str(atlas.ATLAS_HOME))
 HUB_PATH = str(Path(_atlas_home) / "hub" / "hub" / "facebookresearch_jepa-wms_main")
 if HUB_PATH not in sys.path:
@@ -97,6 +102,33 @@ def make_obs_td(visual_hw3_uint8: np.ndarray, proprio_vec: np.ndarray, device: s
     return TensorDict({"visual": visual, "proprio": proprio}, batch_size=[]).to(device)
 
 
+def load_dataset_states(split: str = "train") -> tuple[np.ndarray, list[int]]:
+    # Raw recorded [agent_x, agent_y, T_x, T_y, angle] trajectories -- only
+    # states.pth is needed (not visual/action/token files) to sample reachable
+    # (init, goal) pairs; PushTEnv regenerates observations from state directly.
+    d = atlas.DATA_DIR / "pusht_noise" / split
+    states = torch.load(d / "states.pth", weights_only=False).numpy()
+    with open(d / "seq_lengths.pkl", "rb") as f:
+        seq_lengths = pickle.load(f)
+    return states, seq_lengths
+
+
+def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.random.RandomState,
+                              traj_len: int = GOAL_TRAJ_LEN) -> tuple[np.ndarray, np.ndarray]:
+    valid_eps = [i for i, l in enumerate(seq_lengths) if l >= traj_len]
+    ep_idx = valid_eps[rs.randint(len(valid_eps))]
+    max_offset = seq_lengths[ep_idx] - traj_len
+    offset = rs.randint(max_offset + 1) if max_offset > 0 else 0
+    init_state = states[ep_idx, offset]
+    goal_state = states[ep_idx, offset + traj_len - 1]
+    # dataset states are 5-dim (no velocity); pad to match with_velocity=True's
+    # 7-dim format -- generate_state() itself hardcodes agent velocity to 0
+    # regardless, so zero-padding matches the existing convention exactly.
+    init_state = np.concatenate([init_state, [0.0, 0.0]])
+    goal_state = np.concatenate([goal_state, [0.0, 0.0]])
+    return init_state, goal_state
+
+
 def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
     # wrapper.eval_state() compares state[:4] = [agent_x, agent_y, T_x, T_y] together,
     # which is only meaningful when goal/init come from a correlated real trajectory
@@ -106,17 +138,24 @@ def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
     # Push-T's actual objective (and IBC/Diffusion Policy's own metric) is block
     # position/orientation only -- state indices [T_x, T_y, angle] = [2, 3, 4].
     pos_diff = np.linalg.norm(goal_state[2:4] - cur_state[2:4])
-    angle_diff = np.abs(goal_state[4] - cur_state[4])
-    angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
+    # PushTWrapper.generate_state() draws the goal angle as randn()*2pi - pi --
+    # an unbounded Gaussian, not a wrapped angle -- so a raw difference can span
+    # several full rotations. np.minimum(d, 2pi-d) (the original eval_state()
+    # formula) only wraps correctly within one rotation; for larger raw
+    # differences it produces garbage (even negative) results. Wrap properly
+    # via the standard atan2-free formula: fold into (-pi, pi] first.
+    raw_diff = goal_state[4] - cur_state[4]
+    angle_diff = np.abs((raw_diff + np.pi) % (2 * np.pi) - np.pi)
     success = pos_diff < 20 and angle_diff < np.pi / 9
     return {"success": success, "block_pos_diff": float(pos_diff), "block_angle_diff": float(angle_diff)}
 
 
 def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regime: PhysicsRegime,
-                 seed: int, max_steps: int) -> dict:
+                 seed: int, max_steps: int, states: np.ndarray, seq_lengths: list[int]) -> dict:
     device = agent.device
 
-    init_state, goal_state = wrapper.sample_random_init_goal_states(seed)
+    rs = np.random.RandomState(seed)
+    init_state, goal_state = sample_dataset_init_goal(states, seq_lengths, rs)
 
     goal_obs, _ = prepare_with_visual(base_env, seed, goal_state)
     regime._apply_physics()  # must run after reset() rebuilds the pymunk space
@@ -153,7 +192,8 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="E0: planning success (CEM-driven episodes).")
-    parser.add_argument("--kind", required=True, choices=["ln_act", "lora4", "full"])
+    parser.add_argument("--kind", required=True, choices=["baseline", "ln_act", "lora4", "full"],
+                         help="'baseline' = frozen pretrained predictor, no chart applied.")
     parser.add_argument("--regime", required=True, choices=["R0", "R1", "R2"])
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=30)
@@ -179,10 +219,13 @@ def main() -> None:
     for p in wm.encoder.parameters():
         p.requires_grad_(False)
 
-    chart_path = args.charts_dir / f"chart_{args.kind}_{args.regime}.pt"
-    print(f"Applying chart: {chart_path}")
-    chart = Chart.load(str(chart_path), wm.predictor)
-    chart.apply_(wm.predictor)
+    if args.kind == "baseline":
+        print("kind=baseline -- no chart applied, using frozen pretrained predictor as-is.")
+    else:
+        chart_path = args.charts_dir / f"chart_{args.kind}_{args.regime}.pt"
+        print(f"Applying chart: {chart_path}")
+        chart = Chart.load(str(chart_path), wm.predictor)
+        chart.apply_(wm.predictor)
 
     cfg = build_cfg(args.num_samples, args.iterations, args.horizon, args.num_act_stepped)
     agent = GC_Agent(cfg, model, dset=None, preprocessor=prep)
@@ -191,6 +234,7 @@ def main() -> None:
     base_env = PushTEnv(render_size=224, with_velocity=True)
     wrapper = PushTWrapper(base_env)
     regime = PhysicsRegime(wrapper, args.regime)
+    states, seq_lengths = load_dataset_states()
 
     print(f"Running {args.episodes} episode(s): kind={args.kind} regime={args.regime} "
           f"num_samples={args.num_samples} iterations={args.iterations}")
@@ -205,7 +249,8 @@ def main() -> None:
     pbar = tqdm(range(args.episodes), desc=f"{args.kind}_{args.regime}", unit="ep")
     with open(jsonl_path, "w") as f:
         for ep in pbar:
-            result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps)
+            result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps,
+                                  states=states, seq_lengths=seq_lengths)
             results.append(result)
             f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime, **result}) + "\n")
             f.flush()
