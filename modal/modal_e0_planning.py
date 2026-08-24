@@ -70,6 +70,7 @@ def run_e0_planning(
     num_samples: int = 300,
     iterations: int = 30,
     horizon: int = 6,
+    log_planner_diagnostics: bool = False,
 ) -> None:
     """~14.4 min/episode extrapolated from a 6GB local GPU at reduced
     settings -- untested at full spec, may be faster on L40S/A100."""
@@ -78,23 +79,69 @@ def run_e0_planning(
     # Volumes are eventually consistent -- reload() picks up commits made by
     # a separate `modal volume put` process before this container started.
     atlas_volume.reload()
+    cmd = [sys.executable, "scripts/run_e0_planning.py",
+           "--kind", kind,
+           "--regime", regime,
+           "--episodes", str(episodes),
+           "--num-samples", str(num_samples),
+           "--iterations", str(iterations),
+           "--horizon", str(horizon),
+           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0"]
+    if log_planner_diagnostics:
+        cmd.append("--log-planner-diagnostics")
+    subprocess.run(cmd, check=True, cwd="/src")
+    atlas_volume.commit()
+
+
+@app.local_entrypoint()
+def main(kind: str = "ln_act", regime: str = "R1", episodes: int = 10,
+          num_samples: int = 300, iterations: int = 30, horizon: int = 6,
+          log_planner_diagnostics: bool = False) -> None:
+    run_e0_planning.remote(kind=kind, regime=regime, episodes=episodes,
+                            num_samples=num_samples, iterations=iterations, horizon=horizon,
+                            log_planner_diagnostics=log_planner_diagnostics)
+
+
+@app.function(
+    gpu="L4",
+    volumes={ATLAS_MOUNT_PATH: atlas_volume},
+    timeout=3600,
+)
+def diagnose_cem_costs(
+    kind: str = "baseline",
+    regime: str = "R1",
+    seed: int = 0,
+    num_samples: int = 300,
+    iterations: int = 30,
+    horizon: int = 6,
+    num_act_stepped: int = 6,
+) -> None:
+    """scripts/diagnose_cem_costs.py -- captures CEM's per-candidate costs at
+    iteration 0 (same RNG seed -> same candidates regardless of chart) and the
+    final iteration, to check whether a chart distorts CEM's cost ranking."""
+    import subprocess
+    import sys
+    atlas_volume.reload()
     subprocess.run(
-        [sys.executable, "scripts/run_e0_planning.py",
+        [sys.executable, "scripts/diagnose_cem_costs.py",
          "--kind", kind,
          "--regime", regime,
-         "--episodes", str(episodes),
+         "--seed", str(seed),
          "--num-samples", str(num_samples),
          "--iterations", str(iterations),
          "--horizon", str(horizon),
-         "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0"],
+         "--num-act-stepped", str(num_act_stepped),
+         "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0",
+         "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0_planning/cem_diagnostics"],
         check=True,
         cwd="/src",
     )
     atlas_volume.commit()
 
 
-@app.local_entrypoint()
-def main(kind: str = "ln_act", regime: str = "R1", episodes: int = 10,
-          num_samples: int = 300, iterations: int = 30, horizon: int = 6) -> None:
-    run_e0_planning.remote(kind=kind, regime=regime, episodes=episodes,
-                            num_samples=num_samples, iterations=iterations, horizon=horizon)
+@app.local_entrypoint(name="diagnose_cem_costs")
+def diagnose_cem_costs_entrypoint(kind: str = "baseline", regime: str = "R1", seed: int = 0,
+                                    num_samples: int = 300, iterations: int = 30, horizon: int = 6,
+                                    num_act_stepped: int = 6) -> None:
+    diagnose_cem_costs.remote(kind=kind, regime=regime, seed=seed, num_samples=num_samples,
+                               iterations=iterations, horizon=horizon, num_act_stepped=num_act_stepped)

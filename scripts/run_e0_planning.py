@@ -151,7 +151,8 @@ def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
 
 
 def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regime: PhysicsRegime,
-                 seed: int, max_steps: int, states: np.ndarray, seq_lengths: list[int]) -> dict:
+                 seed: int, max_steps: int, states: np.ndarray, seq_lengths: list[int],
+                 log_planner_diagnostics: bool = False) -> dict:
     device = agent.device
 
     rs = np.random.RandomState(seed)
@@ -168,11 +169,23 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
     success = False
     replans = 0
     final_check = {"block_pos_diff": None, "block_angle_diff": None}
+    planner_diagnostics = []  # per-replan CEM elite-cost convergence, if requested
     t_start = time.time()
     while elapsed < max_steps and not success:
         obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
         action = agent.act(obs_td, steps_left=max(max_steps - elapsed, 1))
         replans += 1
+
+        if log_planner_diagnostics:
+            # Free -- GC_Agent.plan() already computes and stores these; no extra
+            # planner compute. Per-CEM-iteration mean/std of the elite candidates'
+            # cost, e.g. does the search converge to a low-cost action, or stay
+            # high/noisy throughout -- a cheap signal on whether an adapter is
+            # confusing CEM's cost ranking, before capturing full per-candidate costs.
+            planner_diagnostics.append({
+                "elite_losses_mean": agent._prev_elite_losses_mean.squeeze(-1).tolist(),
+                "elite_losses_std": agent._prev_elite_losses_std.squeeze(-1).tolist(),
+            })
 
         action = rearrange(action.cpu(), "t (f d) -> (t f) d", d=2)
         action = agent.preprocessor.denormalize_actions(action).numpy()
@@ -186,8 +199,11 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
             if final_check["success"]:
                 success = True
                 break
-    return {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
-            **{k: v for k, v in final_check.items() if k != "success"}}
+    result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
+              **{k: v for k, v in final_check.items() if k != "success"}}
+    if log_planner_diagnostics:
+        result["planner_diagnostics"] = planner_diagnostics
+    return result
 
 
 def main() -> None:
@@ -205,6 +221,8 @@ def main() -> None:
     parser.add_argument("--charts-dir", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--out-dir", type=Path, default=atlas.OUT_DIR / "e0_planning",
                          help="Where to write per-episode JSONL + summary JSON.")
+    parser.add_argument("--log-planner-diagnostics", action="store_true",
+                         help="Log CEM's per-iteration elite-cost mean/std (free -- already computed).")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -250,7 +268,8 @@ def main() -> None:
     with open(jsonl_path, "w") as f:
         for ep in pbar:
             result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps,
-                                  states=states, seq_lengths=seq_lengths)
+                                  states=states, seq_lengths=seq_lengths,
+                                  log_planner_diagnostics=args.log_planner_diagnostics)
             results.append(result)
             f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime, **result}) + "\n")
             f.flush()

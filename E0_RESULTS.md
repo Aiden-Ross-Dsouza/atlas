@@ -1,5 +1,151 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## Update (2026-08-24, part 2): confirmed mechanism — E0 fine-tuning distorts CEM's cost ranking
+
+Following up on the finding below (baseline solves episode 0 at R1; every adapter fails it
+identically), `scripts/diagnose_cem_costs.py` (new, one-off diagnostic — monkey-patches
+`CEMPlanner.cost_function` at runtime, no jepa-wms files touched) captured CEM's actual
+per-candidate costs for `baseline` vs. `ln_act`, same episode (seed=0, R1), full published spec
+(num_samples=300, iterations=30).
+
+**Key fact this relies on:** CEM's planner always starts from `mean=0, std=var_scale` and draws
+candidates via a generator seeded from `cfg.local_seed` (hardcoded to 0). Since only the *predictor*
+is adapted — the DINOv2 encoder is frozen and identical either way — iteration 0 samples the exact
+same 300 candidate action sequences under both models. Verified directly: `max abs diff: 0.0` between
+the two runs' iteration-0 action tensors. This makes the iteration-0 costs a clean, same-input,
+different-model comparison — not an artifact of different units or different candidates.
+
+**Result — the two models don't just disagree by a shift, they disagree about which actions are
+even good:**
+- Spearman rank correlation between baseline's and `ln_act`'s costs for the identical 300
+  candidates: **0.089 (p=0.12)** — statistically indistinguishable from zero.
+- Baseline's best candidate (cost 0.378 under baseline) is ranked a reasonable #13/300 by `ln_act`.
+- **`ln_act`'s best candidate (cost 0.333 — its own top pick) is ranked #110/300 by baseline**
+  (baseline scores it 0.622, worse than baseline's own average of 0.652 across all 300). The
+  specific action the adapter is most confident is good is, by the frozen model's own (empirically
+  validated) judgment, a mediocre-to-bad choice.
+- By the final iteration, each model has converged to its own preferred region: baseline's elite
+  cluster is tighter and lower (mean 0.076, max 0.218) than `ln_act`'s (mean 0.117, max 0.411) —
+  roughly 1.5-2x worse, measured in the adapter's own cost units, not just in real-world outcome.
+
+**Conclusion:** this is not a case of "the adapter is slightly worse everywhere." `ln_act`'s CEM
+search converges *confidently* (tight, low-variance elite set by iteration 30 — the search itself
+works correctly) toward an action that its own distorted cost landscape rates as excellent, but
+which both the frozen model's cost function and the real environment agree is mediocre. This matches
+exactly what happened in reality: baseline executed a real working push (14px from goal, success);
+`ln_act` executed its confidently-chosen action and the block barely moved at all (32px — unchanged
+from the initial displacement, failure). E0's offline fine-tuning objective (open-loop prediction
+error on 3 training trajectories × 10 steps) measurably distorts the predictor's counterfactual
+cost/ranking function that CEM depends on, even though it can simultaneously *improve* the offline
+UMF metric (as it did for `ln_act` at R1). **Minimizing prediction error does not necessarily
+preserve planning competence** — a citable finding in its own right (the proposal's §3.2 already
+names this tension in general terms; this is now direct, quantified evidence of it in this substrate).
+
+**Not yet checked:** whether this generalizes beyond this one episode/adapter/regime (`ln_act`/R1/
+seed=0) — this diagnostic was deliberately run on a single, cheap, clean instance to establish the
+mechanism, not to characterize how often or how severely it occurs. Raw captures:
+`atlas_out/e0_planning/cem_diagnostics/{baseline,ln_act}_R1_seed0.json`.
+
+## Update (2026-08-24, part 1): two real bugs in the planning-success harness fixed; new finding — trained adapters may be *hurting* real CEM planning at R1/R2
+
+The first planning-success runs (previous section below) showed 0% success across every kind/regime
+combo, including the frozen baseline. Investigation found two real bugs in `run_e0_planning.py`
+itself (not in `atlas/`'s core ATLAS logic), both now fixed:
+
+1. **Success check coupled to an irrelevant quantity.** `PushTWrapper.eval_state()` (jepa-wms's own
+   utility) compares `state[:4]` = `[agent_x, agent_y, T_x, T_y]` together — meaningful only when
+   goal/init states come from a correlated real trajectory (`goal_source=dset`). Our goals were
+   independently random (`sample_random_init_goal_states`), so the "target pusher position" baked
+   into the goal had nothing to do with where the pusher would sensibly end up after actually placing
+   the block — success required both to align by pure chance, which essentially never happens.
+   **Fixed:** `run_e0_planning.py::block_success()` now compares only the T-block's position/angle
+   (indices 2-4), matching Push-T's actual objective (and IBC/Diffusion Policy's own metric).
+2. **Angle-wrap bug, both upstream and inherited.** `generate_state()` draws the goal angle as
+   `randn()*2pi - pi` — an unbounded Gaussian, not a wrapped angle — so a raw angle difference could
+   span several full rotations. The wrap formula (`min(d, 2pi-d)`), valid only within one rotation,
+   produced garbage (even negative) results for larger differences. **Fixed:** proper fold-into-range
+   formula (`abs((d+pi) % 2pi - pi)`), verified against edge cases including multi-rotation input.
+3. **Root cause underneath both:** independently-random init/goal pairs are frequently far apart
+   (167-223px commonly), asking CEM to solve in one 30-step, no-replan shot — a near-impossible
+   one-shot control problem regardless of adapter quality, producing a floor effect that looked like
+   "0% success everywhere" but was actually "the benchmark itself was unsolvable." **Fixed:** goals
+   are now sampled from real recorded Push-T trajectory segments (`data/pusht_noise/train/states.pth`
+   — only the 175MB raw-state file is needed, not the full 7GB dataset with visual/action/token data).
+   `init_state = states[ep, offset]`, `goal_state = states[ep, offset+30]`, both padded with zero
+   velocity to match `with_velocity=True`. Verified: median displacement dropped from ~167-223px to
+   ~35px across 50 samples — a plausible, solvable one-shot task.
+
+### Graduated validation (per a staged plan: fix → smoke-test → small screen → decide)
+
+**Frozen baseline (no chart) at R0:** 2/2 success, real margins (`block_pos_diff` 9.5/14.6,
+well under the 20px threshold) — confirms the fixed benchmark is genuinely solvable.
+
+**Small 2-3-episode screen, ln_act/lora4/full × R1/R2 (18 episodes) vs. frozen baseline at R1/R2
+(6 episodes), same seeds for direct comparison:**
+
+| | Ep0 | Ep1 | Ep2 | Success |
+|---|---|---|---|---|
+| Baseline R1 (no adapter) | 14.2 / 0.05 **T** | 12.9 / 0.14 **T** | 62.2 / 0.70 F | **2/3** |
+| Baseline R2 (no adapter) | 9.3 / 0.07 **T** | 19.7 / 0.15 **T** | 62.2 / 0.70 F | **2/3** |
+| ln_act R1 | 32.4 / 0.05 F | 19.5 / 0.18 **T** | 62.2 / 0.70 F | 1/3 |
+| lora4 R1 | 32.4 / 0.05 F | 39.9 / 0.39 F | 25.3 / 0.33 F | 0/3 |
+| full R1 | 32.4 / 0.05 F | 17.8 / 0.44 F | 25.1 / 0.05 F | 0/3 |
+| ln_act R2 | 32.4 / 0.05 F | 45.8 / 0.97 F | 31.1 / 1.16 F | 0/3 |
+| lora4 R2 | 32.4 / 0.05 F | 45.8 / 0.97 F | 62.2 / 0.70 F | 0/3 |
+| full R2 | 32.4 / 0.05 F | 14.0 / 0.67 F | 62.2 / 0.70 F | 0/3 |
+
+(values are `block_pos_diff` / `block_angle_diff`; success threshold is pos<20, angle<0.35 rad)
+
+**Baseline: 4/6 (67%) across R1+R2. All adapters combined: 1/18 (5.6%).**
+
+### Two structural patterns in the data
+
+- **Episode 2 fails identically everywhere** (`62.2/0.70`, byte-exact across all 8 runs — every
+  kind, every regime, including baseline). Init/goal sampling depends only on the episode seed, not
+  regime/chart, and the final position exactly equals the *initial* displacement (the block never
+  moved). This looks like a genuinely hard/unreachable task instance at this horizon (agent starts
+  too far from the block to make contact and complete the push in one 30-step, no-replan shot) —
+  independent of model quality, not evidence of anything broken.
+- **Episode 0 is the real finding.** Baseline solves it cleanly in both regimes (14.2 then 9.3px);
+  every trained adapter fails it identically (32.4px — again exactly the initial displacement, zero
+  progress). Applying *any* chart turned a solvable episode into a complete failure on this specific
+  instance, in both R1 and R2.
+
+### Interpretation — a real, reportable result, not a broken pipeline
+
+The near-miss numbers throughout are sane (no garbage/NaN/floor effect) — this isn't a code bug in
+the new harness. But it directly contradicts E0's own UMF-based ranking: the offline UMF screen found
+`ln_act`/`lora4` *improving* over baseline at R1 (Reduction vs. baseline: ln_act +46.7%, lora4 +31.4%),
+yet here, under real CEM-driven planning, every adapter does *worse* than no adapter at all. This is
+exactly the risk `E0_RESULTS.md`'s caveat #6 flagged as hypothetical — "the ranking above is a screen
+based on one specific, non-planner action distribution, and could plausibly change" — now observed
+directly rather than just anticipated.
+
+**Leading hypothesis (not yet confirmed):** E0's fine-tuning optimizes open-loop prediction error on
+the *observed* held-out trajectory (3 training rollouts × 10 steps, itself a very small/narrow action
+distribution — see caveat #1). CEM, however, scores hundreds of *counterfactual* candidate action
+sequences that were never part of that training data. An adapter can plausibly get better at
+predicting the one trajectory it saw while getting *worse* at correctly ranking the many hypothetical
+action sequences CEM actually needs to compare — i.e., minimizing prediction error does not
+necessarily preserve planning competence. This would itself be a legitimate, citable finding for
+ATLAS (the proposal's own §3.2 already flags this exact tension in general terms), not just a
+methodology problem.
+
+**Not yet confirmed because we don't have the evidence for the mechanism.** `run_e0_planning.py`
+currently logs only the *executed* action's outcome — not the CEM planner's internal candidate
+rankings/costs. To confirm or rule out the hypothesis directly, the next diagnostic step (not yet
+run) is: for episode 0 specifically (same seed, same CEM `local_seed`), instrument the planner to log
+the top-K candidate action sequences and their predicted costs under the frozen baseline vs. an
+adapter, and check whether the adapter inverts the cost ranking (rates a no-contact/bad action as
+better than the correct push). This needs code changes to capture (jepa-wms's `CEMPlanner` doesn't
+expose this by default) — not yet implemented as of this write-up.
+
+**Other hypotheses not ruled out:** too little/narrow E0 training data (30 transitions/regime) to
+safely modify a predictor CEM depends on; the fine-tuning objective/hyperparameters causing
+over-adaptation to the tiny training set; a residual implementation issue in chart apply/restore
+(considered less likely given `full`/`ln_act`/`lora4` all show the same qualitative pattern, and
+Chart apply/restore already passed its own bug fixes in `code-review.md` Bugs #1/#3/#4/#6f).
+
 ## Update: planning-success half — validated end-to-end on Modal (L4 GPU)
 
 `modal run modal/modal_e0_planning.py --kind ln_act --regime R1 --episodes 1 --num-samples 100`
