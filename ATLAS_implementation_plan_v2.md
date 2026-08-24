@@ -120,11 +120,11 @@ for n, p in model.predictor.named_parameters():
 print('predictor params:', sum(p.numel() for p in model.predictor.parameters()))
 ```
 
-| Surface | Selector | Expected params |
+| Surface | Selector | Real params (T12 #10 correction) |
 |---|---|---|
-| **LN affine + action encoder** | `.norm`/`.ln` with `ndim==1`, plus the action-conditioning module | ≈ **10.4 k** |
-| **LoRA r=4** on attention `qkv`+`proj` | injected | ≈ **55 k** |
-| **Full predictor** | all | ≈ **1.8 M** |
+| **LN affine ONLY** | `.norm`/`.ln` with `ndim==1` | **10,764**. NOT "+ action encoder" — the action encoder is a *sibling* of the predictor (`video_wm.py:82-83`), structurally unreachable from a `Chart` built on `predictor` alone. The ~10.4k count that seemed to validate the original "LN + action encoder" description was a coincidence: LN alone already totals 10,764 |
+| **LoRA r=4** on attention `qkv`+`proj` | injected | **118,176 trainable** (10,292,640 stored pre-training — see `Chart.n_params()`) |
+| **Full predictor** | all | **20,800,884** |
 
 > ⚠️ **JEPA-WM's best Push-T config is `predAdaLN`** (`pt_..._predAdaLN_ftprop_depth6_...`), i.e. *adaptive* LayerNorm. If normalisation is produced by a conditioning MLP there are no free LN affine parameters, and the primary chart surface does not exist as specified. **This is why `dino_wm_pusht` (plain LN, `pred_dino_wm`) is the primary checkpoint.** If you later use the JEPA-WM checkpoint, target the AdaLN conditioning MLP's output projection instead — equally small, equally valid, different code path.
 
@@ -249,6 +249,47 @@ $$\text{GPU-h} = \frac{\text{sec/ep} \times \text{episodes} \times \text{segment
 2. Episodes/segment 20 → 15
 3. Max MPC steps 30 → 20 *(AdaJEPA's own ablation setting)*
 4. Drop the ATLAS-fixed-library arm
+
+### 7.0a CORRECTION (2026-08-24, T6): §7.0's planner budget is AdaJEPA's, not this substrate's — restored to `dino_wm_pusht`'s own validated config
+
+**§7.0's "CEM 200 samples × 10 opt steps, subplanner horizon 25, 5 executed actions per
+replan, ≤30 MPC steps" are AdaJEPA's published hyperparameters (Table 4: 200 samples,
+10 opt steps, subplanner horizon 25, 5 executed actions, frameskip 5, max 20 MPC
+steps) — a different substrate** (a small ResNet + PLDM, not `dino_wm_pusht`'s frozen
+DINOv2 + ViT predictor). Applied literally to this checkpoint, `horizon=25` means 125
+raw steps of model lookahead for a task DINO-WM itself samples to be feasible within a
+horizon of 6 — not a faithful port, an unexamined transplant. Confirmed empirically:
+under §7.0's numbers the frozen baseline solved 0/1 episodes; under the config below it
+solved 2/3.
+
+**Fix, effective for E0's planning-success half and E1 (`scripts/run_e0_planning.py`,
+`scripts/run_e1.py`, and the Modal defaults in `modal/modal_e0_planning.py`):** use the
+config `dino_wm_pusht` was actually validated under —
+`vendor/jepa-wms/configs/evals/simu_env_planning/pt/dino-wm/pt_L2_cem_sourcedset_H6_nas6_ctxt2_r224_alpha0.1_ep96_decode.yaml:200-205`:
+
+```
+num_samples=300, iterations=30, num_elites=10, horizon=6,
+num_act_stepped=6, var_scale=1.0, frameskip=5   →  30 raw steps/episode, 1 replan
+```
+
+This is the config DINO-WM reports ~90% Push-T SR under. **This is a deliberate,
+documented deviation from §7.0, justified as substrate fidelity — not a silent
+change**: every arm still uses the same CEM planner and config (§1's non-negotiable
+#1 is preserved), only the specific hyperparameter *values* differ from what §7.0
+originally specified.
+
+**Consequence for E1 specifically, not yet resolved:** at `num_act_stepped=6`, one
+replan already covers a full 30-raw-step episode, leaving no room for E1's
+`N_WARMUP_REPLANS`-then-route structure within `MAX_MPC_STEPS=30` as currently defined.
+See `E0_HANDOFF.md`'s "RESOLVED (T6)" section and the comment block above
+`CEM_NUM_SAMPLES` in `scripts/run_e1.py` — needs a real decision (e.g. scaling
+`MAX_MPC_STEPS` to `N_desired_replans × num_act_stepped × frameskip` raw steps) before
+the real 60×3 T11 run.
+
+**This also resolves the `num_act_stepped` 1-vs-5 ambiguity** that `E0_HANDOFF.md`
+previously left open — at `nas=6`, one replan covers the whole episode, so there is no
+"1 model-action-per-replan" vs. "5 model-actions-per-replan" reading left to choose
+between.
 
 ### 7.1 E0 — adapter capacity (RQ0). *Days 3–4, ~3 GPU-h*
 

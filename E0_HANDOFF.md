@@ -17,7 +17,20 @@ regimes, becomes the adapter kind used everywhere downstream (E1 onward).
 
 ## Current state, in one paragraph
 
-The UMF half is done and trustworthy (`atlas_out/e0/results.json`, `E0_RESULTS.md`'s original
+**⚠️ 2026-08-25: the sentence below ("the UMF half is done and trustworthy") was WRONG — see
+`CLAUDE.md` §0.1's CRITICAL entry and `E0_DIAGNOSIS_AND_PLAN.md`.** `atlas/score.py::_open_loop_rollout`
+— shared by UMF scoring AND E0's own fine-tuning — did not unroll the checkpoint correctly (5×
+wrong time base, zeroed proprio the checkpoint structurally requires, 1-frame instead of
+`ctxt_window=2` context). Fixed and hardware-verified (`E0_IMPLEMENTATION_PLAN.md` T1–T5): real
+30-raw-step trajectory now gives frozen-model identity-chart UMF = 0.227 (vs. pre-fix 24–52 online /
+0.67–1.67 offline). **Every UMF number below and in `E0_RESULTS.md`'s original table is invalidated**
+— E0's charts have not yet been retrained through the fix (T9, blocked on approval). The planner-config
+paragraph below is still accurate as far as it goes, but has itself been further corrected since (T6
+— see "RESOLVED (T6)" section below): the config now defaults to the SUBSTRATE's own validated spec
+(`num_samples=300, horizon=6, num_act_stepped=6`), not the AdaJEPA-derived Sec7.0 numbers this
+paragraph describes as "corrected."
+
+Original paragraph, kept for the record: The UMF half is done and trustworthy (`atlas_out/e0/results.json`, `E0_RESULTS.md`'s original
 table). The planning-success half went through five rounds of real bugs before producing anything
 trustworthy — success metric, goal sampling, and (the big one) **the entire CEM planner
 configuration was wrong**, pulled from jepa-wms's own shipped eval config instead of this project's
@@ -74,6 +87,41 @@ number dated before 2026-08-24 afternoon** — check the config fields logged al
    independently) uses `5`. Both are internally consistent within their own scripts but disagree
    with each other. **This is not resolved — read the next section before changing either script.**
 
+## ✅ RESOLVED (2026-08-24, T6): what does "≤30 MPC steps" mean?
+
+**Superseded by `E0_IMPLEMENTATION_PLAN.md` T6.** Both readings below turned out to be
+downstream of the same mistake: neither `run_e0_planning.py` nor `run_e1.py` was using
+plan §7.0's own AdaJEPA-derived budget correctly in the first place — §7.0's numbers
+("CEM 200×10, horizon 25, 5 executed actions, ≤30 MPC steps") are **AdaJEPA's**
+published hyperparameters, a **different substrate** (small ResNet + PLDM), not
+`dino_wm_pusht`'s. Applied literally to this checkpoint, `horizon=25` means 125 raw
+steps of lookahead for a task DINO-WM itself samples to be feasible within 25 — not a
+faithful port, an unexamined transplant.
+
+**Fix:** both scripts now default to `dino_wm_pusht`'s own validated config
+(`vendor/jepa-wms/configs/evals/simu_env_planning/pt/dino-wm/pt_L2_cem_sourcedset_H6_nas6_ctxt2_r224_alpha0.1_ep96_decode.yaml:200-205`):
+`num_samples=300, iterations=30, num_elites=10, horizon=6, num_act_stepped=6,
+var_scale=1.0` → **30 raw steps/episode, 1 replan**. This is a documented deviation
+from plan §7.0, justified as substrate fidelity — see
+`ATLAS_implementation_plan_v2.md` §7.0a. Verified: both scripts' `build_cfg`/
+`build_planner_cfg` now resolve to byte-identical planner dicts.
+
+**At `num_act_stepped=6`, one replan covers the whole 30-step episode — there is no
+`1`-vs-`5` ambiguity left to resolve.** Reading A (below) and Reading B (below) are
+both now moot: neither script uses `num_act_stepped=1` or `=5` any more.
+
+**New open issue this creates for E1 specifically (not resolved):** E1's routing
+design needs *multiple* replans per episode (`N_WARMUP_REPLANS` then routed ones) to
+exercise routing at all, but nas=6/horizon=6 means one replan already covers a full
+30-raw-step episode — leaving no room for E1's warmup-then-route structure within
+`MAX_MPC_STEPS=30`. See the comment block above `CEM_NUM_SAMPLES` in
+`scripts/run_e1.py` for the detail. This needs a real decision (e.g. scaling
+`MAX_MPC_STEPS` to `N_desired_replans × num_act_stepped × frameskip` raw steps) before
+the real 60×3 run — flagged, not silently resolved.
+
+<details>
+<summary>Original (superseded) discrepancy writeup, kept for the record</summary>
+
 ## ⚠️ Open, unresolved discrepancy: what does "≤30 MPC steps" mean?
 
 Two independent, each internally-consistent readings of the same plan sentence ("CEM 200×10, horizon
@@ -108,16 +156,23 @@ comparable things right now. Suggested next step: ask the user, or find an autho
 planning hyperparameters, which we adopt") for what "5 executed actions per replan" and "≤30 MPC
 steps" concretely mean in raw-action terms.
 
+</details>
+
 ## What's validated vs. not, right now
+
+**⚠️ This table is itself now partly superseded by `E0_IMPLEMENTATION_PLAN.md` T1's rollout-bug fix
+(2026-08-25) — see `CLAUDE.md` §0.1's CRITICAL entry before trusting any row below.** In particular
+the "UMF table ... unaffected" row was WRONG: the UMF half shared the same broken
+`_open_loop_rollout` as everything else and is invalidated too.
 
 | Claim | Status |
 |---|---|
-| UMF table (3 kinds × 3 regimes) | ✅ Valid, unaffected by anything above |
-| `replans=6` achievable under corrected config | ✅ Confirmed empirically (Reading A, `num_act_stepped=1`) |
-| Baseline vs. `ln_act`/R1 comparison, corrected config | ⚠️ n=1 only (episode 0). Earlier dramatic "baseline wins clean, adapter fails identically" result (from the *wrong* config) did **not** replicate — both failed this instance, `ln_act` somewhat worse on both metrics. Not enough data to conclude anything statistically. |
-| CEM-cost ranking-distortion finding (`ρ≈0.089`, adapter's top pick ranked #110/300 by baseline) | ⚠️ Measured under the **wrong** CEM config (`diagnose_cem_costs.py` run before the fix). Mechanism may still be real but is not re-validated. |
-| G3a/G3b gates | ✅ Passing, but explicitly scoped to mechanism-correctness only — do not cite as evidence ATLAS would catch a chart like the one above (see `scripts/smoke_gates.py::gate_g3a`/`gate_g3b` docstrings). |
-| Richer-retrained `ln_act`/R1 chart (5 trajs × 30 steps vs. original 3×10) | ⚠️ UMF got *worse* (0.68→1.11), not better. Planning success of this richer chart has not been measured at all — only the original chart has been re-tested under the corrected config so far. Chart lives at `atlas_out/e0_richer/chart_ln_act_R1.pt`, kept separate from the original `atlas_out/e0/chart_ln_act_R1.pt` on purpose. |
+| UMF table (3 kinds × 3 regimes) | ❌ **INVALIDATED** (not "unaffected" as this row previously claimed) — shared the same broken `_open_loop_rollout` as the planning half. Fixed in T1; charts themselves not yet retrained (T9, blocked on approval). |
+| `replans=6` achievable under corrected config | Superseded — T6 restored the substrate's own config (`nas=6`, `horizon=6`), under which one replan covers the whole 30-step episode (see the "RESOLVED (T6)" section above), not 6. |
+| Baseline vs. `ln_act`/R1 comparison, corrected config | ⚠️ n=1 only (episode 0), and measured under a planner config (Reading A) since superseded by T6 — needs re-measurement under the T6 config, and against a retrained (T9) chart. |
+| CEM-cost ranking-distortion finding (`ρ≈0.089`, adapter's top pick ranked #110/300 by baseline) | ⚠️ Measured under the **wrong** CEM config *and* the broken rollout (`diagnose_cem_costs.py` run before either fix). Mechanism may still be real but is not re-validated against either correction. |
+| G3a/G3b gates | ✅ Passing post-rollout-fix too (re-confirmed 2026-08-25), still explicitly scoped to mechanism-correctness only — do not cite as evidence ATLAS would catch a chart like the one above (see `scripts/smoke_gates.py::gate_g3a`/`gate_g3b` docstrings). |
+| Richer-retrained `ln_act`/R1 chart (5 trajs × 30 steps vs. original 3×10) | ❌ **INVALIDATED** — trained through the same broken rollout as everything else. The "UMF got worse with more data" finding was itself likely an artifact of fitting a mis-specified target harder (see `E0_DIAGNOSIS_AND_PLAN.md`), not a real richer-data effect. Re-measure post-T9 if still relevant. |
 
 ## Operational notes (learned the hard way this session)
 
@@ -131,17 +186,23 @@ steps" concretely mean in raw-action terms.
 - **`modal app logs <app-id>`** is the reliable way to reconnect to a detached job's live output
   after the original `modal run` process's stream disconnects — more robust than re-running `modal
   run` (which starts a new job) or trusting a stale local log file.
-- Real per-episode wall time under the corrected config (`num_samples=200, iterations=10, horizon=25,
-  num_act_stepped=1`, Reading A / 30 raw steps): **~42 minutes** on an L4. Budget accordingly —
-  this is not a quick check anymore the way the old (wrong) config's ~7 min/episode was.
+- Real per-episode wall time under the (now superseded, see "RESOLVED (T6)" above) `num_samples=200,
+  iterations=10, horizon=25, num_act_stepped=1` config: **~42 minutes** on an L4. Budget accordingly
+  — under the T6 config (`num_samples=300, horizon=6`) throughput is different again; see
+  `scripts/profile_episode.py`'s output (T8, now implemented for real) for a current measurement
+  rather than trusting this stale number.
 - `data/pusht_noise/train/states.pth` (175MB) and `seq_lengths.pkl` must be on the Modal volume at
   the **volume-root-relative** path `/data/pusht_noise/train/...` (not `/atlas_root/data/...`) —
   same lesson as the hub-cache and chart uploads, see `code-review.md` Bug #8/#9.
 
 ## Immediate next steps, in order
 
-1. **Resolve the `num_act_stepped`/episode-length ambiguity above** — this blocks trusting any
-   further planning-success numbers, in either `run_e0_planning.py` or `run_e1.py`.
+**⚠️ Superseded by `E0_IMPLEMENTATION_PLAN.md` T1–T13 (2026-08-25) — the rollout bug found after this
+list was written invalidates the UMF table this list's steps 2-5 assumed was solid ground. Read
+`CLAUDE.md` §0.1's CRITICAL entry and `E0_IMPLEMENTATION_PLAN.md` before resuming any of this.**
+Original list kept for the record:
+
+1. ~~Resolve the `num_act_stepped`/episode-length ambiguity above~~ — done, see "RESOLVED (T6)" above.
 2. Once resolved, get real n>1 data for baseline vs. `ln_act`/R1 under the settled config (currently
    n=1 each) — check whether the CEM-ranking-distortion finding re-appears with real statistics.
 3. Extend to `lora4`/`full` and R2 once the R1 baseline comparison is trusted.
@@ -150,3 +211,14 @@ steps" concretely mean in raw-action terms.
 5. Only after 2–4: decide whether E0's pre-registered rule produces a valid winner, or whether "no
    valid winner, RQ0 failed under this protocol" is the honest reportable result (per `CLAUDE.md`
    §1.8 — don't manufacture a winner to keep moving).
+
+**Current real next steps, in order (post T1–T8):**
+
+1. 🛑 T9 (needs approval) — retrain E0's charts through the repaired pipeline, with more data
+   (replay real demo trajectories under `PhysicsRegime`) and early stopping.
+2. 🛑 T10 (needs approval) — the chart×regime planning matrix: E0's real Success column, E1's
+   oracle/random denominators, and the C3 UMF-vs-success validation figure, all from one run. This is
+   the project's decision point (RQ0) — run before E1.
+3. Resolve E1's new episode-length-vs-warmup-replans issue (flagged in `scripts/run_e1.py`'s own
+   comment block) before attempting T11.
+4. 🛑 T11 (needs approval, only if T10 says the denominator exists) — E1's real 60×3 run.

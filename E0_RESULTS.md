@@ -1,5 +1,43 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## ⚠️ SUPERSEDED (2026-08-25, `E0_IMPLEMENTATION_PLAN.md` T1–T8): everything below this line is invalidated
+
+**Root cause, found after this file's "part 3" update below:** `atlas/score.py::_open_loop_rollout`
+— used by both UMF scoring and E0 chart fine-tuning — did not unroll the checkpoint the way it
+actually unrolls. Four stacked defects: (1) time base wrong by 5× (the rollout looped over RAW action
+count while the encoded action features only had `raw/frameskip` valid entries, so most steps re-fed
+a stale action and compared a 5-frames-ahead prediction against a 1-frame-ahead target); (2) proprio
+hard-zeroed, when this checkpoint's predictor structurally *requires* real proprio (concatenated into
+the token channel width — `forward_pred(proprio=None)` is a channel-width `RuntimeError`, not a
+graceful no-proprio path, confirmed empirically); (3) context window fixed at 1 frame instead of the
+checkpoint's `ctxt_window=2`; (4) a correct implementation (`EncPredWM.unroll()`) already shipped in
+the checkpoint's own wrapper and went unused. Full diagnosis: `E0_DIAGNOSIS_AND_PLAN.md`.
+
+**This invalidates:** every UMF number below (the `ln_act > lora4 > full` ranking, the 18-episode
+sweep, the baseline-vs-adapter comparisons, the CEM-cost-ranking diagnostic, the "richer retraining
+made it worse" result), all 9 charts in `atlas_out/e0/*.pt`, and this file's own "part 3" CEM-config
+correction below (that correction is real and still holds — the planner config bug it describes was
+a *second*, independent bug — but the UMF/rollout numbers it was measured against are still invalid).
+
+**Fixed, verified on real hardware (`E0_IMPLEMENTATION_PLAN.md` T1–T5):** `_open_loop_rollout`
+rewritten on `EncPredWM.unroll()`; real proprio threaded through `score.umf()`,
+`harness.run_e0_finetune()`/`run_e1_episode()`, `router.py`, and `expand.py`; E0's trajectory
+generation chunk-aligned to the model time base with real captured proprio
+(`load_regime_trajectories`); the informative-chunk motion gate (G6) wired into both E0 and E1's UMF
+calls. Real 30-raw-step R1 trajectory, frozen model, identity chart: **UMF = 0.227** (< 1.0, vs. this
+file's pre-fix online 24–52 / offline 0.67–1.67 range). A tiny live 5-step fine-tune shows real
+gradient flow (loss 0.099 → 0.077). All available gates (G2, G3a, G3b, G5, G6) pass; G1/G4 still need
+a live env to actually exercise (see `CLAUDE.md` §0.1 and `E0_IMPLEMENTATION_PLAN.md`'s Final Gate
+section for the current honest status).
+
+**Not yet done:** T9 (retrain all charts through the repaired pipeline) and T10 (the chart×regime
+planning matrix — E0's real Success column) both require explicit approval per
+`E0_IMPLEMENTATION_PLAN.md`'s 🛑 STOP gates before spending GPU budget on them. Until T9 lands, there
+is no valid E0 chart to report a Success column for, and every number below should be read as
+historical record of the pre-fix pipeline, not a current finding.
+
+---
+
 ## Update (2026-08-24, part 3): CEM config was wrong for everything below — corrected, and the headline finding does not cleanly replicate
 
 **Everything in "part 2" and the graduated-screen table further below (the 18-episode sweep, the
