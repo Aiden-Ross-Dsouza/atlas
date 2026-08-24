@@ -1,6 +1,57 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## Update (2026-08-24, part 3): CEM config was wrong for everything below — corrected, and the headline finding does not cleanly replicate
+
+**Everything in "part 2" and the graduated-screen table further below (the 18-episode sweep, the
+baseline-vs-adapter comparisons, the CEM-cost-ranking diagnostic) was run under the wrong CEM
+planner configuration.** `scripts/run_e0_planning.py` used `num_samples=300, iterations=30,
+horizon=6, num_act_stepped=6` — pulled from jepa-wms's own shipped eval YAML and mislabeled "the
+published spec" in this script's own comments. The implementation plan's actual, explicitly
+project-wide planner budget (§7.0, restated in §7.6: *"Planner constant everywhere"*) is **CEM 200
+samples × 10 opt steps, subplanner horizon 25, 5 executed actions per replan, ≤30 MPC steps"** —
+a materially different setup: the old config collapsed to a single one-shot replan per episode;
+the correct one runs ~6 replans per episode with real closed-loop correction. A second bug was
+found fixing this: `num_act_stepped` must be **1** (one model-chunk = `FRAMESKIP=5` raw actions),
+not 5 — `num_act_stepped=5` empirically gives only ~2 replans/episode (25 raw actions/replan), not
+the ~6 the plan describes; `num_act_stepped=1` gives exactly 6, confirmed by direct measurement.
+(`scripts/run_e1.py` has the same `num_act_stepped=5` bug — not fixed there, out of scope for this
+file.) Both fixed in `scripts/run_e0_planning.py`/`modal/modal_e0_planning.py`; new results below
+and going forward use the corrected config. Old results are kept below for the record (each row
+carries its own config values) but should not be read as current findings.
+
+**First corrected-config check (baseline vs. `ln_act`, R1, episode 0 — the same task instance the
+part-2 diagnostic used):**
+
+| | block_pos_diff (success <20) | block_angle_diff (success <0.35) | Result |
+|---|---|---|---|
+| baseline | 38.99 | 0.049 | Fail |
+| ln_act | 48.71 | 0.301 | Fail |
+
+n=1 each (a second episode was cut short by an unrelated operational issue — a killed local Modal
+CLI launcher process eventually propagated a cancellation to the remote job, ~40 min into a ~42 min
+episode; not a code bug, more episodes to follow). **The part-2 headline result — baseline cleanly
+solves episode 0, every adapter fails it identically — does not replicate under the corrected
+config.** Under real closed-loop CEM (6 corrective replans instead of 1 one-shot), *neither*
+baseline nor `ln_act` succeeds on this instance. `ln_act` is still worse on both metrics (further
+from the goal, much worse angle), so the qualitative direction (adapter underperforms baseline) may
+still hold, but the dramatic "clean win vs. complete failure" contrast reported in part 2 was very
+likely an artifact of the broken single-shot config, not a robust effect. **Treat part 2's rank-
+correlation-≈0 / "ranking inversion" finding as not yet re-validated** — it may still be real, but
+needs to be re-measured under this corrected config before being trusted, per the same caution.
+
+Also run alongside this: a controlled retraining check on `ln_act`/R1 with 5 trajectories × 30 steps
+(vs. the original 3×10) to test whether E0's original charts were simply undertrained. Result:
+**eval UMF got worse, not better** (0.68 → 1.11) — richer training on the same scripted-walk action
+distribution did not help, and if anything hurt. This weakens the "just undertrained" hypothesis and
+is more consistent with a genuine distribution-mismatch explanation (E0's training actions don't
+resemble what CEM actually explores) — though this chart's *planning* success (not just UMF) hasn't
+been checked yet.
+
 ## Update (2026-08-24, part 2): confirmed mechanism — E0 fine-tuning distorts CEM's cost ranking
+
+**Superseded by the CEM-config correction above — read that note first.** The diagnostic below was
+run under the wrong planner config; the mechanism it describes may still be real but has not yet
+been re-validated under the corrected setup.
 
 Following up on the finding below (baseline solves episode 0 at R1; every adapter fails it
 identically), `scripts/diagnose_cem_costs.py` (new, one-off diagnostic — monkey-patches
@@ -47,6 +98,10 @@ mechanism, not to characterize how often or how severely it occurs. Raw captures
 `atlas_out/e0_planning/cem_diagnostics/{baseline,ln_act}_R1_seed0.json`.
 
 ## Update (2026-08-24, part 1): two real bugs in the planning-success harness fixed; new finding — trained adapters may be *hurting* real CEM planning at R1/R2
+
+**Superseded by the CEM-config correction in part 3 above** — the dataset-goal/angle-wrap fixes
+described here are still correct and still in effect, but the 18-episode graduated-screen table
+this section leads to was run under the wrong CEM planner config. Read part 3 first.
 
 The first planning-success runs (previous section below) showed 0% success across every kind/regime
 combo, including the frozen baseline. Investigation found two real bugs in `run_e0_planning.py`
