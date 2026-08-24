@@ -11,10 +11,29 @@ key Push-T never sets). Reuses only GC_Agent/CEMPlanner (generic, no
 task-specific code) plus PushTWrapper's two Push-T utility methods
 (sample_random_init_goal_states, eval_state), with its own minimal episode loop.
 
-STATUS: correctness-tested at reduced CEM settings only (small num_samples/
-iterations). NOT run at the published spec (num_samples=300, iterations=30) --
-that OOMs immediately on a 6GB GPU. See code-review.md Bug #7 for the memory
-numbers and the Modal recommendation.
+Planner config defaults to the SUBSTRATE's own validated Push-T config
+(vendor/jepa-wms/configs/evals/simu_env_planning/pt/dino-wm/
+pt_L2_cem_sourcedset_H6_nas6_ctxt2_r224_alpha0.1_ep96_decode.yaml:200-205):
+num_samples=300, iterations=30, num_elites=10, horizon=6, num_act_stepped=6,
+var_scale=1.0, frameskip=5 -> 30 raw steps/episode, 1 replan. This is the
+config dino_wm_pusht reports ~90% Push-T SR under -- a DELIBERATE, DOCUMENTED
+DEVIATION from implementation-plan Sec7.0's "CEM 200x10, horizon 25, 5
+executed actions/replan" budget, justified as substrate fidelity: Sec7.0's
+numbers are AdaJEPA's (a different substrate -- see ATLAS_implementation_plan_v2.md
+Sec7.0a). Applied here, horizon=25 means 125 raw steps of lookahead for a task
+DINO-WM samples to be feasible within 25. This RESOLVES E0_HANDOFF.md's open
+num_act_stepped 1-vs-5 ambiguity: at nas=6, one replan covers the whole
+30-step episode, so there is no ambiguity left to resolve (see
+E0_IMPLEMENTATION_PLAN.md T6). An earlier version of this script used the
+same jepa-wms shipped-config numbers but mislabeled them "the published spec"
+without cross-checking against the plan's own Sec7.0/7.6 budget -- that
+mislabeling was the real error (not the numbers themselves, which are correct
+here); a later revision then switched to the AdaJEPA-derived
+num_samples=200/horizon=25/nas=1 reading before this file settled on the
+substrate config as the user's explicit final decision. All results computed
+under either earlier config should be treated as invalid until re-run under
+this one. See code-review.md Bug #7 for the memory numbers this config was
+originally reported to OOM at on a 6GB GPU (needs Modal/a bigger local GPU).
 
 Usage:
     python scripts/run_e0_planning.py --kind ln_act --regime R1 --episodes 1 \\
@@ -45,8 +64,11 @@ from tqdm import tqdm
 # denormalize_actions/env.step(), which expect the raw 2-dim space.
 FRAMESKIP = 5
 
-# frameskip * goal_H + 1 (plan_evaluator.py's own goal_source=dset formula) --
-# goal_H=6 matches the shipped config's planner.horizon/num_act_stepped.
+# frameskip * goal_H + 1 (plan_evaluator.py's own goal_source=dset formula).
+# goal_H here = max_steps/frameskip = 30/5 = 6 -- the EPISODE's raw-step
+# budget. Numerically the same as the CEM planner's own horizon (also 6,
+# post-T6), but conceptually independent -- this is the goal-sampling
+# trajectory length, not the planner's lookahead.
 GOAL_TRAJ_LEN = FRAMESKIP * 6 + 1
 
 # Raw ATLAS_HOME env var, NOT atlas.ATLAS_HOME: that's .resolve()'d, which on
@@ -87,12 +109,17 @@ def build_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: 
     })
 
 
-def prepare_with_visual(base_env: PushTEnv, seed: int, state: np.ndarray):
+def prepare_with_visual(base_env: PushTEnv, regime: PhysicsRegime, seed: int, state: np.ndarray):
     # PushTWrapper.prepare() discards obs["visual"] (expects a PixelWrapper to
     # re-render it); we skip PixelWrapper, so reset the raw env directly.
+    # Routed through regime.reset() (not base_env.reset()) so physics reapplies
+    # in the one place PhysicsRegime.reset() already does it -- matches
+    # atlas/harness.py::_prepare_env exactly (E0_IMPLEMENTATION_PLAN.md T6).
+    # reset_to_state is set on base_env directly, not the regime wrapper: since
+    # gym.Wrapper does not proxy attribute WRITES to the wrapped env.
     base_env.seed(seed)
     base_env.reset_to_state = state
-    return base_env.reset()
+    return regime.reset()
 
 
 def make_obs_td(visual_hw3_uint8: np.ndarray, proprio_vec: np.ndarray, device: str) -> TensorDict:
@@ -151,19 +178,29 @@ def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
 
 
 def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regime: PhysicsRegime,
-                 seed: int, max_steps: int, states: np.ndarray, seq_lengths: list[int],
-                 log_planner_diagnostics: bool = False) -> dict:
+                 seed: int, max_steps: int, num_act_stepped: int, states: np.ndarray,
+                 seq_lengths: list[int], log_planner_diagnostics: bool = False) -> dict:
     device = agent.device
 
     rs = np.random.RandomState(seed)
     init_state, goal_state = sample_dataset_init_goal(states, seq_lengths, rs)
 
-    goal_obs, _ = prepare_with_visual(base_env, seed, goal_state)
-    regime._apply_physics()  # must run after reset() rebuilds the pymunk space
+    goal_obs, _ = prepare_with_visual(base_env, regime, seed, goal_state)
     agent.set_goal(make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
 
-    obs, _ = prepare_with_visual(base_env, seed, init_state)
-    regime._apply_physics()
+    obs, _ = prepare_with_visual(base_env, regime, seed, init_state)
+
+    # n_replans_target is a LOOSE upper bound on the replan loop -- the real
+    # termination is `elapsed >= max_steps` inside the loop below, checked
+    # every iteration. steps_left passed to agent.act() must be MODEL-CHUNK
+    # units, matching CEMPlanner.horizon's units (plan_length = min(horizon,
+    # steps_left)), NOT raw environment steps -- see
+    # atlas/harness.py::run_e1_episode for the same convention. Under this
+    # file's default config (horizon=6, num_act_stepped=6 -- T6's substrate
+    # config), one replan executes num_act_stepped*frameskip = 30 raw actions,
+    # i.e. the WHOLE 30-step episode in a single replan, matching the plan's
+    # "1 replan" summary regardless of this loop bound's exact value.
+    n_replans_target = max(max_steps // num_act_stepped, 1)
 
     elapsed = 0
     success = False
@@ -171,9 +208,12 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
     final_check = {"block_pos_diff": None, "block_angle_diff": None}
     planner_diagnostics = []  # per-replan CEM elite-cost convergence, if requested
     t_start = time.time()
-    while elapsed < max_steps and not success:
+    for replan_idx in range(n_replans_target):
+        if elapsed >= max_steps:
+            break
         obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
-        action = agent.act(obs_td, steps_left=max(max_steps - elapsed, 1))
+        steps_left_model = (n_replans_target - replan_idx) * num_act_stepped
+        action = agent.act(obs_td, steps_left=max(steps_left_model, 1))
         replans += 1
 
         if log_planner_diagnostics:
@@ -199,6 +239,8 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
             if final_check["success"]:
                 success = True
                 break
+        if success:
+            break
     result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
               **{k: v for k, v in final_check.items() if k != "success"}}
     if log_planner_diagnostics:
@@ -214,10 +256,16 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--num-samples", type=int, default=300,
-                         help="Published spec is 300; OOMs on a 6GB GPU. Use e.g. 16 for a local test.")
+                         help="Substrate's own validated Push-T config (T6): 300. "
+                              "Use fewer (e.g. 16) for a local smoke test.")
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--horizon", type=int, default=6)
-    parser.add_argument("--num-act-stepped", type=int, default=6)
+    parser.add_argument("--num-act-stepped", type=int, default=6,
+                         help="MODEL-chunk units (1 chunk = FRAMESKIP=5 raw actions via "
+                              "action chunking). Substrate default nas=6: one replan executes "
+                              "6*5=30 raw actions -- the whole 30-step episode in one replan, "
+                              "matching dino_wm_pusht's own validated eval config "
+                              "(E0_IMPLEMENTATION_PLAN.md T6).")
     parser.add_argument("--charts-dir", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--out-dir", type=Path, default=atlas.OUT_DIR / "e0_planning",
                          help="Where to write per-episode JSONL + summary JSON.")
@@ -237,6 +285,17 @@ def main() -> None:
     for p in wm.encoder.parameters():
         p.requires_grad_(False)
 
+    # T7 throughput fixes (bit-exact-ish; measured payoff order 1 > 2):
+    # 1. SDPA is absent from the eval YAML so it defaults False, falling back
+    #    to manual attention that materialises [num_samples,16,512,512] fp32
+    #    three times per layer x 6 layers -- also the memory fix keeping
+    #    num_samples=300 inside a 24GB GPU. Enabled post-load, not via YAML.
+    for m in wm.predictor.modules():
+        if hasattr(m, "use_sdpa"):
+            m.use_sdpa = True
+    # 2. The checkpoint was trained in bf16 -- minimum matmul-precision fix.
+    torch.set_float32_matmul_precision("high")
+
     if args.kind == "baseline":
         print("kind=baseline -- no chart applied, using frozen pretrained predictor as-is.")
     else:
@@ -250,43 +309,102 @@ def main() -> None:
     agent.device = device
 
     base_env = PushTEnv(render_size=224, with_velocity=True)
+    # regime wraps base_env DIRECTLY (not PushTWrapper) -- PushTWrapper.reset()
+    # discards obs["visual"] (returns state instead, expecting a PixelWrapper
+    # to re-render it), so PhysicsRegime(wrapper, ...) would silently break
+    # prepare_with_visual()'s regime.reset() call. Matches
+    # atlas/harness.py::run_e1_episode's construction exactly
+    # (E0_IMPLEMENTATION_PLAN.md T6). `wrapper` itself is otherwise unused in
+    # this file (goal sampling/success use the local sample_dataset_init_goal/
+    # block_success functions, not PushTWrapper's methods) -- kept only for
+    # run_episode()'s existing signature.
     wrapper = PushTWrapper(base_env)
-    regime = PhysicsRegime(wrapper, args.regime)
+    regime = PhysicsRegime(base_env, args.regime)
     states, seq_lengths = load_dataset_states()
 
     print(f"Running {args.episodes} episode(s): kind={args.kind} regime={args.regime} "
-          f"num_samples={args.num_samples} iterations={args.iterations}")
-    if args.num_samples < 300:
-        print("NOTE: reduced num_samples -- not the published spec (300). See module docstring.")
+          f"num_samples={args.num_samples} iterations={args.iterations} horizon={args.horizon} "
+          f"num_act_stepped={args.num_act_stepped}")
+    if args.num_samples < 300 or args.horizon < 6:
+        print("NOTE: reduced CEM settings -- not the substrate's validated config (T6). See module docstring.")
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    # Resume/append support: don't silently overwrite + recompute episodes an
+    # earlier invocation already paid real GPU time for (e.g. a small sanity
+    # run before committing to a bigger --episodes count). jsonl_path's write
+    # loop below always writes exactly one record per ep in range(args.episodes)
+    # (seed=ep, no skipping) -- so on-disk episode indices are contiguous from
+    # 0 by construction, unless the file was hand-edited or came from a
+    # different (kind, regime) run merged in by mistake.
     jsonl_path = args.out_dir / f"{args.kind}_{args.regime}.jsonl"
-    results = []
-    pbar = tqdm(range(args.episodes), desc=f"{args.kind}_{args.regime}", unit="ep")
-    with open(jsonl_path, "w") as f:
-        for ep in pbar:
-            result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps,
-                                  states=states, seq_lengths=seq_lengths,
-                                  log_planner_diagnostics=args.log_planner_diagnostics)
-            results.append(result)
-            f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime, **result}) + "\n")
-            f.flush()
-            pbar.set_postfix(success=result["success"], steps=result["steps"])
+    existing_records = []
+    if jsonl_path.exists():
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    existing_records.append(json.loads(line))
+        existing_eps = sorted(r["episode"] for r in existing_records)
+        if existing_eps != list(range(len(existing_eps))):
+            print(f"WARNING: {jsonl_path} episode indices are not contiguous from 0 "
+                  f"({existing_eps}) -- resume logic assumes contiguity; treating "
+                  f"already_done as max(episode)+1, which may re-run or skip unexpectedly "
+                  f"if the file was hand-edited or mixes runs.")
+        already_done = (max(existing_eps) + 1) if existing_eps else 0
+    else:
+        already_done = 0
 
-    success_rate = sum(r["success"] for r in results) / len(results)
-    mean_time = sum(r["wall_time"] for r in results) / len(results)
+    if existing_records and args.episodes <= already_done:
+        print(f"Requested --episodes {args.episodes} already satisfied by {already_done} "
+              f"existing episode(s) in {jsonl_path} -- skipping episode loop, "
+              f"recomputing summary from existing records only.")
+    else:
+        results = []
+        new_eps = range(already_done, args.episodes)
+        if already_done:
+            print(f"Resuming: {already_done} episode(s) already in {jsonl_path}, "
+                  f"running {len(new_eps)} new episode(s) (seeds {already_done}..{args.episodes - 1}).")
+        pbar = tqdm(new_eps, desc=f"{args.kind}_{args.regime}", unit="ep")
+        with open(jsonl_path, "a" if already_done else "w") as f:
+            for ep in pbar:
+                result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps,
+                                      num_act_stepped=args.num_act_stepped, states=states,
+                                      seq_lengths=seq_lengths,
+                                      log_planner_diagnostics=args.log_planner_diagnostics)
+                results.append(result)
+                f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime, **result}) + "\n")
+                f.flush()
+                pbar.set_postfix(success=result["success"], steps=result["steps"])
+
+    # Summary stats are computed over ALL episodes on disk (old + newly run),
+    # read back from the JSONL rather than relying on this invocation's
+    # in-memory `results` list -- so a resumed run's summary reflects the full
+    # accumulated episode count, not just what this process itself ran.
+    with open(jsonl_path) as f:
+        all_records = [json.loads(line) for line in f if line.strip()]
+
+    success_rate = sum(r["success"] for r in all_records) / len(all_records)
+    mean_time = sum(r["wall_time"] for r in all_records) / len(all_records)
+    # Peak GPU memory below reflects ONLY this process's own run (this
+    # invocation's episodes, if any were run) -- torch's peak-memory-allocated
+    # stat is process-local and can't retroactively recover a peak from an
+    # earlier invocation's now-exited process. If this call resumed 0 new
+    # episodes, this number is meaningless (no allocation happened here) and
+    # should not be read as "peak over all episodes."
     peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else None
-    print(f"\nSuccess rate: {success_rate:.2f} ({sum(r['success'] for r in results)}/{len(results)})")
+    print(f"\nSuccess rate: {success_rate:.2f} ({sum(r['success'] for r in all_records)}/{len(all_records)})")
     print(f"Mean wall time per episode: {mean_time:.1f}s")
     if peak_mem_gb is not None:
-        print(f"Peak GPU memory: {peak_mem_gb:.2f} GB")
+        print(f"Peak GPU memory (THIS PROCESS ONLY, not necessarily over all "
+              f"{len(all_records)} accumulated episodes if this was a resumed run): {peak_mem_gb:.2f} GB")
 
     summary_path = args.out_dir / f"{args.kind}_{args.regime}_summary.json"
     summary_path.write_text(json.dumps({
-        "kind": args.kind, "regime": args.regime, "episodes": args.episodes,
+        "kind": args.kind, "regime": args.regime, "episodes": len(all_records),
         "num_samples": args.num_samples, "iterations": args.iterations, "horizon": args.horizon,
+        "num_act_stepped": args.num_act_stepped,
         "success_rate": success_rate, "mean_wall_time_s": mean_time, "peak_gpu_memory_gb": peak_mem_gb,
     }, indent=2))
 

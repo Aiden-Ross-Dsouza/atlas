@@ -10,13 +10,26 @@ from atlas.score import umf, compute_motion_gate
 
 
 def make_dummy_world_model(grid_size):
+    """Mock of the EncPredWM WRAPPER (the object torch.hub.load returns — NOT
+    .model): action_dim=10 is the real 10-dim model-chunk contract
+    (frameskip=5 * raw_action_dim=2), and .unroll() is the wrapper's own
+    canonical rollout entry point (see atlas.score._open_loop_rollout /
+    E0_IMPLEMENTATION_PLAN.md T1)."""
     wm = MagicMock()
     wm.grid_size = grid_size
-    wm.action_dim = 2
-    wm.proprio_encoder = None
-    wm.encode_act.side_effect = lambda a: a
-    wm.forward_pred.side_effect = lambda z, a, p: (z, None, None)
-    wm.predictor = MagicMock()
+    wm.action_dim = 10
+    wm.model = MagicMock()
+    wm.model.predictor = MagicMock()
+
+    def _unroll(z_ctxt, act_suffix):
+        # z_ctxt: [B=1, tau=1, V=1, H, W, D]; act_suffix: [T, B=1, A].
+        # Identity unroll: repeat the single context frame T+1 times, matching
+        # unroll()'s documented [T+tau, B, V, H, W, D] output contract.
+        T = act_suffix.shape[0]
+        frame = z_ctxt[:, 0]  # [B, V, H, W, D] -- drop tau
+        return frame.unsqueeze(0).expand(T + 1, *frame.shape).clone()
+
+    wm.unroll.side_effect = _unroll
     return wm
 
 def make_dummy_chart():
@@ -33,7 +46,7 @@ def test_umf_static_chunk_returns_none():
     N = grid * grid
     z0 = torch.randn(N, D)
     encoder_output = z0.unsqueeze(0).expand(T + 1, -1, -1).clone()
-    actions = torch.zeros(T, 2)
+    actions = torch.zeros(T, 10)  # model-chunk actions: 10 = frameskip(5) * raw_dim(2)
 
     chart = make_dummy_chart()
     wm = make_dummy_world_model(grid)
@@ -49,7 +62,7 @@ def test_umf_gated_chunk_returns_none():
     z0 = torch.randn(N, D)
     z_end = z0 + 0.001  # tiny displacement
     encoder_output = torch.stack([z0] + [z0] * (T - 1) + [z_end])
-    actions = torch.zeros(T, 2)
+    actions = torch.zeros(T, 10)  # model-chunk actions
 
     chart = make_dummy_chart()
     wm = make_dummy_world_model(grid)

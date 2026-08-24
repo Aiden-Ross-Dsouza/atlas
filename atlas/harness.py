@@ -71,7 +71,10 @@ def run_e0_finetune(
     Offline fine-tune a chart of the given kind on provided trajectories.
 
     Args:
-        world_model:  VideoWM instance (EncPredWM.model from torch.hub).
+        world_model:  EncPredWM instance (the object torch.hub.load returns —
+                      NOT .model). _open_loop_rollout needs the wrapper for its
+                      canonical unroll(); chart apply/restore and cfgs_loss-based
+                      loss still reach the inner VideoWM via world_model.model.
         trajectories: List of trajectory dicts with pre-encoded data.
         kind:         Chart kind to fine-tune.
         regime:       Regime name (for logging).
@@ -84,10 +87,10 @@ def run_e0_finetune(
     """
     import torch.optim as optim
     from tqdm import tqdm
-    from atlas.score import _open_loop_rollout
+    from atlas.score import _open_loop_rollout, _make_z_ctxt
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    predictor = world_model.predictor
+    predictor = world_model.model.predictor
     chart = Chart(predictor, kind)
     chart.apply_(predictor)
     
@@ -112,12 +115,16 @@ def run_e0_finetune(
             enc_out: torch.Tensor = traj["encoder_output"]  # [T+1, N, D]
             actions: torch.Tensor = traj["actions"]         # [T, action_dim]
             z_vis = enc_out[0]
-            
+            proprio_ctxt = traj.get("proprio")
+            if proprio_ctxt is not None:
+                proprio_ctxt = proprio_ctxt[0:1].unsqueeze(0)  # [1, 1, P_tok, D_p]
+            z_ctxt = _make_z_ctxt(world_model, z_vis, proprio_ctxt)
+
             # Predict visual latents open-loop
-            z_preds = _open_loop_rollout(world_model, z_vis, actions) # [T, N, D]
-            loss = compute_trajectory_loss(world_model, z_preds, enc_out[1:])
+            z_preds = _open_loop_rollout(world_model, z_ctxt, actions) # [T, N, D]
+            loss = compute_trajectory_loss(world_model.model, z_preds, enc_out[1:])
             total_loss = total_loss + loss
-            
+
         (total_loss / len(trajectories)).backward()
         optimizer.step()
         avg_loss = total_loss.item() / len(trajectories)
@@ -184,7 +191,7 @@ def _prepare_env(base_env, regime, seed: int, state) -> tuple[dict, dict]:
 def run_e1_episode(
     library: Library,
     agent,                      # GC_Agent, pre-configured with E1's CEM hyperparameters
-    world_model,                # VideoWM: has .predictor, .encode_obs, .encode_act, .forward_pred
+    world_model,                # EncPredWM wrapper: .model.predictor, .encode_obs, .unroll
     base_env,                   # raw PushTEnv
     regime,                     # PhysicsRegime(base_env, ...) — physics fixed for the whole episode
     goal_utils,                 # PushTWrapper(base_env) — only .sample_random_init_goal_states/.eval_state used
@@ -219,7 +226,11 @@ def run_e1_episode(
     called) — E1 does not switch regimes mid-episode; that's E3/E4's stream.
     """
     device = agent.device
-    predictor = world_model.predictor
+    predictor = world_model.model.predictor
+    # Seeds the "random" router for this episode -- was the unseeded global
+    # `random` module (E0_IMPLEMENTATION_PLAN.md T12 #6).
+    import random as _random
+    router_rng = _random.Random(episode_seed)
 
     init_state, goal_state = goal_utils.sample_random_init_goal_states(episode_seed)
 
@@ -234,16 +245,18 @@ def run_e1_episode(
     selected_trace: list[int] = []
     umf_trace: list[list[float | None]] = []
     raw_steps_per_replan: list[int] = []
-    prev_chunk: tuple[torch.Tensor, torch.Tensor] | None = None  # (encoder_output, actions)
+    # (encoder_output [T_model+1,N,D], actions [T_model,10], proprio_ctxt [1,1,P_tok,D])
+    prev_chunk: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     for replan_idx in range(n_replans_target):
         if replan_idx >= n_warmup_replans and prev_chunk is not None:
-            enc_out, acts = prev_chunk
+            enc_out, acts, proprio_ctxt = prev_chunk
             current_idx, route_info = route(
                 kind=router, library=library, world_model=world_model,
                 encoder_output=enc_out, actions=acts, current_idx=current_idx,
                 motion_gate=motion_gate, hysteresis=hysteresis,
                 regime_label=regime_label, label_to_chart=label_to_chart,
+                proprio_ctxt=proprio_ctxt, rng=router_rng,
             )
             umf_trace.append(route_info["scores"])
         else:
@@ -269,10 +282,12 @@ def run_e1_episode(
         raw_actions = agent.preprocessor.denormalize_actions(raw_actions).numpy()
 
         imgs = [obs["visual"]]
+        proprios = [obs["proprio"]]
         step_actions = []
         for a in raw_actions:
             obs, reward, done, info = base_env.step(a)
             imgs.append(obs["visual"])
+            proprios.append(obs["proprio"])
             step_actions.append(a)
             elapsed += 1
             if goal_utils.eval_state(goal_state, info["state"])["success"]:
@@ -280,18 +295,39 @@ def run_e1_episode(
                 break
         raw_steps_per_replan.append(len(step_actions))
 
-        # Encode the just-executed chunk so the NEXT replan can score against it.
+        # Encode the just-executed chunk so the NEXT replan can score against
+        # it — subsampled to the model time base and chunked to model actions
+        # (E0_IMPLEMENTATION_PLAN.md T4), using world_model.encode() (not
+        # preprocessor.transform_obs_visual + encode_obs) so real proprio is
+        # captured -- this checkpoint's predictor requires it (see T1's
+        # finding: forward_pred(proprio=None) is a channel-width mismatch,
+        # not a graceful no-proprio path). If success cut this replan short
+        # mid-frameskip-group, truncate to the largest prefix divisible by
+        # frameskip -- prev_chunk from a successful replan is never consumed
+        # again (the outer loop breaks right after this block).
         import numpy as np
-        imgs_np = np.stack(imgs, axis=0)[None]                      # [1, T+1, H, W, 3]
-        acts_np = np.stack(step_actions, axis=0)                    # [T, 2]
-        img_tensor = agent.preprocessor.transform_obs_visual(imgs_np).to(device)
-        act_tensor = agent.preprocessor.normalize_actions(
-            torch.from_numpy(acts_np).float().unsqueeze(0)
-        ).squeeze(0).to(device)
-        with torch.no_grad():
-            enc_out_dict = world_model.encode_obs({"visual": img_tensor})
-            enc_out = enc_out_dict["visual"].squeeze(0).squeeze(1).flatten(1, 2)  # [T+1, N, D]
-        prev_chunk = (enc_out, act_tensor)
+        n_raw = (len(step_actions) // frameskip) * frameskip
+        if n_raw == 0:
+            if not success:
+                prev_chunk = None
+        else:
+            keep_idx = list(range(0, n_raw + 1, frameskip))
+            imgs_sub = np.stack([imgs[i] for i in keep_idx], axis=0)       # [T_model+1, H, W, 3]
+            proprios_sub = np.stack([proprios[i] for i in keep_idx], axis=0)  # [T_model+1, P]
+            visual_t = torch.from_numpy(imgs_sub.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
+            proprio_t = torch.from_numpy(proprios_sub.astype(np.float32)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
+                enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)   # [T_model+1, N, D]
+                proprio_enc = enc["proprio"]                                  # [1, T_model+1, P_tok, D_p]
+
+            acts_np = np.stack(step_actions[:n_raw], axis=0)               # [n_raw, 2]
+            act_norm = agent.preprocessor.normalize_actions(
+                torch.from_numpy(acts_np).float().unsqueeze(0)
+            ).squeeze(0)                                                    # [n_raw, 2]
+            act_model = act_norm.reshape(n_raw // frameskip, frameskip * 2).to(device)  # [T_model, 10]
+
+            prev_chunk = (enc_out, act_model, proprio_enc[:, 0:1])  # proprio_ctxt: [1,1,P_tok,D_p]
 
         if success:
             break

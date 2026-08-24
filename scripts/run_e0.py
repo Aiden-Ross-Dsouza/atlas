@@ -27,9 +27,10 @@ import torch
 import atlas
 from atlas.chart import Chart, ChartKind
 from atlas.harness import run_e0_finetune, log_episode
+from atlas.score import compute_motion_gate
 
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0) -> list[dict]:
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5) -> list[dict]:
     """
     Collects real trajectories from PushTEnv under the specified regime and
     encodes them through the frozen vision backbone.
@@ -54,7 +55,28 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     top of the aimed sampling (which only raises the expected contact rate,
     it doesn't guarantee it for every seed/spawn configuration).
 
-    Returns a list of dicts: [{'encoder_output': [T+1, N, D], 'actions': [T, action_dim]}]
+    Frame/action chunking (E0_IMPLEMENTATION_PLAN.md T3): raw env steps are
+    still what gets simulated (frameskip has no effect on physics), but the
+    RETURNED actions/frames are chunked/subsampled to the MODEL time base --
+    `_open_loop_rollout` unrolls one model step per `frameskip` raw steps, so
+    training/eval data must match that or every step after the first runs on
+    a stale, wrong-time-base target (see E0_DIAGNOSIS_AND_PLAN.md's root-cause
+    writeup). `world_model.encode()` (not the old
+    preprocessor.transform_obs_visual + encode_obs path) is used so real
+    proprio is captured and normalized/embedded the same way the planner does
+    it -- this checkpoint's predictor concatenates proprio into the token
+    channel width (VideoWM.concat_obs_act(), dim=3) and errors without it, so
+    it is not an optional enrichment here.
+
+    Args:
+        world_model: EncPredWM instance (the object torch.hub.load returns —
+                     NOT .model).
+
+    Returns a list of dicts:
+        {'encoder_output': [T_model+1, N, D],
+         'actions':        [T_model, 10]  (model-chunk, normalized),
+         'proprio':        [T_model+1, P_tok, D_p]  (encoded, full sequence),
+         'seed':           int}
     """
     import sys
     import numpy as np
@@ -68,6 +90,12 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
     from atlas.regimes import PhysicsRegime
 
+    if traj_len % frameskip != 0:
+        raise ValueError(
+            f"traj_len={traj_len} must be divisible by frameskip={frameskip} so "
+            f"frame subsampling and action chunking land exactly on model steps."
+        )
+
     # Disjoint seed ranges per regime (unchanged spirit from the original code,
     # extended to cover R0 too since PhysicsRegime now supports all three).
     # seed_offset additionally separates independent calls for the same regime
@@ -79,10 +107,17 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     for traj_idx in range(num_trajs):
         for attempt in range(max_tries):
             seed = seed_base + traj_idx * max_tries + attempt
-            env = PhysicsRegime(PushTEnv(render_size=224), regime)
+            # with_velocity=True: matches scripts/run_e1.py and the shipped
+            # eval YAML (env.with_velocity: true) -- the checkpoint's
+            # preprocessor.proprio_std is sized for the 4-dim (x,y,vx,vy)
+            # proprio this produces, not the 2-dim default. Confirmed
+            # empirically (RuntimeError on proprio_std shape mismatch without
+            # it) -- see E0_IMPLEMENTATION_PLAN.md T3.
+            env = PhysicsRegime(PushTEnv(render_size=224, with_velocity=True), regime)
             env.seed(seed)
             obs, state = env.reset()
             imgs = [obs["visual"]]  # RGB array [224, 224, 3]
+            proprios = [obs["proprio"]]
             raw_actions = []
             total_contacts = 0
 
@@ -122,28 +157,43 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
                 agent_xy = obs["proprio"][:2]
                 total_contacts += info["n_contacts"]
                 imgs.append(obs["visual"])
+                proprios.append(obs["proprio"])
                 raw_actions.append(act)
 
             if total_contacts > 0 or attempt == max_tries - 1:
                 break  # accept: real contact happened, or retries exhausted
 
-        imgs_np = np.stack(imgs, axis=0)        # [T+1, 224, 224, 3]
-        acts_np = np.stack(raw_actions, axis=0) # [T, 2]
+        imgs_np = np.stack(imgs, axis=0)            # [T_raw+1, 224, 224, 3]
+        proprios_np = np.stack(proprios, axis=0)    # [T_raw+1, proprio_dim]
+        acts_np = np.stack(raw_actions, axis=0)     # [T_raw, 2]
 
-        # Preprocess visual observations: [1, T+1, 3, 224, 224]
-        img_tensor = preprocessor.transform_obs_visual(imgs_np[None]).to(device)
-        
-        # Normalize actions: [T, 2]
-        act_tensor = preprocessor.normalize_actions(torch.from_numpy(acts_np).float().unsqueeze(0)).squeeze(0).to(device)
+        # Subsample frames to the model time base: keep every `frameskip`-th
+        # raw frame (plus frame 0) -> T_raw/frameskip + 1 frames, matching the
+        # chunked actions below one-to-one.
+        keep_idx = list(range(0, traj_len + 1, frameskip))
+        imgs_sub = imgs_np[keep_idx]                # [T_model+1, 224, 224, 3]
+        proprios_sub = proprios_np[keep_idx]        # [T_model+1, proprio_dim]
 
+        # Encode visual+proprio TOGETHER via the wrapper's own encode() -- the
+        # same obs-dict layout GC_Agent.act() feeds it (raw uint8 visual, raw
+        # proprio; encode() does its own /255 + preprocessor.transform +
+        # normalize_proprios).
+        visual_t = torch.from_numpy(imgs_sub.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
+        proprio_t = torch.from_numpy(proprios_sub.astype(np.float32)).unsqueeze(0).to(device)
         with torch.no_grad():
-            enc_out_dict = world_model.encode_obs({"visual": img_tensor})
-            enc_out = enc_out_dict["visual"]  # [1, T+1, 1, 16, 16, 384]
-            enc_out = enc_out.squeeze(0).squeeze(1).flatten(1, 2)  # [T+1, 256, 384]
+            enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
+            enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)  # [T_model+1, 256, 384]
+            proprio_enc = enc["proprio"].squeeze(0)                     # [T_model+1, P_tok, D_p]
+
+        # Chunk raw actions [T_raw, 2] -> model actions [T_raw/frameskip, 10].
+        act_tensor_raw = torch.from_numpy(acts_np).float()
+        act_norm = preprocessor.normalize_actions(act_tensor_raw.unsqueeze(0)).squeeze(0)  # [T_raw, 2]
+        act_model = act_norm.reshape(traj_len // frameskip, frameskip * 2).to(device)      # [T_model, 10]
 
         trajectories.append({
             "encoder_output": enc_out,
-            "actions": act_tensor,
+            "actions": act_model,
+            "proprio": proprio_enc,
             "seed": seed,  # the ACCEPTED seed (whichever attempt broke the retry loop) --
                             # written to e0_seed_manifest.json so E1/downstream experiments
                             # can be audited for zero overlap with E0's train/eval seeds.
@@ -152,24 +202,37 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     return trajectories
 
 
-def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict]) -> tuple[float, float]:
+def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict],
+                       motion_gate: float | None = None) -> tuple[float, float]:
     """
     Evaluates a fine-tuned chart on held-out validation trajectories.
+
+    Args:
+        world_model: EncPredWM wrapper (the object torch.hub.load returns —
+                     NOT .model). _open_loop_rollout/umf need the wrapper for
+                     the canonical unroll(); chart apply/restore and
+                     cfgs_loss-based loss reach the inner VideoWM via
+                     world_model.model.
+        motion_gate: Informative-chunk threshold (gate G6) — see
+                     atlas.score.compute_motion_gate. None = skip gate.
+
     Returns (avg_eval_loss, avg_eval_umf).
     """
     import numpy as np
     from atlas.harness import compute_trajectory_loss
-    from atlas.score import _open_loop_rollout, umf
+    from atlas.score import _open_loop_rollout, _make_z_ctxt, umf
 
     losses = []
     umf_scores = []
-    
+
     with torch.no_grad():
         for traj in val_trajectories:
             enc_out = traj["encoder_output"]
             actions = traj["actions"]
             z_vis = enc_out[0]
-            
+            proprio_ctxt = traj["proprio"][0:1].unsqueeze(0)  # [1, 1, P_tok, D_p]
+            z_ctxt = _make_z_ctxt(world_model, z_vis, proprio_ctxt)
+
             # Apply chart specifically for the open-loop rollout, then restore.
             # apply_() is INSIDE the try too (not just the rollout) -- if
             # apply_() itself raises partway through (e.g. a lora4 chart with
@@ -178,17 +241,18 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict]) -
             # parametrization that corrupts every subsequent chart/fine-tune
             # sharing this predictor object. See code-review.md Bug #6f.
             try:
-                chart.apply_(world_model.predictor)
-                z_preds = _open_loop_rollout(world_model, z_vis, actions)
+                chart.apply_(world_model.model.predictor)
+                z_preds = _open_loop_rollout(world_model, z_ctxt, actions)
             finally:
-                chart.restore_(world_model.predictor)
-            
-            loss = compute_trajectory_loss(world_model, z_preds, enc_out[1:])
+                chart.restore_(world_model.model.predictor)
+
+            loss = compute_trajectory_loss(world_model.model, z_preds, enc_out[1:])
             losses.append(loss.item())
 
             # umf internally handles applying and restoring the chart,
             # expecting the predictor to start in baseline state.
-            score = umf(chart, world_model, enc_out, actions)
+            score = umf(chart, world_model, enc_out, actions, motion_gate=motion_gate,
+                        proprio_ctxt=proprio_ctxt)
             if score is not None:
                 umf_scores.append(score)
 
@@ -203,6 +267,10 @@ def main() -> None:
                         choices=["ln_act", "lora4", "full"])
     parser.add_argument("--regimes", nargs="+", default=["R1", "R2"])
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--num-train-trajs", type=int, default=3,
+                         help="Number of TRAINING trajectories. run_e0_finetune() loops over "
+                              "every trajectory on every step, so compute scales linearly "
+                              "with this too.")
     parser.add_argument("--train-traj-len", type=int, default=10,
                          help="Steps per TRAINING trajectory. run_e0_finetune() backprops "
                               "through the full open-loop unroll, so GPU memory scales "
@@ -225,15 +293,25 @@ def main() -> None:
     wandb_group = f"e0_experiment_{int(time.time())}"
 
     print("Loading dino_wm_pusht from local hub...")
-    hub_path = str(Path(__file__).parent.parent / "hub" / "hub" / "facebookresearch_jepa-wms_main")
+    # Raw ATLAS_HOME env var, not Path(__file__)-relative: on Modal the code
+    # (/src) and the volume-mounted hub cache (/atlas_root/hub) live at
+    # different paths -- see run_e0_planning.py's HUB_PATH for the same fix.
+    import os
+    _atlas_home = os.environ.get("ATLAS_HOME", str(atlas.ATLAS_HOME))
+    hub_path = str(Path(_atlas_home) / "hub" / "hub" / "facebookresearch_jepa-wms_main")
     model, prep = torch.hub.load(
         hub_path, "dino_wm_pusht",
         source="local",
         force_reload=False, trust_repo=True,
     )
-    wm = model.model if hasattr(model, "model") else model
+    # `model` is the EncPredWM wrapper (owns ctxt_window/proprio_mode and the
+    # canonical unroll() this checkpoint was validated with -- see
+    # E0_IMPLEMENTATION_PLAN.md T1/T2). `wm` is the inner VideoWM, needed for
+    # predictor state-dict ops, Chart construction, and encoder freezing --
+    # wrapper.to(device) moves it too, since it's a registered submodule.
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    wm = wm.to(device)
+    wrapper = model.to(device)
+    wm = wrapper.model if hasattr(wrapper, "model") else wrapper
     for p in wm.encoder.parameters():
         p.requires_grad_(False)
 
@@ -266,10 +344,10 @@ def main() -> None:
         # long since UMF needs real accumulated displacement). See --train-traj-len
         # / --eval-traj-len help text and code-review.md Bug #6d/#6e.
         train_trajectories = load_regime_trajectories(
-            wm, prep, regime, num_trajs=3, traj_len=args.train_traj_len, device=device,
-            seed_offset=0)
+            wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
+            device=device, seed_offset=0)
         val_trajectories = load_regime_trajectories(
-            wm, prep, regime, num_trajs=2, traj_len=args.eval_traj_len, device=device,
+            wrapper, prep, regime, num_trajs=2, traj_len=args.eval_traj_len, device=device,
             seed_offset=10_000)
         seed_manifest[regime] = {
             "train": [t["seed"] for t in train_trajectories],
@@ -277,6 +355,17 @@ def main() -> None:
         }
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
+
+        # Gate G6: informative-chunk threshold, computed once from this
+        # regime's own training displacements (10th percentile) -- wired into
+        # every umf() call below instead of the motion_gate=None the eval
+        # path has always used (E0_IMPLEMENTATION_PLAN.md T5).
+        train_displacements = torch.tensor([
+            (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
+            for t in train_trajectories
+        ])
+        motion_gate = compute_motion_gate(train_displacements)
+        print(f"  [Debug] motion_gate (10th pct of train displacement) = {motion_gate:.4f}", flush=True)
 
         for kind in args.kinds:
             # Reset the predictor to its pristine pretrained state before every
@@ -295,8 +384,8 @@ def main() -> None:
                 final_loss = losses[-1] if losses else float("nan")
                 try:
                     chart = Chart.load(chart_file, wm.predictor)
-                    n_params = len(chart._param_names)
-                    eval_loss, eval_umf = evaluate_e0_chart(wm, chart, val_trajectories)
+                    n_params = chart.n_params()  # real parameter count, not a tensor count (T12 #9)
+                    eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
                 except Exception as e:
                     # Print the real error instead of silently returning NaN --
                     # a swallowed exception here previously masked a real bug
@@ -346,7 +435,7 @@ def main() -> None:
             # [Debug print statement] Print fine-tuning start
             print(f"  Fine-tuning {kind} on {regime} ({args.steps} steps)...", flush=True)
             chart = run_e0_finetune(
-                world_model=wm,
+                world_model=wrapper,
                 trajectories=train_trajectories,
                 kind=kind,
                 regime=regime,
@@ -354,9 +443,9 @@ def main() -> None:
                 lr=args.lr,
                 out_dir=args.out,
             )
-            
+
             # Held-out Evaluation on Validation Trajectories
-            eval_loss, eval_umf = evaluate_e0_chart(wm, chart, val_trajectories)
+            eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
 
             if args.wandb:
                 try:
@@ -374,7 +463,7 @@ def main() -> None:
                 "train_loss": final_loss,
                 "eval_loss": eval_loss,
                 "eval_umf": eval_umf,
-                "params": len(chart._param_names),
+                "params": chart.n_params(),  # real parameter count, not a tensor count (T12 #9)
                 "status": "completed",
             }
             # [Debug print statement] Print fine-tuning & eval completed

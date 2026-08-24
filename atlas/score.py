@@ -30,21 +30,39 @@ if TYPE_CHECKING:
 def umf(
     chart: "Chart",
     world_model,
-    encoder_output: torch.Tensor,   # [T+1, N_patches, D] — already encoded
-    actions: torch.Tensor,          # [T, wm.action_dim] — model actions (raw_dim * frameskip)
+    encoder_output: torch.Tensor,   # [T_model+1, N_patches, D] — already encoded, one frame per frameskip
+    actions: torch.Tensor,          # [T_model, wm.action_dim] — MODEL-chunk actions (10-dim: frameskip*raw_dim)
     motion_gate: float | None = None,
+    proprio_ctxt: torch.Tensor | None = None,
 ) -> float | None:
     """
     Compute UMF for *chart* on chunk Q = (encoder_output, actions).
 
     Args:
         chart:           The chart to evaluate.
-        world_model:     VideoWM instance (EncPredWM.model from torch.hub). The chart
-                         parameters are swapped into world_model.predictor (ViTPredictor).
-        encoder_output:  Pre-computed visual latent states z_0 … z_T, shape [T+1, N, D].
-        actions:         Executed raw actions a_0 … a_{T-1}, shape [T, action_dim].
+        world_model:     EncPredWM instance (the object torch.hub.load returns — NOT
+                         .model). Owns ctxt_window/proprio_mode and is the canonical
+                         unroll this checkpoint was validated with. The chart
+                         parameters are swapped into world_model.model.predictor
+                         (ViTPredictor).
+        encoder_output:  Pre-computed visual latent states z_0 … z_{T_model}, sampled
+                         every `frameskip` raw frames, shape [T_model+1, N, D].
+        actions:         Executed MODEL-chunk actions a_0 … a_{T_model-1}, shape
+                         [T_model, 10] (10 = frameskip * raw_action_dim). NOT raw
+                         per-env-step actions — see _open_loop_rollout's guard.
         motion_gate:     If not None, return None when observed displacement
                          ||z_T - z_0||_F <= motion_gate (uninformative chunk).
+        proprio_ctxt:    Encoded proprio for the FIRST frame, shape [1, 1, P_tok, D]
+                         — exactly EncPredWM.encode()'s "proprio" output for a
+                         single-frame observation (T=1), no reshaping needed.
+                         NOT optional in practice for this checkpoint —
+                         empirically, dino_wm_pusht's predictor was trained with
+                         proprio concatenated into the token channel width
+                         (VideoWM.concat_obs_act(), dim=3), so forward_pred with
+                         proprio=None produces a channel-width mismatch, not a
+                         graceful proprio-free path. None is accepted only for
+                         forward compatibility with a checkpoint that has no
+                         proprio_encoder at all.
 
     Returns:
         UMF value in [0, ∞), or None if chunk is uninformative.
@@ -71,11 +89,12 @@ def umf(
         return None  # uninformative chunk — caller must not count as a strike
 
     # ── Open-loop unroll under chart ──────────────────────────────────────────
-    # chart.apply_/restore_ swap params on ViTPredictor (world_model.predictor).
-    predictor = world_model.predictor
+    # chart.apply_/restore_ swap params on ViTPredictor (world_model.model.predictor).
+    predictor = world_model.model.predictor
+    z_ctxt = _make_z_ctxt(world_model, z0, proprio_ctxt)
     chart.apply_(predictor)
     try:
-        z_hat = _open_loop_rollout(world_model, z0, actions)   # [T, N, D]
+        z_hat = _open_loop_rollout(world_model, z_ctxt, actions)   # [T, N, D]
     finally:
         chart.restore_(predictor)
 
@@ -94,67 +113,81 @@ def umf(
     return numerator / displacement
 
 
-def _open_loop_rollout(world_model, z_vis: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+def _make_z_ctxt(enc_pred_wm, z0: torch.Tensor, proprio_ctxt: torch.Tensor | None):
+    """Build the z_ctxt _open_loop_rollout expects: a TensorDict with real
+    proprio when available (required for dino_wm_pusht — see umf()'s
+    proprio_ctxt docstring), else a bare visual Tensor."""
+    if proprio_ctxt is None:
+        return z0
+    from tensordict import TensorDict
+
+    grid = enc_pred_wm.grid_size
+    D = z0.shape[-1]
+    visual = z0.reshape(1, 1, 1, grid, grid, D)
+    return TensorDict({"visual": visual, "proprio": proprio_ctxt}, batch_size=[])
+
+
+def _open_loop_rollout(enc_pred_wm, z_ctxt, actions: torch.Tensor) -> torch.Tensor:
     """
-    Roll out the predictor open-loop from z_vis for len(actions) steps.
-
-    This uses VideoWM.forward_pred() — the correct entry point for the dino_wm
-    architecture — rather than calling ViTPredictor.forward() directly.
-
-    ViTPredictor expects a single pre-concatenated [vis ‖ proprio ‖ action] tensor
-    assembled by VideoWM.concat_obs_act() after encode_act(). Calling the bare
-    predictor with raw (z, a) arguments is not a valid call signature.
+    Roll out the predictor open-loop via EncPredWM.unroll() — the checkpoint's own
+    canonical unroll (sliding ctxt_window, real action chunking, real proprio
+    propagation when z_ctxt carries a "proprio" key), rather than hand-driving
+    VideoWM.forward_pred() with a 1-frame context and a fabricated zero proprio.
+    GC_Agent plans through this exact function (gc_agent.py:175).
 
     Args:
-        world_model: VideoWM instance (accessible as EncPredWM.model from torch.hub).
-        z_vis:       Initial visual latent [N_patches, D] (one frame, no batch).
-        actions:     Raw action sequence [T, action_dim].
+        enc_pred_wm: EncPredWM — the object torch.hub.load(...) returns, NOT
+                     the inner .model. Owns ctxt_window/proprio_mode/grid_size.
+        z_ctxt:      Context latent features for the FIRST frame of the chunk
+                     (tau=1). Either:
+                       - a TensorDict/dict with "visual" [1, 1, V, H, W, D] and
+                         "proprio" [1, 1, P_tok, D] (once real proprio is
+                         threaded through — see T3), or
+                       - a bare visual Tensor, either already [1, 1, V, H, W, D]
+                         or flat [N, D] (auto-reshaped using grid_size). The
+                         Tensor form has no proprio key at all — EncPredWM.unroll
+                         then omits proprio from forward_pred rather than
+                         substituting a fabricated zero.
+        actions:     [T_model, 10] MODEL-chunk actions (normalized). 10 =
+                     frameskip * raw_action_dim — NOT raw per-env-step actions.
 
     Returns:
-        Predicted visual latent states ẑ_1 … ẑ_T, shape [T, N_patches, D].
+        Predicted visual latent states ẑ_1 … ẑ_{T_model}, shape [T_model, N_patches, D].
+
+    Raises:
+        ValueError: if actions' last dim doesn't match the checkpoint's model
+                    action_dim — the guard for the raw-vs-model time-base bug
+                    this function replaces (see E0_DIAGNOSIS_AND_PLAN.md).
     """
-    from einops import rearrange
+    from tensordict import TensorDict
+
+    model_action_dim = enc_pred_wm.action_dim  # 10 = frameskip(5) * raw_action_dim(2)
+    if actions.shape[-1] != model_action_dim:
+        raise ValueError(
+            f"_open_loop_rollout got actions with last dim {actions.shape[-1]}, but "
+            f"this checkpoint's model action_dim is {model_action_dim} (= frameskip * "
+            f"raw_action_dim). This looks like RAW per-env-step actions, not "
+            f"model-chunk actions — chunk them to [T_raw // frameskip, {model_action_dim}] "
+            f"before calling (see E0_IMPLEMENTATION_PLAN.md T3)."
+        )
+
+    grid = enc_pred_wm.grid_size
+
+    if isinstance(z_ctxt, torch.Tensor) and z_ctxt.ndim == 2:
+        # Flat [N, D] first-frame visual latent -> [B=1, tau=1, V=1, H, W, D]
+        D = z_ctxt.shape[-1]
+        z_ctxt = z_ctxt.reshape(1, 1, 1, grid, grid, D)
 
     T = actions.shape[0]
-    grid = world_model.grid_size      # e.g. 16 for ViT-S/14 @ 224
-    D = z_vis.shape[-1]               # 384
+    act_suffix = actions.unsqueeze(1)  # [T, B=1, A]
 
-    # Reshape z_vis [N, D] → [B=1, tau=1, V=1, H, W, D]
-    z_cur = z_vis.reshape(1, 1, 1, grid, grid, D)
+    out = enc_pred_wm.unroll(z_ctxt, act_suffix=act_suffix)
 
-    # Encode all raw actions at once → [B=1, T, action_tokens, D] or [B=1, T, A]
-    a_seq = actions.unsqueeze(0)                          # [1, T, action_dim]
-    act_feats_all = world_model.encode_act(a_seq)         # [1, T, ...]
-
-    z_preds = []
-    act_buf = None
-    proprio_buf = None
-    if getattr(world_model, "proprio_encoder", None) is not None:
-        prop_dim = world_model.proprio_encoder.embed_dim
-        # Create a dummy proprio feature of shape [1, 1, grid * grid, prop_dim]
-        prop_feat = torch.zeros(1, 1, grid * grid, prop_dim, device=z_vis.device)
-        proprio_buf = prop_feat
-
-    for t in range(T):
-        new_act = act_feats_all[:, t : t + 1]            # [1, 1, ...]
-        act_buf = new_act if act_buf is None else torch.cat([act_buf, new_act], dim=1)
-        
-        # Also accumulate dummy proprio if needed
-        curr_prop = None
-        if proprio_buf is not None:
-            curr_prop = proprio_buf.expand(1, act_buf.shape[1], -1, -1)
-
-        pred_video_features, _, _ = world_model.forward_pred(
-            z_cur[:, -1:],            # [1, 1, V, H, W, D] — one frame context
-            act_buf[:, -1:],          # [1, 1, ...] — one action step
-            curr_prop[:, -1:] if curr_prop is not None else None,
-        )
-        # pred_video_features: [1, 1, V, H, W, D]  (T_pred=1)
-        next_z = pred_video_features[:, -1:]             # [1, 1, V, H, W, D]
-        z_preds.append(next_z.reshape(grid * grid, D))   # [N, D]
-        z_cur = next_z
-
-    return torch.stack(z_preds, dim=0)                   # [T, N, D]
+    vid = out["visual"] if isinstance(out, (TensorDict, dict)) else out
+    # vid: [T + tau, B, V, H, W, D]; tau=1 context frame prepended -> drop it.
+    vid = vid[1:].squeeze(1)          # [T, V, H, W, D]
+    T_out, V, H, W, D = vid.shape
+    return vid.reshape(T_out, V * H * W, D)   # [T, N, D]
 
 
 def compute_motion_gate(training_displacements: torch.Tensor, percentile: float = 10.0) -> float:

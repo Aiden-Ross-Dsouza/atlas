@@ -70,10 +70,18 @@ def run_e0_planning(
     num_samples: int = 300,
     iterations: int = 30,
     horizon: int = 6,
+    num_act_stepped: int = 6,
+    charts_subdir: str = "e0",
+    out_subdir: str = "e0_planning",
     log_planner_diagnostics: bool = False,
 ) -> None:
-    """~14.4 min/episode extrapolated from a 6GB local GPU at reduced
-    settings -- untested at full spec, may be faster on L40S/A100."""
+    """Defaults = the SUBSTRATE's own validated Push-T config (CEM 300x30,
+    horizon 6, num_act_stepped 6 -> 30 raw steps/episode, 1 replan), the
+    config dino_wm_pusht reports ~90% SR under -- see
+    run_e0_planning.py's module docstring (E0_IMPLEMENTATION_PLAN.md T6).
+    charts_subdir/out_subdir let a corrected-config re-run write to e.g.
+    atlas_out/e0_planning_v2/ without overwriting earlier (superseded-config,
+    kept for the record) results."""
     import subprocess
     import sys
     # Volumes are eventually consistent -- reload() picks up commits made by
@@ -86,7 +94,9 @@ def run_e0_planning(
            "--num-samples", str(num_samples),
            "--iterations", str(iterations),
            "--horizon", str(horizon),
-           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0"]
+           "--num-act-stepped", str(num_act_stepped),
+           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
+           "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
     if log_planner_diagnostics:
         cmd.append("--log-planner-diagnostics")
     subprocess.run(cmd, check=True, cwd="/src")
@@ -96,10 +106,12 @@ def run_e0_planning(
 @app.local_entrypoint()
 def main(kind: str = "ln_act", regime: str = "R1", episodes: int = 10,
           num_samples: int = 300, iterations: int = 30, horizon: int = 6,
+          num_act_stepped: int = 6, charts_subdir: str = "e0", out_subdir: str = "e0_planning",
           log_planner_diagnostics: bool = False) -> None:
     run_e0_planning.remote(kind=kind, regime=regime, episodes=episodes,
                             num_samples=num_samples, iterations=iterations, horizon=horizon,
-                            log_planner_diagnostics=log_planner_diagnostics)
+                            num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
+                            out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics)
 
 
 @app.function(
@@ -145,3 +157,45 @@ def diagnose_cem_costs_entrypoint(kind: str = "baseline", regime: str = "R1", se
                                     num_act_stepped: int = 6) -> None:
     diagnose_cem_costs.remote(kind=kind, regime=regime, seed=seed, num_samples=num_samples,
                                iterations=iterations, horizon=horizon, num_act_stepped=num_act_stepped)
+
+
+@app.function(
+    gpu="L4",
+    volumes={ATLAS_MOUNT_PATH: atlas_volume},
+    timeout=3600 * 6,
+)
+def run_e0_train(
+    kinds: str = "ln_act",
+    regimes: str = "R1",
+    steps: int = 2000,
+    num_train_trajs: int = 3,
+    train_traj_len: int = 10,
+    out_subdir: str = "e0",
+) -> None:
+    """scripts/run_e0.py -- offline chart fine-tuning. out_subdir lets a
+    richer-training experiment write to atlas_out/e0_richer/ instead of
+    overwriting the original atlas_out/e0/ charts."""
+    import subprocess
+    import sys
+    atlas_volume.reload()
+    subprocess.run(
+        [sys.executable, "scripts/run_e0.py",
+         "--kinds", *kinds.split(","),
+         "--regimes", *regimes.split(","),
+         "--steps", str(steps),
+         "--num-train-trajs", str(num_train_trajs),
+         "--train-traj-len", str(train_traj_len),
+         "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"],
+        check=True,
+        cwd="/src",
+    )
+    atlas_volume.commit()
+
+
+@app.local_entrypoint(name="run_e0_train")
+def run_e0_train_entrypoint(kinds: str = "ln_act", regimes: str = "R1", steps: int = 2000,
+                              num_train_trajs: int = 3, train_traj_len: int = 10,
+                              out_subdir: str = "e0") -> None:
+    run_e0_train.remote(kinds=kinds, regimes=regimes, steps=steps,
+                         num_train_trajs=num_train_trajs, train_traj_len=train_traj_len,
+                         out_subdir=out_subdir)

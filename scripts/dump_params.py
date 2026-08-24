@@ -25,7 +25,15 @@ def main() -> None:
     total = sum(p.numel() for p in predictor.parameters())
     print(f"\nPredictor total params: {total:,}")
 
-    print("\n── LN affine (ndim ≤ 1 with 'norm' or 'ln' in name) + action encoder ──")
+    # ln_act chart is LN-affine ONLY (10,764 params), NOT "LN + action
+    # encoder": the action encoder is a SIBLING of the predictor
+    # (video_wm.py:82-83), so a Chart built on `predictor.named_parameters()`
+    # alone can never reach it structurally -- the `is_act` filter below finds
+    # nothing (0 matches) against the real predictor's own parameters, which
+    # is exactly the evidence for that (E0_IMPLEMENTATION_PLAN.md T12 #10).
+    # Kept as a check, not deleted, so a future checkpoint with a differently
+    # structured predictor would visibly surface any action-named params here.
+    print("\n── LN affine (ndim ≤ 1 with 'norm' or 'ln' in name) — 'action' filter is a structural no-op, see comment ──")
     ln_act_count = 0
     for n, p in predictor.named_parameters():
         is_ln = (p.ndim == 1) and ("norm" in n or "ln" in n)

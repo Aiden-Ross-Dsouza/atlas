@@ -37,6 +37,8 @@ def route(
     *,
     regime_label: int | None = None,   # required for oracle_id
     label_to_chart: dict[int, int] | None = None,  # required for oracle_id
+    proprio_ctxt: torch.Tensor | None = None,
+    rng: _random.Random | None = None,  # for the "random" router; see _route_random
 ) -> tuple[int, dict]:
     """
     Select a chart index from *library*.
@@ -44,7 +46,8 @@ def route(
     Args:
         kind:           Which router to use.
         library:        The current chart library.
-        world_model:    VideoWM instance (EncPredWM.model from torch.hub).
+        world_model:    EncPredWM instance (the object torch.hub.load returns —
+                        NOT .model). Predictor reached via world_model.model.predictor.
         encoder_output: Pre-encoded chunk [T+1, N, D].
         actions:        Executed actions [T, action_dim].
         current_idx:    Index of the currently active chart (for hysteresis).
@@ -52,6 +55,13 @@ def route(
         hysteresis:     Keep current chart unless competitor beats by this margin.
         regime_label:   True regime ID (oracle only).
         label_to_chart: Map regime_id -> chart_idx (oracle only).
+        proprio_ctxt:   Encoded first-frame proprio [1, 1, P_tok, D] — see
+                        score.umf()'s proprio_ctxt docstring (required in
+                        practice for this checkpoint).
+        rng:            random.Random instance for the "random" router — thread
+                        the episode seed here for reproducibility (the router
+                        previously used the unseeded global `random` module).
+                        Falls back to that global module if None.
 
     Returns:
         (selected_idx, info_dict)
@@ -61,9 +71,9 @@ def route(
         return _route_oracle(library, regime_label, label_to_chart)
 
     if kind == "random":
-        return _route_random(library)
+        return _route_random(library, rng)
 
-    scores = _score_all(kind, library, world_model, encoder_output, actions, motion_gate)
+    scores = _score_all(kind, library, world_model, encoder_output, actions, motion_gate, proprio_ctxt)
 
     # If all scores are None the chunk is uninformative — keep current chart.
     valid = {i: s for i, s in enumerate(scores) if s is not None}
@@ -73,10 +83,20 @@ def route(
     best_idx = min(valid, key=valid.__getitem__)
     best_score = valid[best_idx]
 
-    # Hysteresis: only switch if improvement exceeds margin.
+    # Hysteresis: only switch if improvement exceeds margin, normalised by
+    # this replan's own score spread (T12 #5) -- the raw margin (m=0.05,
+    # fixed per CLAUDE.md Sec1.7, never changed) is meaningless applied to
+    # absolute scores on wildly different scales across routers (umf ~O(1),
+    # e1 ~1e4 so m is a no-op, sdyn in [-1,1] so m dominates and can block a
+    # correct switch). Normalising makes m mean "switch only if the
+    # improvement is at least 5% of this replan's own chart-to-chart spread",
+    # scale-invariant across routers without changing m's value.
     current_score = valid.get(current_idx)
-    if current_score is not None and (current_score - best_score) < hysteresis:
-        return current_idx, {"scores": scores, "gated": False}
+    if current_score is not None:
+        spread = max(valid.values()) - min(valid.values())
+        relative_gap = (current_score - best_score) / spread if spread > 0 else 0.0
+        if relative_gap < hysteresis:
+            return current_idx, {"scores": scores, "gated": False}
 
     return best_idx, {"scores": scores, "gated": False}
 
@@ -90,16 +110,18 @@ def _score_all(
     encoder_output: torch.Tensor,
     actions: torch.Tensor,
     motion_gate: float | None,
+    proprio_ctxt: torch.Tensor | None = None,
 ) -> list[float | None]:
     """Return a score (lower = better) for each chart, or None if gated."""
     scores: list[float | None] = []
     for chart in library:
         if kind == "umf":
-            s = compute_umf(chart, world_model, encoder_output, actions, motion_gate)
+            s = compute_umf(chart, world_model, encoder_output, actions, motion_gate,
+                             proprio_ctxt=proprio_ctxt)
         elif kind == "e1":
-            s = _e1_score(chart, world_model, encoder_output, actions, motion_gate)
+            s = _e1_score(chart, world_model, encoder_output, actions, motion_gate, proprio_ctxt)
         elif kind == "sdyn":
-            s = _sdyn_score(chart, world_model, encoder_output, actions, motion_gate)
+            s = _sdyn_score(chart, world_model, encoder_output, actions, motion_gate, proprio_ctxt)
         else:
             raise ValueError(f"Unknown router kind: {kind!r}")
         scores.append(s)
@@ -107,7 +129,7 @@ def _score_all(
 
 
 @torch.no_grad()
-def _e1_score(chart, world_model, encoder_output, actions, motion_gate) -> float | None:
+def _e1_score(chart, world_model, encoder_output, actions, motion_gate, proprio_ctxt=None) -> float | None:
     """
     One-step prediction error: ‖ẑ₁ − z₁‖² (ablation of UMF: no normalisation,
     scores only the first predicted step).
@@ -118,43 +140,48 @@ def _e1_score(chart, world_model, encoder_output, actions, motion_gate) -> float
     action), so a single raw action cannot be encoded on its own; the caller's
     full *actions* array is always frameskip-divisible (same array `umf()`
     scores), so this reuses that guarantee instead of re-deriving frameskip.
+    proprio_ctxt: see score.umf()'s docstring — required in practice for this
+    checkpoint.
     """
-    from atlas.score import _open_loop_rollout
+    from atlas.score import _open_loop_rollout, _make_z_ctxt
 
     z = encoder_output
     z0, z1 = z[0], z[1]
     observed_disp = (z[-1] - z[0]).norm(p="fro").item()
     if motion_gate is not None and observed_disp <= motion_gate:
         return None
-    predictor = world_model.predictor
+    predictor = world_model.model.predictor
+    z_ctxt = _make_z_ctxt(world_model, z0, proprio_ctxt)
     chart.apply_(predictor)
     try:
-        z_hat = _open_loop_rollout(world_model, z0, actions)
+        z_hat = _open_loop_rollout(world_model, z_ctxt, actions)
     finally:
         chart.restore_(predictor)
     return (z_hat[0] - z1).pow(2).sum().item()
 
 
 @torch.no_grad()
-def _sdyn_score(chart, world_model, encoder_output, actions, motion_gate) -> float | None:
+def _sdyn_score(chart, world_model, encoder_output, actions, motion_gate, proprio_ctxt=None) -> float | None:
     """
     Dynamics fingerprint routing (S-dyn baseline).
     Score = negative cosine similarity between observed Δz and predicted Δz,
     using the first predicted step of the full open-loop rollout (see
     _e1_score's docstring for why a 1-action slice can't be encoded directly).
-    Lower = better (matches UMF convention).
+    Lower = better (matches UMF convention). proprio_ctxt: see
+    score.umf()'s docstring — required in practice for this checkpoint.
     """
-    from atlas.score import _open_loop_rollout
+    from atlas.score import _open_loop_rollout, _make_z_ctxt
 
     z = encoder_output
     observed_disp = (z[-1] - z[0]).norm(p="fro").item()
     if motion_gate is not None and observed_disp <= motion_gate:
         return None
     z0, z1_obs = z[0], z[1]
-    predictor = world_model.predictor
+    predictor = world_model.model.predictor
+    z_ctxt = _make_z_ctxt(world_model, z0, proprio_ctxt)
     chart.apply_(predictor)
     try:
-        z_hat = _open_loop_rollout(world_model, z0, actions)
+        z_hat = _open_loop_rollout(world_model, z_ctxt, actions)
     finally:
         chart.restore_(predictor)
     z1_hat = z_hat[0]
@@ -164,8 +191,9 @@ def _sdyn_score(chart, world_model, encoder_output, actions, motion_gate) -> flo
     return -cos_sim  # negate: lower score = more similar = better
 
 
-def _route_random(library: Library) -> tuple[int, dict]:
-    idx = _random.randrange(len(library))
+def _route_random(library: Library, rng: _random.Random | None = None) -> tuple[int, dict]:
+    source = rng if rng is not None else _random
+    idx = source.randrange(len(library))
     return idx, {"scores": [None] * len(library), "gated": False}
 
 

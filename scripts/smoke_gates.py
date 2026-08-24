@@ -31,6 +31,23 @@ from atlas.score import umf as compute_umf
 from atlas.expand import Expander, ExpansionConfig
 
 
+def _make_synthetic_proprio_ctxt(wm, grid: int, device) -> torch.Tensor | None:
+    """Build a correctly-SHAPED (not physically meaningful) proprio_ctxt
+    [1, 1, P_tok, D_p] for gates that use synthetic random encoder_output --
+    this checkpoint's forward_pred needs a shape-correct proprio tensor
+    concatenated into the token channel width even for synthetic data (see
+    E0_IMPLEMENTATION_PLAN.md T1's finding: proprio=None is a channel-width
+    mismatch, not a graceful no-proprio path). None only if this checkpoint
+    genuinely has no proprio_encoder."""
+    if getattr(wm, "proprio_encoder", None) is None:
+        return None
+    prop_dim = wm.proprio_encoder.embed_dim
+    proprio_ctxt = torch.randn(1, 1, 1, prop_dim, device=device)
+    if getattr(wm, "proprio_encoding", None) == "feature":
+        proprio_ctxt = proprio_ctxt.repeat(1, 1, grid * grid, 1)
+    return proprio_ctxt
+
+
 def gate_g1(predictor, encoder, env) -> None:
     """G1: Library {c₀} only must be bit-identical to frozen baseline."""
     print("G1: identity chart bit-identity check...", end=" ")
@@ -73,13 +90,16 @@ def gate_g1(predictor, encoder, env) -> None:
     print("PASSED")
 
 
-def gate_g2(wm) -> None:
+def gate_g2(wm, wrapper) -> None:
     """G2: Over-refine chart X on W; score all on W' -> X must not auto-win.
 
-    Uses VideoWM.forward_pred() as the rollout entry point — the correct API
-    for the dino_wm architecture. ViTPredictor.forward() takes a single
-    pre-assembled [vis || proprio || action] tensor; calling it with separate
-    (z, action) args is not valid.
+    Uses VideoWM.forward_pred() as the rollout entry point for the manual
+    over-refine training loop below — the correct API for the dino_wm
+    architecture (ViTPredictor.forward() takes a single pre-assembled
+    [vis || proprio || action] tensor; calling it with separate (z, action)
+    args is not valid). compute_umf() itself now needs the EncPredWM WRAPPER
+    (torch.hub.load's return value, not .model) -- see
+    E0_IMPLEMENTATION_PLAN.md T1/T2.
     """
     print("G2: prequential ordering check...", end=" ")
     from einops import rearrange
@@ -138,9 +158,13 @@ def gate_g2(wm) -> None:
     cx.update_from_predictor_(predictor)
     cx.restore_(predictor)
 
-    # Score both charts on W' using the updated umf() API.
-    umf_c0 = compute_umf(c0, wm, W_prime["encoder_output"], W_prime["actions"])
-    umf_cx = compute_umf(cx, wm, W_prime["encoder_output"], W_prime["actions"])
+    # Score both charts on W' using the updated umf() API (needs the wrapper
+    # and a shape-correct proprio_ctxt -- see _make_synthetic_proprio_ctxt).
+    proprio_ctxt = _make_synthetic_proprio_ctxt(wm, grid, device)
+    umf_c0 = compute_umf(c0, wrapper, W_prime["encoder_output"], W_prime["actions"],
+                          proprio_ctxt=proprio_ctxt)
+    umf_cx = compute_umf(cx, wrapper, W_prime["encoder_output"], W_prime["actions"],
+                          proprio_ctxt=proprio_ctxt)
 
     # For random data, just verify scores are computed without error.
     if umf_cx is not None and umf_c0 is not None:
@@ -176,7 +200,7 @@ def _predict_one_step(wm, z_t: torch.Tensor, a_t_raw: torch.Tensor) -> torch.Ten
         return pred_vis.reshape(N, D)
 
 
-def gate_g3a(wm) -> None:
+def gate_g3a(wm, wrapper) -> None:
     """G3a: genuinely new, learnable regime shift -> probe fires and commits.
 
     Tests Expander's coded logic only (record()/maybe_expand() called
@@ -184,7 +208,9 @@ def gate_g3a(wm) -> None:
     see CLAUDE.md Sec 0.1). Does NOT test whether UMF-based verification would
     catch a chart that improves UMF while still hurting real CEM planning
     (see the E0 CEM-cost diagnostic finding) -- that's a different, harder,
-    not-yet-gated question.
+    not-yet-gated question. compute_umf()/maybe_expand() now need the
+    EncPredWM WRAPPER (torch.hub.load's return value, not .model) -- see
+    E0_IMPLEMENTATION_PLAN.md T1/T2.
     """
     print("G3a: probe fires on a genuinely new regime...", end=" ")
     predictor = wm.predictor
@@ -198,6 +224,7 @@ def gate_g3a(wm) -> None:
     N = grid * grid
     act_dim = wm.action_dim
     device = next(predictor.parameters()).device
+    proprio_ctxt = _make_synthetic_proprio_ctxt(wm, grid, device)
 
     # "Regime shift" = a small perturbation to the predictor's OWN weights, not
     # an external latent-space bias (empirically, an additive bias applied
@@ -228,8 +255,8 @@ def gate_g3a(wm) -> None:
 
     for _ in range(cfg.q):
         enc, actions = make_regime_chunk()
-        best_umf = compute_umf(c0, wm, enc, actions)
-        expander.record(best_umf, enc, actions)
+        best_umf = compute_umf(c0, wrapper, enc, actions, proprio_ctxt=proprio_ctxt)
+        expander.record(best_umf, enc, actions, proprio_ctxt=proprio_ctxt)
 
     if expander._strikes < cfg.q:
         raise AssertionError(
@@ -239,7 +266,8 @@ def gate_g3a(wm) -> None:
         )
 
     next_enc, next_actions = make_regime_chunk()
-    outcome = expander.maybe_expand(library, wm, next_enc, next_actions, motion_gate=None)
+    outcome = expander.maybe_expand(library, wrapper, next_enc, next_actions, motion_gate=None,
+                                     next_proprio_ctxt=proprio_ctxt)
 
     if outcome != "committed":
         raise AssertionError(
@@ -251,14 +279,16 @@ def gate_g3a(wm) -> None:
     print(f"PASSED  (outcome={outcome}, strikes={cfg.q})")
 
 
-def gate_g3b(wm) -> None:
+def gate_g3b(wm, wrapper) -> None:
     """G3b: unfixable, structureless noise -> probe rejects, nothing commits.
 
     Deliberately the crudest possible unfixable case (pure i.i.d. noise, zero
     learnable structure) -- see plan's Scope boundary note. This does not
     validate that verification catches a chart which merely improves UMF
     while still being bad for real planning; it only confirms the probe
-    isn't vacuous (doesn't say yes to everything).
+    isn't vacuous (doesn't say yes to everything). compute_umf()/maybe_expand()
+    now need the EncPredWM WRAPPER, not .model -- see
+    E0_IMPLEMENTATION_PLAN.md T1/T2.
     """
     print("G3b: probe rejects unfixable noise...", end=" ")
     predictor = wm.predictor
@@ -272,6 +302,7 @@ def gate_g3b(wm) -> None:
     N = grid * grid
     act_dim = wm.action_dim
     device = next(predictor.parameters()).device
+    proprio_ctxt = _make_synthetic_proprio_ctxt(wm, grid, device)
 
     def make_noise_chunk():
         encoder_output = torch.randn(T + 1, N, D, device=device)
@@ -280,8 +311,8 @@ def gate_g3b(wm) -> None:
 
     for _ in range(cfg.q):
         enc, actions = make_noise_chunk()
-        best_umf = compute_umf(c0, wm, enc, actions)
-        expander.record(best_umf, enc, actions)
+        best_umf = compute_umf(c0, wrapper, enc, actions, proprio_ctxt=proprio_ctxt)
+        expander.record(best_umf, enc, actions, proprio_ctxt=proprio_ctxt)
 
     if expander._strikes < cfg.q:
         raise AssertionError(
@@ -290,7 +321,8 @@ def gate_g3b(wm) -> None:
         )
 
     next_enc, next_actions = make_noise_chunk()
-    outcome = expander.maybe_expand(library, wm, next_enc, next_actions, motion_gate=None)
+    outcome = expander.maybe_expand(library, wrapper, next_enc, next_actions, motion_gate=None,
+                                     next_proprio_ctxt=proprio_ctxt)
 
     if outcome != "rejected_score":
         raise AssertionError(
@@ -305,19 +337,25 @@ def gate_g4(env_factory, regimes: list[str]) -> None:
     """G4: 20 random-action rollouts per regime → latents differ statistically."""
     print(f"G4: regime reality check for {regimes}...", end=" ")
     import numpy as np
-    from atlas.regimes import PhysicsRegime
 
     means = {}
     for regime in regimes:
         env = env_factory(regime)
         all_obs = []
         for seed in range(20):
-            obs, _ = env.reset(seed=seed)
-            all_obs.append(obs.flatten())
+            # PushTEnv is legacy-gym, NOT gymnasium: .seed() then .reset() (no
+            # seed kwarg), 4-tuple .step() (obs, reward, done, info), and obs
+            # is a dict {"visual", "proprio"} -- not a plain array. The
+            # previous version of this function used env.reset(seed=...) and
+            # a 5-tuple step(), matching neither, and had never actually run
+            # against a real env (E0_IMPLEMENTATION_PLAN.md T12 #11).
+            env.seed(seed)
+            obs, _ = env.reset()
+            all_obs.append(obs["visual"].flatten().astype(np.float64))
             for _ in range(10):
-                obs, _, done, trunc, _ = env.step(env.action_space.sample())
-                all_obs.append(obs.flatten())
-                if done or trunc:
+                obs, reward, done, info = env.step(env.action_space.sample())
+                all_obs.append(obs["visual"].flatten().astype(np.float64))
+                if done:
                     break
         means[regime] = np.stack(all_obs).mean(axis=0)
         env.close()
@@ -353,8 +391,12 @@ def gate_g5() -> None:
     print("PASSED")
 
 
-def gate_g6(wm) -> None:
-    """G6: Static chunk → compute_umf returns None (motion_gate or zero denominator)."""
+def gate_g6(wm, wrapper) -> None:
+    """G6: Static chunk → compute_umf returns None (motion_gate or zero denominator).
+
+    compute_umf() now needs the EncPredWM WRAPPER, not .model -- see
+    E0_IMPLEMENTATION_PLAN.md T1/T2.
+    """
     print("G6: denominator / static-chunk gate check...", end=" ")
     predictor = wm.predictor
     c0 = Chart(predictor, "ln_act")
@@ -367,7 +409,7 @@ def gate_g6(wm) -> None:
     encoder_output = z0.unsqueeze(0).expand(T + 1, -1, -1).clone()
     actions = torch.zeros(T, act_dim, device=device)
 
-    result = compute_umf(c0, wm, encoder_output, actions, motion_gate=0.0)
+    result = compute_umf(c0, wrapper, encoder_output, actions, motion_gate=0.0)
     if result is not None:
         raise AssertionError(
             f"G6 FAILED: expected None for static chunk but got UMF = {result:.4f}. "
@@ -411,15 +453,19 @@ def main() -> None:
             "facebookresearch/jepa-wms", "dino_wm_pusht",
             force_reload=False, trust_repo=True,
         )
-        # torch.hub returns EncPredWM wrapper; underlying VideoWM is at .model
+        # torch.hub returns the EncPredWM wrapper; underlying VideoWM is at
+        # .model. compute_umf()/route()/maybe_expand() need the WRAPPER
+        # (T1/T2); predictor state-dict ops and direct forward_pred/encode_act
+        # calls in this file's own synthetic-data helpers still need `wm`.
+        wrapper = model
         wm = model.model if hasattr(model, "model") else model
         for p in wm.encoder.parameters():
             p.requires_grad_(False)
 
-        run_gate("G2", gate_g2, wm)
-        run_gate("G3a", gate_g3a, wm)
-        run_gate("G3b", gate_g3b, wm)
-        run_gate("G6", gate_g6, wm)
+        run_gate("G2", gate_g2, wm, wrapper)
+        run_gate("G3a", gate_g3a, wm, wrapper)
+        run_gate("G3b", gate_g3b, wm, wrapper)
+        run_gate("G6", gate_g6, wm, wrapper)
 
     if run_all or run in ("G1", "G4"):
         print("\nNote: G1 and G4 require a running Push-T environment.")

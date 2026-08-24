@@ -108,7 +108,7 @@ def main() -> None:
     records = []
     for router in routers:
         record = run_e1_episode(
-            library=library, agent=agent, world_model=wm,
+            library=library, agent=agent, world_model=model,
             base_env=base_env, regime=regime_wrapper, goal_utils=goal_utils,
             router=router, episode_seed=seed,
             n_warmup_replans=N_WARMUP_REPLANS, n_replans_target=n_replans_target,

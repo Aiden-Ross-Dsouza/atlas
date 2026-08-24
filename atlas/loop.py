@@ -62,7 +62,7 @@ class StepInfo:
 def atlas_step(
     library: Library,
     expander: Expander,
-    predictor,
+    world_model,
     encoder_output: torch.Tensor,
     actions: torch.Tensor,
     current_idx: int,
@@ -80,7 +80,10 @@ def atlas_step(
     Args:
         library:              Current chart library.
         expander:             Stateful expander (strike counter).
-        predictor:            Frozen JEPA predictor.
+        world_model:          EncPredWM instance (the object torch.hub.load
+                              returns — NOT .model). Passed through to
+                              route()/expander.maybe_expand(), both of which
+                              need the wrapper (see E0_IMPLEMENTATION_PLAN.md T1/T2).
         encoder_output:       Current chunk [T+1, N, D].
         actions:              Executed actions [T, action_dim].
         current_idx:          Currently active chart index.
@@ -96,7 +99,7 @@ def atlas_step(
     selected_idx, route_info = route(
         kind=cfg.router,
         library=library,
-        predictor=predictor,
+        world_model=world_model,
         encoder_output=encoder_output,
         actions=actions,
         current_idx=current_idx,
@@ -127,7 +130,7 @@ def atlas_step(
             and expander._strikes >= cfg.q
         ):
             probe_outcome = expander.maybe_expand(
-                library, predictor, next_encoder_output, next_actions, cfg.motion_gate
+                library, world_model, next_encoder_output, next_actions, cfg.motion_gate
             )
 
     elif cfg.expansion_mode == "detect_only":
@@ -157,7 +160,7 @@ def atlas_step(
 
 def atlas_refine(
     chart,
-    predictor,
+    world_model,
     encoder_output: torch.Tensor,
     actions: torch.Tensor,
     lr: float = 5e-4,
@@ -166,9 +169,16 @@ def atlas_refine(
     One AdaJEPA gradient step on the selected chart.
     Must be called AFTER scoring and planning (step 5 in the prequential order).
 
+    Rolls out via _open_loop_rollout() -- the same EncPredWM.unroll()-based
+    function score.umf() and harness.run_e0_finetune() use, rather than the
+    bare predictor(z_cur, a_t) call this used to make, which is not a valid
+    call signature for this ViTPredictor (see E0_DIAGNOSIS_AND_PLAN.md).
+
     Args:
         chart:          The selected chart (c*).
-        predictor:      The frozen JEPA predictor (adapter will be applied/restored).
+        world_model:    EncPredWM instance (the object torch.hub.load
+                        returns — NOT .model). Predictor reached via
+                        world_model.model.predictor.
         encoder_output: Current chunk [T+1, N, D].
         actions:        Executed actions [T, action_dim].
         lr:             Learning rate.
@@ -177,26 +187,22 @@ def atlas_refine(
         Scalar loss value for logging.
     """
     import torch.optim as optim
+    from atlas.score import _open_loop_rollout
 
+    predictor = world_model.model.predictor
     chart.apply_(predictor)
     params = [p for n, p in predictor.named_parameters() if n in chart._param_names]
     optimizer = optim.Adam(params, lr=lr)
 
     optimizer.zero_grad()
-    z = encoder_output
-    T = actions.shape[0]
-    z_cur = z[0].unsqueeze(0)
-    loss = torch.tensor(0.0, device=z_cur.device)
-    for t in range(T):
-        a_t = actions[t].unsqueeze(0)
-        z_next_hat = predictor(z_cur, a_t)
-        loss = loss + (z_next_hat - z[t + 1].unsqueeze(0)).pow(2).mean()
-        z_cur = z_next_hat.detach()
-    (loss / T).backward()
+    z_vis = encoder_output[0]
+    z_preds = _open_loop_rollout(world_model, z_vis, actions)  # [T, N, D]
+    loss = (z_preds - encoder_output[1:]).pow(2).mean(dim=-1).mean()
+    loss.backward()
     optimizer.step()
 
-    scalar_loss = (loss / T).item()
-    
+    scalar_loss = loss.item()
+
     # [WandB Logging] Log to active WandB run if initialized
     try:
         import wandb

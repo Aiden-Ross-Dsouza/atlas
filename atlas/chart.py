@@ -2,9 +2,15 @@
 chart.py — Chart: a small persistent adapter on the frozen JEPA predictor.
 
 Three kinds (E0 picks one):
-  ln_act  — LN affine parameters + action encoder  (~10.4 k params)
-  lora4   — LoRA r=4 on attention qkv + proj       (~55 k params)
-  full    — all predictor parameters               (~1.8 M params)
+  ln_act  — LN affine parameters ONLY, 10,764 params. NOT "+ action encoder":
+            the action encoder is a SIBLING of the predictor (video_wm.py:82-83),
+            structurally unreachable from a Chart built on `predictor` alone
+            (E0_IMPLEMENTATION_PLAN.md T12 #10 — docs previously claimed
+            otherwise; the ~10.4k count that seemed to validate it was a
+            coincidence, since LN alone already totals 10,764).
+  lora4   — LoRA r=4 on attention qkv + proj       (118,176 trainable;
+            10,292,640 stored pre-training — see chart.n_params())
+  full    — all predictor parameters               (20,800,884 params)
 
 API:
   chart.apply_(predictor)    — swap chart params into predictor in-place
