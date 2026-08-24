@@ -74,6 +74,7 @@ def run_e0_planning(
     charts_subdir: str = "e0",
     out_subdir: str = "e0_planning",
     log_planner_diagnostics: bool = False,
+    min_block_pos_diff: float = 40.0,
 ) -> None:
     """Defaults = the SUBSTRATE's own validated Push-T config (CEM 300x30,
     horizon 6, num_act_stepped 6 -> 30 raw steps/episode, 1 replan), the
@@ -81,7 +82,14 @@ def run_e0_planning(
     run_e0_planning.py's module docstring (E0_IMPLEMENTATION_PLAN.md T6).
     charts_subdir/out_subdir let a corrected-config re-run write to e.g.
     atlas_out/e0_planning_v2/ without overwriting earlier (superseded-config,
-    kept for the record) results."""
+    kept for the record) results. min_block_pos_diff: minimum required block
+    displacement between a sampled real init/goal pair -- unfiltered sampling
+    let some pairs draw an already-near-goal state, making success trivial
+    without any real pushing (confirmed empirically: 5/10 baseline R0
+    episodes finished in <=8 raw steps under the old unfiltered sampler).
+    Runs with this filter active must use a NEW out_subdir (e.g.
+    e0_planning_v2) -- old results under the same seeds were sampled
+    differently and are not resume-compatible with filtered runs."""
     import subprocess
     import sys
     # Volumes are eventually consistent -- reload() picks up commits made by
@@ -96,7 +104,8 @@ def run_e0_planning(
            "--horizon", str(horizon),
            "--num-act-stepped", str(num_act_stepped),
            "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
-           "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+           "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}",
+           "--min-block-pos-diff", str(min_block_pos_diff)]
     if log_planner_diagnostics:
         cmd.append("--log-planner-diagnostics")
     subprocess.run(cmd, check=True, cwd="/src")
@@ -107,9 +116,10 @@ def run_e0_planning(
 def main(kind: str = "ln_act", regime: str = "R1", episodes: int = 10,
           num_samples: int = 300, iterations: int = 30, horizon: int = 6,
           num_act_stepped: int = 6, charts_subdir: str = "e0", out_subdir: str = "e0_planning",
-          log_planner_diagnostics: bool = False) -> None:
+          log_planner_diagnostics: bool = False, min_block_pos_diff: float = 40.0) -> None:
     run_e0_planning.remote(kind=kind, regime=regime, episodes=episodes,
                             num_samples=num_samples, iterations=iterations, horizon=horizon,
+                            min_block_pos_diff=min_block_pos_diff,
                             num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
                             out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics)
 
@@ -168,13 +178,21 @@ def run_e0_train(
     kinds: str = "ln_act",
     regimes: str = "R1",
     steps: int = 2000,
-    num_train_trajs: int = 3,
-    train_traj_len: int = 10,
-    out_subdir: str = "e0",
+    num_train_trajs: int = 20,
+    train_traj_len: int = 25,
+    num_val_trajs: int = 8,
+    eval_traj_len: int = 50,
+    eval_every: int = 25,
+    patience: int = 5,
+    data_source: str = "dataset",
+    data_split: str = "train",
+    out_subdir: str = "e0_v2",
 ) -> None:
-    """scripts/run_e0.py -- offline chart fine-tuning. out_subdir lets a
-    richer-training experiment write to atlas_out/e0_richer/ instead of
-    overwriting the original atlas_out/e0/ charts."""
+    """scripts/run_e0.py -- offline chart fine-tuning, T9: real-data replay
+    (data_source='dataset') + early stopping (eval_every/patience) on a held-
+    out val split (num_val_trajs), sized for Modal's 24GB L4 (not the 6GB
+    local card). out_subdir defaults to e0_v2 so this doesn't overwrite the
+    original (pre-T1-fix, invalidated) atlas_out/e0/ charts."""
     import subprocess
     import sys
     atlas_volume.reload()
@@ -185,6 +203,12 @@ def run_e0_train(
          "--steps", str(steps),
          "--num-train-trajs", str(num_train_trajs),
          "--train-traj-len", str(train_traj_len),
+         "--num-val-trajs", str(num_val_trajs),
+         "--eval-traj-len", str(eval_traj_len),
+         "--eval-every", str(eval_every),
+         "--patience", str(patience),
+         "--data-source", data_source,
+         "--data-split", data_split,
          "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"],
         check=True,
         cwd="/src",
@@ -194,8 +218,14 @@ def run_e0_train(
 
 @app.local_entrypoint(name="run_e0_train")
 def run_e0_train_entrypoint(kinds: str = "ln_act", regimes: str = "R1", steps: int = 2000,
-                              num_train_trajs: int = 3, train_traj_len: int = 10,
-                              out_subdir: str = "e0") -> None:
+                              num_train_trajs: int = 20, train_traj_len: int = 25,
+                              num_val_trajs: int = 8, eval_traj_len: int = 50,
+                              eval_every: int = 25, patience: int = 5,
+                              data_source: str = "dataset", data_split: str = "train",
+                              out_subdir: str = "e0_v2") -> None:
     run_e0_train.remote(kinds=kinds, regimes=regimes, steps=steps,
                          num_train_trajs=num_train_trajs, train_traj_len=train_traj_len,
+                         num_val_trajs=num_val_trajs, eval_traj_len=eval_traj_len,
+                         eval_every=eval_every, patience=patience,
+                         data_source=data_source, data_split=data_split,
                          out_subdir=out_subdir)

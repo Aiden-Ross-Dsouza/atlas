@@ -141,13 +141,39 @@ def load_dataset_states(split: str = "train") -> tuple[np.ndarray, list[int]]:
 
 
 def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.random.RandomState,
-                              traj_len: int = GOAL_TRAJ_LEN) -> tuple[np.ndarray, np.ndarray]:
+                              traj_len: int = GOAL_TRAJ_LEN, min_block_pos_diff: float = 40.0,
+                              max_tries: int = 20) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Samples a real (init, goal) pair from the same real demo episode, `traj_len`
+    raw timesteps apart.
+
+    Real demos have idle/repositioning stretches where the block barely moves
+    over that window -- sampling blindly can draw a pair already within (or
+    very close to) block_success()'s own 20px/pi-9 threshold, making "success"
+    trivial without any real pushing. Confirmed empirically: 5/10 baseline R0
+    episodes (uniform sampling, no filter) finished in <=8 raw steps, one in a
+    single action -- inflating the measured success rate. Retries (up to
+    max_tries) until the block has moved at least min_block_pos_diff px
+    between init and goal, so a real push is actually required. Falls back to
+    the last-drawn pair (with a warning) if nothing satisfies this within
+    max_tries, rather than looping forever -- some regions of the dataset may
+    just not have long-range pushes at this traj_len.
+    """
     valid_eps = [i for i, l in enumerate(seq_lengths) if l >= traj_len]
-    ep_idx = valid_eps[rs.randint(len(valid_eps))]
-    max_offset = seq_lengths[ep_idx] - traj_len
-    offset = rs.randint(max_offset + 1) if max_offset > 0 else 0
-    init_state = states[ep_idx, offset]
-    goal_state = states[ep_idx, offset + traj_len - 1]
+    init_state = goal_state = None
+    for attempt in range(max_tries):
+        ep_idx = valid_eps[rs.randint(len(valid_eps))]
+        max_offset = seq_lengths[ep_idx] - traj_len
+        offset = rs.randint(max_offset + 1) if max_offset > 0 else 0
+        init_state = states[ep_idx, offset]
+        goal_state = states[ep_idx, offset + traj_len - 1]
+        block_pos_diff = np.linalg.norm(goal_state[2:4] - init_state[2:4])
+        if block_pos_diff >= min_block_pos_diff:
+            break
+        if attempt == max_tries - 1:
+            print(f"    WARNING: sample_dataset_init_goal exhausted {max_tries} tries -- "
+                  f"accepting a pair with block_pos_diff={block_pos_diff:.1f} < "
+                  f"min_block_pos_diff={min_block_pos_diff}")
     # dataset states are 5-dim (no velocity); pad to match with_velocity=True's
     # 7-dim format -- generate_state() itself hardcodes agent velocity to 0
     # regardless, so zero-padding matches the existing convention exactly.
@@ -179,11 +205,18 @@ def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
 
 def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regime: PhysicsRegime,
                  seed: int, max_steps: int, num_act_stepped: int, states: np.ndarray,
-                 seq_lengths: list[int], log_planner_diagnostics: bool = False) -> dict:
+                 seq_lengths: list[int], log_planner_diagnostics: bool = False,
+                 min_block_pos_diff: float = 40.0) -> dict:
     device = agent.device
 
     rs = np.random.RandomState(seed)
-    init_state, goal_state = sample_dataset_init_goal(states, seq_lengths, rs)
+    init_state, goal_state = sample_dataset_init_goal(states, seq_lengths, rs,
+                                                        min_block_pos_diff=min_block_pos_diff)
+    # Logged so episode difficulty is auditable straight from episodes.jsonl,
+    # without recomputing from states.pth -- this is exactly the number the
+    # min_block_pos_diff filter above controls.
+    init_block_pos_diff = float(np.linalg.norm(goal_state[2:4] - init_state[2:4]))
+    init_block_angle_diff = float(np.abs((goal_state[4] - init_state[4] + np.pi) % (2 * np.pi) - np.pi))
 
     goal_obs, _ = prepare_with_visual(base_env, regime, seed, goal_state)
     agent.set_goal(make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
@@ -205,6 +238,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
     elapsed = 0
     success = False
     replans = 0
+    total_contacts = 0
     final_check = {"block_pos_diff": None, "block_angle_diff": None}
     planner_diagnostics = []  # per-replan CEM elite-cost convergence, if requested
     t_start = time.time()
@@ -235,6 +269,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                 break
             obs, reward, done, info = base_env.step(a)
             elapsed += 1
+            total_contacts += info["n_contacts"]
             final_check = block_success(goal_state, info["state"])
             if final_check["success"]:
                 success = True
@@ -242,6 +277,8 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
         if success:
             break
     result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
+              "init_block_pos_diff": init_block_pos_diff, "init_block_angle_diff": init_block_angle_diff,
+              "total_contacts": total_contacts,
               **{k: v for k, v in final_check.items() if k != "success"}}
     if log_planner_diagnostics:
         result["planner_diagnostics"] = planner_diagnostics
@@ -271,6 +308,14 @@ def main() -> None:
                          help="Where to write per-episode JSONL + summary JSON.")
     parser.add_argument("--log-planner-diagnostics", action="store_true",
                          help="Log CEM's per-iteration elite-cost mean/std (free -- already computed).")
+    parser.add_argument("--min-block-pos-diff", type=float, default=40.0,
+                         help="Minimum block displacement (px) required between a sampled real "
+                              "init/goal pair -- rejects pairs where the block barely moved over "
+                              "the real demo's 30-step window (real demos have idle/repositioning "
+                              "stretches), which otherwise makes 'success' trivial without any "
+                              "real pushing. Confirmed empirically: unfiltered sampling gave 5/10 "
+                              "baseline R0 episodes finishing in <=8 raw steps. See "
+                              "sample_dataset_init_goal()'s docstring.")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -372,7 +417,8 @@ def main() -> None:
                 result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps,
                                       num_act_stepped=args.num_act_stepped, states=states,
                                       seq_lengths=seq_lengths,
-                                      log_planner_diagnostics=args.log_planner_diagnostics)
+                                      log_planner_diagnostics=args.log_planner_diagnostics,
+                                      min_block_pos_diff=args.min_block_pos_diff)
                 results.append(result)
                 f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime, **result}) + "\n")
                 f.flush()

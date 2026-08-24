@@ -66,6 +66,9 @@ def run_e0_finetune(
     n_steps: int,
     lr: float,
     out_dir: Path,
+    val_trajectories: list[dict] | None = None,
+    eval_every: int = 25,
+    patience: int = 5,
 ) -> Chart:
     """
     Offline fine-tune a chart of the given kind on provided trajectories.
@@ -78,13 +81,29 @@ def run_e0_finetune(
         trajectories: List of trajectory dicts with pre-encoded data.
         kind:         Chart kind to fine-tune.
         regime:       Regime name (for logging).
-        n_steps:      Number of gradient steps.
+        n_steps:      Maximum number of gradient steps (upper bound -- early
+                      stopping below may stop sooner).
         lr:           Learning rate.
         out_dir:      Directory to save the resulting chart and loss log.
+        val_trajectories: Held-out trajectories for early stopping
+                      (E0_IMPLEMENTATION_PLAN.md T9 -- the overfitting fix:
+                      `full` previously reached train loss 0.0015 over 2000
+                      steps on 30 transitions with no validation signal at
+                      all). If None, behaves exactly as before: always runs
+                      the full n_steps and returns the FINAL step's weights
+                      (no regression for any existing caller that doesn't
+                      pass this).
+        eval_every:   Steps between validation checks.
+        patience:     Stop after this many consecutive checks with no
+                      improvement in validation loss. The chart returned is
+                      the BEST-validation snapshot seen, not necessarily the
+                      final step's weights -- training can (and does)
+                      overfit past the optimum.
 
     Returns:
         The fine-tuned Chart.
     """
+    import copy
     import torch.optim as optim
     from tqdm import tqdm
     from atlas.score import _open_loop_rollout, _make_z_ctxt
@@ -93,7 +112,7 @@ def run_e0_finetune(
     predictor = world_model.model.predictor
     chart = Chart(predictor, kind)
     chart.apply_(predictor)
-    
+
     # Freeze non-chart parameters and enable gradients ONLY on chart parameters
     for n, p in predictor.named_parameters():
         if kind == "lora4" and ("lora_A" in n or "lora_B" in n):
@@ -106,7 +125,36 @@ def run_e0_finetune(
     params = [p for n, p in predictor.named_parameters() if p.requires_grad]
     optimizer = optim.Adam(params, lr=lr)
 
+    def _val_loss() -> float:
+        # Training mutates `predictor`'s live parameters in-place (not
+        # chart._params), so predictor already reflects the current trained
+        # state here -- no apply_/restore_ needed, just a plain no-grad
+        # forward pass. update_from_predictor_ separately snapshots the
+        # current weights INTO chart._params, which the caller below uses to
+        # keep the best-so-far snapshot.
+        chart.update_from_predictor_(predictor)
+        losses = []
+        with torch.no_grad():
+            for traj in val_trajectories:
+                enc_out = traj["encoder_output"]
+                actions = traj["actions"]
+                z_vis = enc_out[0]
+                proprio_ctxt = traj.get("proprio")
+                if proprio_ctxt is not None:
+                    proprio_ctxt = proprio_ctxt[0:1].unsqueeze(0)
+                z_ctxt = _make_z_ctxt(world_model, z_vis, proprio_ctxt)
+                z_preds = _open_loop_rollout(world_model, z_ctxt, actions)
+                loss = compute_trajectory_loss(world_model.model, z_preds, enc_out[1:])
+                losses.append(loss.item())
+        return sum(losses) / len(losses)
+
     loss_log: list[float] = []
+    val_loss_log: list[dict] = []
+    best_val_loss = float("inf")
+    best_params: dict[str, torch.Tensor] | None = None
+    checks_since_improvement = 0
+    stopped_early_at: int | None = None
+
     pbar = tqdm(range(n_steps), desc=f"{kind}_{regime}", unit="step")
     for step in pbar:
         optimizer.zero_grad()
@@ -150,12 +198,49 @@ def run_e0_finetune(
         if (step + 1) == 1 or (step + 1) % 100 == 0 or (step + 1) == n_steps:
             pbar.write(f"    [Debug] [{kind}_{regime}] Step {step+1}/{n_steps} - Loss: {avg_loss:.6f}")
 
-    chart.update_from_predictor_(predictor)
+        if val_trajectories and ((step + 1) % eval_every == 0 or (step + 1) == n_steps):
+            val_loss = _val_loss()
+            val_loss_log.append({"step": step + 1, "val_loss": val_loss})
+            pbar.write(f"    [Debug] [{kind}_{regime}] Step {step+1}/{n_steps} - Val Loss: {val_loss:.6f}"
+                       f"{' (best)' if val_loss < best_val_loss else ''}")
+
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({f"val_loss_{kind}_{regime}": val_loss, "step": step + 1})
+            except ImportError:
+                pass
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_params = copy.deepcopy(chart._params)
+                checks_since_improvement = 0
+            else:
+                checks_since_improvement += 1
+                if checks_since_improvement >= patience:
+                    stopped_early_at = step + 1
+                    pbar.write(f"    [Debug] [{kind}_{regime}] Early stopping at step {step+1} "
+                               f"-- no val improvement for {patience} checks (best val loss "
+                               f"{best_val_loss:.6f})")
+                    break
+
+    if val_trajectories and best_params is not None:
+        # Keep the BEST validation snapshot, not the final (possibly
+        # overfit) step's weights.
+        chart._params = best_params
+    else:
+        chart.update_from_predictor_(predictor)
     chart.restore_(predictor)
 
     chart_path = out_dir / f"chart_{kind}_{regime}.pt"
     chart.save(chart_path)
     (out_dir / f"loss_{kind}_{regime}.json").write_text(json.dumps(loss_log))
+    if val_trajectories:
+        (out_dir / f"val_loss_{kind}_{regime}.json").write_text(json.dumps({
+            "val_loss_log": val_loss_log,
+            "best_val_loss": best_val_loss,
+            "stopped_early_at_step": stopped_early_at,
+        }))
     return chart
 
 

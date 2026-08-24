@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import json
+import pickle
 import time
 from pathlib import Path
+from typing import Literal
 
 import torch
 import atlas
@@ -29,8 +32,44 @@ from atlas.chart import Chart, ChartKind
 from atlas.harness import run_e0_finetune, log_episode
 from atlas.score import compute_motion_gate
 
+DataSource = Literal["scripted", "dataset"]
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5) -> list[dict]:
+
+@functools.lru_cache(maxsize=None)
+def _load_pusht_demo_dataset(split: str = "train"):
+    """
+    Loads (and caches, per-process) the real Push-T demonstration dataset used
+    by T9's replay path. Cached because load_regime_trajectories() is called
+    multiple times per regime (train + eval, and again by scripts/run_e1.py
+    for its motion-gate sample) -- without caching, each call would re-read
+    ~260MB (states.pth + rel_actions.pth) from disk.
+
+    Only states.pth/rel_actions.pth/seq_lengths.pkl are loaded -- NOT
+    tokens.pth (4.8GB; precomputed encodings we don't want, since we need
+    live proprio/visual through world_model.encode(), see module docstring)
+    or abs_actions.pth (env.step() with relative=True, the PushTEnv default,
+    consumes rel_actions -- confirmed against pusht_dset.py:36-52's identical
+    choice).
+
+    Returns (states [N,246,5] float64, rel_actions [N,246,2] float64,
+    seq_lengths: list[int]). states/actions are NOT dataset-normalized (no
+    mean/std applied) -- these are the raw recorded values, matching what
+    PushTEnv.reset_to_state / env.step() expect (env.step() itself does
+    action*action_scale internally, action_scale=100 by default -- see
+    _load_pusht_demo_dataset's caller for the /action_scale conversion,
+    empirically confirmed exact under R0: replaying a real episode's actions
+    from its own recorded initial state reproduces the recorded states to
+    ~1e-5 (float32/64 rounding only), before any PhysicsRegime shift).
+    """
+    d = atlas.DATA_DIR / "pusht_noise" / split
+    states = torch.load(d / "states.pth", weights_only=False).numpy()
+    rel_actions = torch.load(d / "rel_actions.pth", weights_only=False).numpy()
+    with open(d / "seq_lengths.pkl", "rb") as f:
+        seq_lengths = pickle.load(f)
+    return states, rel_actions, seq_lengths
+
+
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train") -> list[dict]:
     """
     Collects real trajectories from PushTEnv under the specified regime and
     encodes them through the frozen vision backbone.
@@ -68,15 +107,36 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     channel width (VideoWM.concat_obs_act(), dim=3) and errors without it, so
     it is not an optional enrichment here.
 
+    source="dataset" (E0_IMPLEMENTATION_PLAN.md T9) replaces the scripted
+    aimed-walk actions above with REAL recorded action sequences from
+    data/pusht_noise/{data_split}/ (18,685 real Push-T demonstrations, the
+    same distribution dino_wm_pusht's checkpoint was trained on): a real
+    episode + offset is chosen (per-trajectory, per-attempt, seeded exactly
+    like the scripted path's target/noise draws), the env is reset to that
+    episode's REAL recorded state via reset_to_state (not a fresh random
+    reset), and the episode's REAL recorded raw actions are replayed step by
+    step. The recording was made under R0 physics; replaying those same
+    actions under PhysicsRegime's R1/R2 genuinely diverges from the original
+    trajectory (confirmed: replaying under R0 itself reproduces the recorded
+    states to ~1e-5, i.e. float rounding only -- so any larger divergence
+    under R1/R2 is the regime shift, not a bug in the replay). The
+    accept/retry-on-zero-contact structure (max_tries) is unchanged between
+    both sources.
+
     Args:
         world_model: EncPredWM instance (the object torch.hub.load returns —
                      NOT .model).
+        source:      'scripted' (default, unchanged) or 'dataset' (T9 replay).
+        data_split:  Which data/pusht_noise/{split}/ to draw real episodes
+                     from when source='dataset'. Unused for 'scripted'.
 
     Returns a list of dicts:
         {'encoder_output': [T_model+1, N, D],
          'actions':        [T_model, 10]  (model-chunk, normalized),
          'proprio':        [T_model+1, P_tok, D_p]  (encoded, full sequence),
-         'seed':           int}
+         'seed':           int,   # accepted seed (both sources)
+         'episode_idx':    int | None,  # source='dataset' only: which real episode
+         'offset':         int | None}  # source='dataset' only: start offset within it
     """
     import sys
     import numpy as np
@@ -103,62 +163,116 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     # without it, two calls both starting traj_idx at 0 would silently overlap.
     seed_base = {"R0": 2000, "R1": 0, "R2": 1000}.get(regime, 0) + seed_offset
 
+    if source == "dataset":
+        demo_states, demo_rel_actions, demo_seq_lengths = _load_pusht_demo_dataset(data_split)
+        # Need traj_len real actions [offset, offset+traj_len) plus the state
+        # AFTER the last one (offset+traj_len) as a valid (non-padding) row --
+        # so seq_length must cover index offset+traj_len, i.e. >= traj_len+1.
+        valid_eps = [i for i, l in enumerate(demo_seq_lengths) if l >= traj_len + 1]
+        if not valid_eps:
+            raise ValueError(
+                f"No episodes in data/pusht_noise/{data_split} have seq_length >= "
+                f"traj_len+1={traj_len + 1} (max seq_length in this split is "
+                f"{max(demo_seq_lengths)}) -- reduce traj_len."
+            )
+
     trajectories = []
     for traj_idx in range(num_trajs):
         for attempt in range(max_tries):
             seed = seed_base + traj_idx * max_tries + attempt
+            rs = np.random.RandomState(seed)
             # with_velocity=True: matches scripts/run_e1.py and the shipped
             # eval YAML (env.with_velocity: true) -- the checkpoint's
             # preprocessor.proprio_std is sized for the 4-dim (x,y,vx,vy)
             # proprio this produces, not the 2-dim default. Confirmed
             # empirically (RuntimeError on proprio_std shape mismatch without
             # it) -- see E0_IMPLEMENTATION_PLAN.md T3.
-            env = PhysicsRegime(PushTEnv(render_size=224, with_velocity=True), regime)
-            env.seed(seed)
+            base_env = PushTEnv(render_size=224, with_velocity=True)
+            env = PhysicsRegime(base_env, regime)
+
+            episode_idx: int | None = None
+            offset: int | None = None
+            if source == "dataset":
+                episode_idx = int(valid_eps[rs.randint(len(valid_eps))])
+                max_offset = demo_seq_lengths[episode_idx] - traj_len - 1
+                offset = int(rs.randint(max_offset + 1)) if max_offset > 0 else 0
+                init_state5 = demo_states[episode_idx, offset]  # [ax, ay, Tx, Ty, angle] -- no velocity
+                # Pad to with_velocity=True's 7-dim reset state -- PushTEnv's
+                # own random-reset branch hardcodes agent velocity to 0
+                # regardless of the sampled state, so zero-padding here
+                # matches the existing convention exactly (also done
+                # identically in run_e0_planning.py::sample_dataset_init_goal).
+                init_state7 = np.concatenate([init_state5, [0.0, 0.0]])
+                # reset_to_state/seed are set on the INNER env, not the
+                # PhysicsRegime wrapper -- gym.Wrapper proxies attribute READS
+                # but not WRITES (see atlas/harness.py::_prepare_env's
+                # docstring, and run_e0_planning.py::prepare_with_visual,
+                # which this mirrors).
+                base_env.seed(seed)
+                base_env.reset_to_state = init_state7
+            else:
+                env.seed(seed)
+
             obs, state = env.reset()
             imgs = [obs["visual"]]  # RGB array [224, 224, 3]
             proprios = [obs["proprio"]]
             raw_actions = []
             total_contacts = 0
 
-            rs = np.random.RandomState(seed)
-            block_xy = state[2:4]
-            # One persistent random target near the block, sampled once per
-            # trajectory — NOT resampled every step, which is what keeps the
-            # walk "aimed" instead of cancelling out like the old scheme.
-            target = block_xy + rs.uniform(-40.0, 40.0, size=(2,))
-            agent_xy = obs["proprio"][:2]
-
-            for _ in range(traj_len):
-                # Undo the env's own act*action_scale (+= agent.position when
-                # relative=True, the default) to get a raw action that aims
-                # the agent at `target` this step.
-                direction = (target - agent_xy) / env.action_scale
-                noise = rs.normal(0.0, 0.15, size=(2,))
-                # ACTION_GAIN: without this, "aim hard at the target every
-                # step" produces raw actions with std ~[0.46, 0.43] (often
-                # saturating at the +-1 clip bound while the agent is still
-                # far away) -- but the checkpoint's own preprocessor.action_std
-                # is ~[0.20, 0.20] (real demonstration data takes gentler,
-                # smaller per-step actions), so un-scaled actions land ~2.2x
-                # outside the distribution the model was calibrated on, which
-                # after normalize_actions stretches to std ~2.1-2.3 and values
-                # up to +-5 std. Confirmed via direct audit (code-review.md
-                # Bug #6d). ACTION_GAIN=0.25 was tuned empirically (clipping
-                # is nonlinear, so std doesn't scale linearly with gain) to
-                # bring raw action std to ~[0.215, 0.204], matching the
-                # checkpoint's ~[0.202, 0.200] almost exactly. This alone
-                # drops single-attempt contact rate to ~43%, but the
-                # rejection-sampling retry above (max_tries=8) still reaches
-                # ~99% expected overall success (1-(1-0.43)^8).
-                ACTION_GAIN = 0.25
-                act = np.clip((direction + noise) * ACTION_GAIN, -1.0, 1.0)
-                obs, reward, done, info = env.step(act)
+            if source == "dataset":
+                action_scale = env.action_scale  # read-proxied through PhysicsRegime; env.action_scale==100 default
+                for t in range(traj_len):
+                    # Real recorded action, converted back to the raw
+                    # [-1,1]-ish input env.step() expects -- env.step()
+                    # itself does action*action_scale internally (relative=True
+                    # default: += agent.position). Confirmed empirically:
+                    # replaying an episode's own actions from its own recorded
+                    # initial state under R0 reproduces the recorded states to
+                    # ~1e-5 (see module docstring).
+                    act = demo_rel_actions[episode_idx, offset + t] / action_scale
+                    obs, reward, done, info = env.step(act)
+                    total_contacts += info["n_contacts"]
+                    imgs.append(obs["visual"])
+                    proprios.append(obs["proprio"])
+                    raw_actions.append(act)
+            else:
+                block_xy = state[2:4]
+                # One persistent random target near the block, sampled once per
+                # trajectory — NOT resampled every step, which is what keeps the
+                # walk "aimed" instead of cancelling out like the old scheme.
+                target = block_xy + rs.uniform(-40.0, 40.0, size=(2,))
                 agent_xy = obs["proprio"][:2]
-                total_contacts += info["n_contacts"]
-                imgs.append(obs["visual"])
-                proprios.append(obs["proprio"])
-                raw_actions.append(act)
+
+                for _ in range(traj_len):
+                    # Undo the env's own act*action_scale (+= agent.position when
+                    # relative=True, the default) to get a raw action that aims
+                    # the agent at `target` this step.
+                    direction = (target - agent_xy) / env.action_scale
+                    noise = rs.normal(0.0, 0.15, size=(2,))
+                    # ACTION_GAIN: without this, "aim hard at the target every
+                    # step" produces raw actions with std ~[0.46, 0.43] (often
+                    # saturating at the +-1 clip bound while the agent is still
+                    # far away) -- but the checkpoint's own preprocessor.action_std
+                    # is ~[0.20, 0.20] (real demonstration data takes gentler,
+                    # smaller per-step actions), so un-scaled actions land ~2.2x
+                    # outside the distribution the model was calibrated on, which
+                    # after normalize_actions stretches to std ~2.1-2.3 and values
+                    # up to +-5 std. Confirmed via direct audit (code-review.md
+                    # Bug #6d). ACTION_GAIN=0.25 was tuned empirically (clipping
+                    # is nonlinear, so std doesn't scale linearly with gain) to
+                    # bring raw action std to ~[0.215, 0.204], matching the
+                    # checkpoint's ~[0.202, 0.200] almost exactly. This alone
+                    # drops single-attempt contact rate to ~43%, but the
+                    # rejection-sampling retry above (max_tries=8) still reaches
+                    # ~99% expected overall success (1-(1-0.43)^8).
+                    ACTION_GAIN = 0.25
+                    act = np.clip((direction + noise) * ACTION_GAIN, -1.0, 1.0)
+                    obs, reward, done, info = env.step(act)
+                    agent_xy = obs["proprio"][:2]
+                    total_contacts += info["n_contacts"]
+                    imgs.append(obs["visual"])
+                    proprios.append(obs["proprio"])
+                    raw_actions.append(act)
 
             if total_contacts > 0 or attempt == max_tries - 1:
                 break  # accept: real contact happened, or retries exhausted
@@ -197,6 +311,9 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
             "seed": seed,  # the ACCEPTED seed (whichever attempt broke the retry loop) --
                             # written to e0_seed_manifest.json so E1/downstream experiments
                             # can be audited for zero overlap with E0's train/eval seeds.
+            "episode_idx": episode_idx,  # source='dataset' only; None for 'scripted'
+            "offset": offset,            # source='dataset' only; None for 'scripted'
+            "n_contacts": total_contacts,  # informs the contact-rate check in main()
         })
 
     return trajectories
@@ -266,17 +383,29 @@ def main() -> None:
     parser.add_argument("--kinds", nargs="+", default=["ln_act", "lora4", "full"],
                         choices=["ln_act", "lora4", "full"])
     parser.add_argument("--regimes", nargs="+", default=["R1", "R2"])
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--num-train-trajs", type=int, default=3,
+    parser.add_argument("--steps", type=int, default=2000,
+                         help="MAXIMUM gradient steps -- early stopping (see --patience) can "
+                              "stop sooner once validation loss stops improving.")
+    parser.add_argument("--num-train-trajs", type=int, default=20,
                          help="Number of TRAINING trajectories. run_e0_finetune() loops over "
-                              "every trajectory on every step, so compute scales linearly "
-                              "with this too.")
-    parser.add_argument("--train-traj-len", type=int, default=10,
-                         help="Steps per TRAINING trajectory. run_e0_finetune() backprops "
-                              "through the full open-loop unroll, so GPU memory scales "
-                              "~linearly with this (measured ~0.27GB/step for kind=full on "
-                              "this predictor) -- kept short to fit a 6GB GPU. See "
-                              "code-review.md Bug #6e.")
+                              "every trajectory on every step, so compute (and, since all "
+                              "trajectories' graphs are held simultaneously before one "
+                              "accumulated backward, GPU memory) scales ~linearly with this. "
+                              "Bumped from the original 3 now that --data-source=dataset (T9) "
+                              "gives real, diverse trajectories instead of one scripted policy "
+                              "-- intended for Modal (24GB), not the 6GB local card.")
+    parser.add_argument("--train-traj-len", type=int, default=25,
+                         help="Steps per TRAINING trajectory (must be a multiple of frameskip=5). "
+                              "run_e0_finetune() backprops through the full open-loop unroll, so "
+                              "GPU memory scales ~linearly with this too (measured ~0.27GB/step "
+                              "for kind=full on this predictor) -- combined with the "
+                              "--num-train-trajs bump above, this is sized for Modal's 24GB L4, "
+                              "not local. See code-review.md Bug #6e.")
+    parser.add_argument("--num-val-trajs", type=int, default=8,
+                         help="Number of held-out validation trajectories, used both for early "
+                              "stopping during training and (necessarily reusing the same set --  "
+                              "this is not a 3-way train/val/test split) for the final reported "
+                              "eval_loss/eval_umf. Bumped from the original hardcoded 2.")
     parser.add_argument("--eval-traj-len", type=int, default=50,
                          help="Steps per EVAL (held-out) trajectory. Runs under torch.no_grad "
                               "so length is cheap here -- needs to be long because 10 was too "
@@ -284,8 +413,25 @@ def main() -> None:
                               "enough displacement for UMF to be well-behaved. See "
                               "code-review.md Bug #6d. DINO-WM's own training trajectories "
                               "are ~100 steps.")
+    parser.add_argument("--eval-every", type=int, default=25,
+                         help="Gradient steps between early-stopping validation checks "
+                              "(E0_IMPLEMENTATION_PLAN.md T9).")
+    parser.add_argument("--patience", type=int, default=5,
+                         help="Stop after this many consecutive validation checks with no "
+                              "improvement (E0_IMPLEMENTATION_PLAN.md T9) -- the overfitting fix: "
+                              "`full` previously reached train loss 0.0015 over 2000 steps on 30 "
+                              "transitions with no validation signal at all.")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--out", type=Path, default=atlas.OUT_DIR / "e0")
+    parser.add_argument("--data-source", choices=["scripted", "dataset"], default="dataset",
+                         help="'dataset' (default, T9): replay real Push-T demo action "
+                              "sequences from data/pusht_noise/{--data-split}/ under the "
+                              "shifted regime. 'scripted': the original synthetic aimed-walk "
+                              "sampler (documented fallback per E0_IMPLEMENTATION_PLAN.md T9 "
+                              "-- use if the replay path proves too slow).")
+    parser.add_argument("--data-split", type=str, default="train",
+                         help="data/pusht_noise/{split}/ to draw real episodes from "
+                              "(--data-source=dataset only).")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="atlas-e0", help="WandB project name")
     args = parser.parse_args()
@@ -345,16 +491,32 @@ def main() -> None:
         # / --eval-traj-len help text and code-review.md Bug #6d/#6e.
         train_trajectories = load_regime_trajectories(
             wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
-            device=device, seed_offset=0)
+            device=device, seed_offset=0, source=args.data_source, data_split=args.data_split)
         val_trajectories = load_regime_trajectories(
-            wrapper, prep, regime, num_trajs=2, traj_len=args.eval_traj_len, device=device,
-            seed_offset=10_000)
+            wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
+            seed_offset=10_000, source=args.data_source, data_split=args.data_split)
         seed_manifest[regime] = {
-            "train": [t["seed"] for t in train_trajectories],
-            "eval": [t["seed"] for t in val_trajectories],
+            "source": args.data_source,
+            "train": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
+                      for t in train_trajectories],
+            "eval": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
+                     for t in val_trajectories],
         }
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
+
+        if args.data_source == "dataset":
+            # T9 acceptance check: real demo episodes should generally involve
+            # agent-block contact (they're expert task completions), but verify
+            # rather than assume -- especially post-regime-shift, where the
+            # replayed actions no longer perfectly track the (now-different)
+            # physics. n_contacts is per-trajectory total contact events across
+            # traj_len steps, recorded by load_regime_trajectories() above.
+            all_trajs = train_trajectories + val_trajectories
+            n_with_contact = sum(1 for t in all_trajs if t["n_contacts"] > 0)
+            print(f"  [Debug] Real-demo replay contact rate for {regime}: "
+                  f"{n_with_contact}/{len(all_trajs)} trajectories had >=1 contact "
+                  f"(n_contacts per traj: {[t['n_contacts'] for t in all_trajs]})", flush=True)
 
         # Gate G6: informative-chunk threshold, computed once from this
         # regime's own training displacements (10th percentile) -- wired into
@@ -433,7 +595,9 @@ def main() -> None:
                     print(f"⚠️ WandB init failed for {kind}_{regime}: {e}", flush=True)
 
             # [Debug print statement] Print fine-tuning start
-            print(f"  Fine-tuning {kind} on {regime} ({args.steps} steps)...", flush=True)
+            print(f"  Fine-tuning {kind} on {regime} (up to {args.steps} steps, "
+                  f"early stop after {args.patience} checks w/o improvement every "
+                  f"{args.eval_every} steps)...", flush=True)
             chart = run_e0_finetune(
                 world_model=wrapper,
                 trajectories=train_trajectories,
@@ -442,6 +606,9 @@ def main() -> None:
                 n_steps=args.steps,
                 lr=args.lr,
                 out_dir=args.out,
+                val_trajectories=val_trajectories,
+                eval_every=args.eval_every,
+                patience=args.patience,
             )
 
             # Held-out Evaluation on Validation Trajectories
