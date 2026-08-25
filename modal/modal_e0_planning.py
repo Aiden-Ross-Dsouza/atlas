@@ -66,6 +66,7 @@ app = modal.App("atlas-e0-planning", image=image)
 def run_e0_planning(
     kind: str = "ln_act",
     regime: str = "R1",
+    regime_config: str | None = None,
     episodes: int = 10,
     num_samples: int = 300,
     iterations: int = 30,
@@ -106,6 +107,8 @@ def run_e0_planning(
            "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
            "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}",
            "--min-block-pos-diff", str(min_block_pos_diff)]
+    if regime_config is not None:
+        cmd += ["--regime-config", regime_config]
     if log_planner_diagnostics:
         cmd.append("--log-planner-diagnostics")
     subprocess.run(cmd, check=True, cwd="/src")
@@ -113,11 +116,12 @@ def run_e0_planning(
 
 
 @app.local_entrypoint()
-def main(kind: str = "ln_act", regime: str = "R1", episodes: int = 10,
+def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = None,
+          episodes: int = 10,
           num_samples: int = 300, iterations: int = 30, horizon: int = 6,
           num_act_stepped: int = 6, charts_subdir: str = "e0", out_subdir: str = "e0_planning",
           log_planner_diagnostics: bool = False, min_block_pos_diff: float = 40.0) -> None:
-    run_e0_planning.remote(kind=kind, regime=regime, episodes=episodes,
+    run_e0_planning.remote(kind=kind, regime=regime, regime_config=regime_config, episodes=episodes,
                             num_samples=num_samples, iterations=iterations, horizon=horizon,
                             min_block_pos_diff=min_block_pos_diff,
                             num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
@@ -177,6 +181,7 @@ def diagnose_cem_costs_entrypoint(kind: str = "baseline", regime: str = "R1", se
 def run_e0_train(
     kinds: str = "ln_act",
     regimes: str = "R1",
+    regime_config: str | None = None,
     steps: int = 2000,
     num_train_trajs: int = 20,
     train_traj_len: int = 25,
@@ -192,38 +197,42 @@ def run_e0_train(
     (data_source='dataset') + early stopping (eval_every/patience) on a held-
     out val split (num_val_trajs), sized for Modal's 24GB L4 (not the 6GB
     local card). out_subdir defaults to e0_v2 so this doesn't overwrite the
-    original (pre-T1-fix, invalidated) atlas_out/e0/ charts."""
+    original (pre-T1-fix, invalidated) atlas_out/e0/ charts. regime_config: JSON
+    string applied to EVERY regime in `regimes` via set_regime_config -- pass
+    the SAME calibrated config used at eval time (run_e0_planning's own
+    regime_config), or a chart trains under one physics and gets evaluated
+    under another with no error raised anywhere (E0_RECOVERY_PLAN.md P3)."""
     import subprocess
     import sys
     atlas_volume.reload()
-    subprocess.run(
-        [sys.executable, "scripts/run_e0.py",
-         "--kinds", *kinds.split(","),
-         "--regimes", *regimes.split(","),
-         "--steps", str(steps),
-         "--num-train-trajs", str(num_train_trajs),
-         "--train-traj-len", str(train_traj_len),
-         "--num-val-trajs", str(num_val_trajs),
-         "--eval-traj-len", str(eval_traj_len),
-         "--eval-every", str(eval_every),
-         "--patience", str(patience),
-         "--data-source", data_source,
-         "--data-split", data_split,
-         "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"],
-        check=True,
-        cwd="/src",
-    )
+    cmd = [sys.executable, "scripts/run_e0.py",
+           "--kinds", *kinds.split(","),
+           "--regimes", *regimes.split(","),
+           "--steps", str(steps),
+           "--num-train-trajs", str(num_train_trajs),
+           "--train-traj-len", str(train_traj_len),
+           "--num-val-trajs", str(num_val_trajs),
+           "--eval-traj-len", str(eval_traj_len),
+           "--eval-every", str(eval_every),
+           "--patience", str(patience),
+           "--data-source", data_source,
+           "--data-split", data_split,
+           "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+    if regime_config is not None:
+        cmd += ["--regime-config", regime_config]
+    subprocess.run(cmd, check=True, cwd="/src")
     atlas_volume.commit()
 
 
 @app.local_entrypoint(name="run_e0_train")
-def run_e0_train_entrypoint(kinds: str = "ln_act", regimes: str = "R1", steps: int = 2000,
+def run_e0_train_entrypoint(kinds: str = "ln_act", regimes: str = "R1",
+                              regime_config: str | None = None, steps: int = 2000,
                               num_train_trajs: int = 20, train_traj_len: int = 25,
                               num_val_trajs: int = 8, eval_traj_len: int = 50,
                               eval_every: int = 25, patience: int = 5,
                               data_source: str = "dataset", data_split: str = "train",
                               out_subdir: str = "e0_v2") -> None:
-    run_e0_train.remote(kinds=kinds, regimes=regimes, steps=steps,
+    run_e0_train.remote(kinds=kinds, regimes=regimes, regime_config=regime_config, steps=steps,
                          num_train_trajs=num_train_trajs, train_traj_len=train_traj_len,
                          num_val_trajs=num_val_trajs, eval_traj_len=eval_traj_len,
                          eval_every=eval_every, patience=patience,

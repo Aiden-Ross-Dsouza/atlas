@@ -86,7 +86,7 @@ from evals.simu_env_planning.envs.pusht_gym_wrap import PushTWrapper  # noqa: E4
 from evals.simu_env_planning.planning.gc_agent import GC_Agent  # noqa: E402
 
 from atlas.chart import Chart  # noqa: E402
-from atlas.regimes import PhysicsRegime  # noqa: E402
+from atlas.regimes import PhysicsRegime, REGIME_CONFIGS, set_regime_config  # noqa: E402
 
 
 def build_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: int) -> OmegaConf:
@@ -290,6 +290,13 @@ def main() -> None:
     parser.add_argument("--kind", required=True, choices=["baseline", "ln_act", "lora4", "full"],
                          help="'baseline' = frozen pretrained predictor, no chart applied.")
     parser.add_argument("--regime", required=True, choices=["R0", "R1", "R2"])
+    parser.add_argument("--regime-config", type=str, default=None,
+                         help="JSON string overriding this regime's physics params for "
+                              "calibration sweeps (P1 Step 2), e.g. '{\"friction\": 2.0}' or "
+                              "'{\"damping\": 0.5}'. Applied via atlas.regimes.set_regime_config "
+                              "before PhysicsRegime is constructed; logged into the summary JSON "
+                              "and every per-episode record so cells stay attributable. Omit to "
+                              "use REGIME_CONFIGS' existing default for --regime.")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--num-samples", type=int, default=300,
@@ -363,6 +370,10 @@ def main() -> None:
     # this file (goal sampling/success use the local sample_dataset_init_goal/
     # block_success functions, not PushTWrapper's methods) -- kept only for
     # run_episode()'s existing signature.
+    if args.regime_config is not None:
+        set_regime_config(args.regime, json.loads(args.regime_config))
+    resolved_regime_cfg = dict(REGIME_CONFIGS.get(args.regime, {}))
+
     wrapper = PushTWrapper(base_env)
     regime = PhysicsRegime(base_env, args.regime)
     states, seq_lengths = load_dataset_states()
@@ -420,7 +431,8 @@ def main() -> None:
                                       log_planner_diagnostics=args.log_planner_diagnostics,
                                       min_block_pos_diff=args.min_block_pos_diff)
                 results.append(result)
-                f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime, **result}) + "\n")
+                f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime,
+                                     "regime_config": resolved_regime_cfg, **result}) + "\n")
                 f.flush()
                 pbar.set_postfix(success=result["success"], steps=result["steps"])
 
@@ -448,7 +460,8 @@ def main() -> None:
 
     summary_path = args.out_dir / f"{args.kind}_{args.regime}_summary.json"
     summary_path.write_text(json.dumps({
-        "kind": args.kind, "regime": args.regime, "episodes": len(all_records),
+        "kind": args.kind, "regime": args.regime, "regime_config": resolved_regime_cfg,
+        "episodes": len(all_records),
         "num_samples": args.num_samples, "iterations": args.iterations, "horizon": args.horizon,
         "num_act_stepped": args.num_act_stepped,
         "success_rate": success_rate, "mean_wall_time_s": mean_time, "peak_gpu_memory_gb": peak_mem_gb,

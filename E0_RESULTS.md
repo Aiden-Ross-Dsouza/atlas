@@ -1,5 +1,81 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## 🟢 CURRENT (2026-08-25, post T1–T8 fix): first real post-fix results — frozen baseline + 3 trained charts
+
+**Status: preliminary (n=10 paired episodes per cell, not T10's full ~20-seed design). Real, trustworthy
+numbers under the repaired pipeline — first data since the rollout fix that can be cited at all — but
+not yet statistically powered for a final verdict. All runs on Modal (L4), substrate config
+(`num_samples=300, iterations=30, horizon=6, num_act_stepped=6`), same 10 paired seeds across every
+cell (`atlas_out/e0_planning_filtered/`), real (init, goal) pairs sampled from `data/pusht_noise/train/`.**
+
+### Bug found and fixed before any of this was trustworthy: trivial init/goal pairs
+
+The first frozen-baseline@R0 sanity run (n=10, unfiltered sampling) measured 90% SR — matching
+DINO-WM's published number almost exactly, which looked like a clean pass. It wasn't: 5/10 episodes
+finished in ≤8 raw steps (one in a single action), because `sample_dataset_init_goal()` picks init/goal
+states from the *same* real demo episode 30 raw timesteps apart, and real demos have idle/repositioning
+stretches where the block barely moves over that window — sometimes landing init and goal already
+within `block_success()`'s own 20px/π-9 threshold, making "success" free. **Fixed:**
+`sample_dataset_init_goal()` (`scripts/run_e0_planning.py`) now retries (up to `max_tries=20`) until the
+sampled pair has ≥`min_block_pos_diff=40px` of real block displacement (new CLI flag
+`--min-block-pos-diff`). Also added `total_contacts` logging to `run_episode()`'s result dict (mirrors
+the contact counter `run_e0.py`'s trajectory generator already had) so episode difficulty and
+real-vs-trivial contact are auditable straight from `episodes.jsonl`, not just inferred from step counts.
+**Any planning-success number measured before this fix (including this file's own numbers below) should
+be treated as inflated and not compared against the numbers in this section.**
+
+### Frozen baseline, filtered sampling, n=10 per regime
+
+| Regime | Success | Notes |
+|---|---|---|
+| R0 (default) | 8/10 (80%) | 1 genuine zero-contact failure (ep2: `total_contacts=0`, final diff == init diff to the decimal — pusher never touched the block in 30 steps) |
+| R2 (elasticity 0.9) | 8/10 (80%) | **Episode-for-episode identical outcome pattern to R0** (same 2 fail, same 8 succeed, very close final diffs) — elasticity barely perturbs frozen behavior for these tasks |
+| R1 (friction 0.8) | 7/10 (70%) | **Real divergence from R0**: episode 8 (init=53.2px) succeeds under R0/R2 but fails under R1 (30 steps, 13 contacts, stalls at 47.5px) — friction is doing something R0/R2 aren't, on an identical task instance |
+
+Seeds are literally paired across regimes (`sample_dataset_init_goal` is regime-independent), so this
+is a genuine controlled comparison, not just three separate samples: e.g. seed 0 (init=91.5px) fails on
+all three regimes with nearly identical final diffs (~81–97px); seed 1 (init=45.8px) succeeds on all
+three. R1's episode 8 is the one real behavioral difference in this n=10 sample — good news for the
+project: a regime a frozen model genuinely can't handle is exactly what a chart needs to exist for.
+
+### Charts trained (T9, `atlas_out/e0_v2/`) — real-data replay + early stopping, both implemented this session
+
+Two T9 requirements landed: (1) `scripts/run_e0.py::load_regime_trajectories(..., source="dataset")`
+replays real `data/pusht_noise/train/` demo action sequences under the shifted regime instead of the
+old scripted aimed-walk sampler (validated: replaying under R0 reproduces the original recording to
+~1e-5; contact rate 17/17 for both R1 and R2); (2) `atlas/harness.py::run_e0_finetune()` gained
+early stopping on a held-out validation split (`val_trajectories`/`eval_every`/`patience`) — keeps the
+*best*-validation-loss chart snapshot, not the final step's (the original bug this fixes: `full` reached
+train loss 0.0015 over 2000 steps on 30 transitions with zero validation signal).
+
+**⚠️ Open methodological concern, raised 2026-08-25, not yet resolved:** real-data replay is
+open-loop — the replayed action sequence never reacts to what the block actually does under the new
+(R1/R2) physics, since it's just a fixed real R0-recorded sequence. A closed-loop policy (like the
+original scripted sampler, which recomputes its action from the *live* simulated position every step)
+is reactive to the actual regime-shifted dynamics; open-loop replay isn't, and later actions in a
+replayed trajectory can become progressively mismatched to what's actually happening as the trajectory
+diverges from the original recording. This may be part of why `lora4` (below) failed the way it did.
+Proposed fix, not yet implemented: sample real *initial states* from the dataset (for state diversity)
+but drive the rollout forward with the closed-loop scripted policy instead of blind replay.
+
+| Chart | Regime | Train traj / len | Eval UMF | Early-stopped at | Planning SR (n=10, paired) | vs. baseline |
+|---|---|---|---|---|---|---|
+| `ln_act` | R1 | 20 × 25 | 0.2078 | step 150 (best @ step 25) | 7/10 (70%) | same rate, but **fixed** the real ep8 friction-failure; introduced a razor-thin new miss on ep3 (21.6px vs. 20px threshold) |
+| `ln_act` | R2 | 20 × 25 | 0.1232 | step 475 (best @ step 350) | 8/10 (80%) | **identical outcome pattern to baseline, episode-for-episode** — no behavioral change, consistent with R2 barely perturbing the frozen model in the first place |
+| `lora4` | R1 | 10 × 15† | 0.2420 | step 150 (best @ step 25) | **4/10 (40%)** | **substantially worse.** Distinctive failure mode: *more* contact than any other chart (up to 35) but pushes the block the *wrong way* on 2 episodes (ended up further from goal than the start) |
+
+† `lora4` OOM'd on Modal's 22GB L4 at the same 20×25 trajectories `ln_act` used (its LoRA
+parametrization has real extra activation overhead per forward pass); retried at 10×15. **This is a
+real confound** — `lora4`'s worse result may reflect materially less/shorter training data rather than
+(or in addition to) the architecture itself or the open-loop data concern above. Re-run at a matched
+trajectory budget before treating 40% as a verdict on `lora4`.
+
+**Not yet done:** `full` chart (third kind the pre-registered rule needs); re-running `lora4` at a fair
+trajectory budget; resolving the open-loop-replay concern; extending past n=10 for statistical power;
+the formal `scripts/run_e0_matrix.py` (T10) this was all a manual preview of.
+
+---
+
 ## ⚠️ SUPERSEDED (2026-08-25, `E0_IMPLEMENTATION_PLAN.md` T1–T8): everything below this line is invalidated
 
 **Root cause, found after this file's "part 3" update below:** `atlas/score.py::_open_loop_rollout`

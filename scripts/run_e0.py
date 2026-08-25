@@ -30,6 +30,7 @@ import torch
 import atlas
 from atlas.chart import Chart, ChartKind
 from atlas.harness import run_e0_finetune, log_episode
+from atlas.regimes import REGIME_CONFIGS, set_regime_config
 from atlas.score import compute_motion_gate
 
 DataSource = Literal["scripted", "dataset"]
@@ -383,6 +384,17 @@ def main() -> None:
     parser.add_argument("--kinds", nargs="+", default=["ln_act", "lora4", "full"],
                         choices=["ln_act", "lora4", "full"])
     parser.add_argument("--regimes", nargs="+", default=["R1", "R2"])
+    parser.add_argument("--regime-config", type=str, default=None,
+                         help="JSON string overriding physics params for EVERY regime in "
+                              "--regimes (P1 Step 2/P3), e.g. '{\"friction\": 2.0}'. Applied via "
+                              "atlas.regimes.set_regime_config before trajectories are loaded, so "
+                              "training and (this script's own) eval use the same calibrated "
+                              "physics. All real invocations pass a single --regimes value; "
+                              "applying one config to multiple regimes at once is not a supported "
+                              "use case and is not validated. Logged into e0_seed_manifest.json "
+                              "per regime so a chart's training physics stays attributable -- "
+                              "run_e0_planning.py's own --regime-config must match this at eval "
+                              "time or the comparison is a silent, invalidating mismatch.")
     parser.add_argument("--steps", type=int, default=2000,
                          help="MAXIMUM gradient steps -- early stopping (see --patience) can "
                               "stop sooner once validation loss stops improving.")
@@ -469,6 +481,11 @@ def main() -> None:
     # charts' weights instead of the pretrained baseline. See code-review.md #1.
     pristine_predictor_state = copy.deepcopy(wm.predictor.state_dict())
 
+    if args.regime_config is not None:
+        resolved_cfg = json.loads(args.regime_config)
+        for regime in args.regimes:
+            set_regime_config(regime, resolved_cfg)
+
     # [Debug print statement] Print setup info
     print(f"\nE0: {len(args.kinds)} kinds × {len(args.regimes)} regimes "
           f"= {len(args.kinds) * len(args.regimes)} fine-tunes", flush=True)
@@ -497,6 +514,7 @@ def main() -> None:
             seed_offset=10_000, source=args.data_source, data_split=args.data_split)
         seed_manifest[regime] = {
             "source": args.data_source,
+            "regime_config": dict(REGIME_CONFIGS.get(regime, {})),
             "train": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
                       for t in train_trajectories],
             "eval": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}

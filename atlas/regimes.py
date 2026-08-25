@@ -59,6 +59,13 @@ REGIME_CONFIGS: dict[str, dict] = {
 }
 
 
+def set_regime_config(name: str, cfg: dict) -> None:
+    """Override a regime's physics parameters for calibration sweeps (P1).
+    Values are logged per-run; this is a benchmark-design knob, not a tuned
+    hyperparameter (see REGIME_CALIBRATION.md)."""
+    REGIME_CONFIGS[name] = dict(cfg)
+
+
 class PhysicsRegime(gym.Wrapper):
     """
     Gymnasium wrapper that applies physics modifications to a pymunk-based env.
@@ -97,6 +104,17 @@ class PhysicsRegime(gym.Wrapper):
 
         if "elasticity" in self._cfg:
             self._set_shape_property("elasticity", self._cfg["elasticity"])
+
+        if "damping" in self._cfg:
+            # space.damping is fraction of velocity retained PER SECOND (pymunk),
+            # hardcoded to 0 in PushTEnv._setup() (called by every reset(), which
+            # runs before this) -- so setting it here, after reset(), is both
+            # necessary (else it's clobbered back to 0) and correctly ordered.
+            # gym.Wrapper proxies attribute READS, so self.env.space resolves to
+            # the freshly-rebuilt space; the pusher is KINEMATIC (velocity set
+            # explicitly by PD control each sim step), so this affects the BLOCK
+            # only -- see E0_RECOVERY_PLAN.md §0.3.
+            self.env.space.damping = self._cfg["damping"]
 
     def _set_shape_property(self, name: str, value: float) -> None:
         """Set a pymunk Shape property (friction/elasticity) on BOTH the agent's
