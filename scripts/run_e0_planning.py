@@ -140,8 +140,20 @@ def load_dataset_states(split: str = "train") -> tuple[np.ndarray, list[int]]:
     return states, seq_lengths
 
 
+# P2d (E0_RECOVERY_PLAN.md): reachability cutoff, derived from data, not guessed.
+# In P1 Step-4's 15-episode calibration cells, episode 2's agent-block distance
+# was 184.37px -- the agent never made a single contact in 30 raw steps, in ALL
+# THREE cells (R0, friction 2.0, damping 0.5): total_contacts==0 and
+# block_pos_diff exactly equal to init_block_pos_diff in every cell. The
+# next-highest distance among the OTHER 14 episodes (all of which made contact)
+# was ep0 at 150.48px. 160.0 sits in the ~34px gap between the largest reachable
+# distance observed (150.48) and the one confirmed-unreachable distance (184.37).
+DEFAULT_MAX_AGENT_BLOCK_DIST = 160.0
+
+
 def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.random.RandomState,
                               traj_len: int = GOAL_TRAJ_LEN, min_block_pos_diff: float = 40.0,
+                              max_agent_block_dist: float = DEFAULT_MAX_AGENT_BLOCK_DIST,
                               max_tries: int = 20) -> tuple[np.ndarray, np.ndarray]:
     """
     Samples a real (init, goal) pair from the same real demo episode, `traj_len`
@@ -154,10 +166,18 @@ def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.
     episodes (uniform sampling, no filter) finished in <=8 raw steps, one in a
     single action -- inflating the measured success rate. Retries (up to
     max_tries) until the block has moved at least min_block_pos_diff px
-    between init and goal, so a real push is actually required. Falls back to
-    the last-drawn pair (with a warning) if nothing satisfies this within
-    max_tries, rather than looping forever -- some regions of the dataset may
-    just not have long-range pushes at this traj_len.
+    between init and goal, so a real push is actually required.
+
+    max_agent_block_dist (P2d): also rejects pairs where the sampled init
+    state's agent-to-block distance exceeds this -- such pairs are
+    unreachable within the episode's step budget regardless of policy
+    quality (see DEFAULT_MAX_AGENT_BLOCK_DIST's derivation above), and burn
+    episode budget on a case that can never discriminate between arms.
+
+    Falls back to the last-drawn pair (with a warning) if nothing satisfies
+    both conditions within max_tries, rather than looping forever -- some
+    regions of the dataset may just not have long-range, reachable pushes at
+    this traj_len.
     """
     valid_eps = [i for i, l in enumerate(seq_lengths) if l >= traj_len]
     init_state = goal_state = None
@@ -168,12 +188,14 @@ def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.
         init_state = states[ep_idx, offset]
         goal_state = states[ep_idx, offset + traj_len - 1]
         block_pos_diff = np.linalg.norm(goal_state[2:4] - init_state[2:4])
-        if block_pos_diff >= min_block_pos_diff:
+        agent_block_dist = np.linalg.norm(init_state[0:2] - init_state[2:4])
+        if block_pos_diff >= min_block_pos_diff and agent_block_dist <= max_agent_block_dist:
             break
         if attempt == max_tries - 1:
             print(f"    WARNING: sample_dataset_init_goal exhausted {max_tries} tries -- "
-                  f"accepting a pair with block_pos_diff={block_pos_diff:.1f} < "
-                  f"min_block_pos_diff={min_block_pos_diff}")
+                  f"accepting a pair with block_pos_diff={block_pos_diff:.1f} "
+                  f"(min {min_block_pos_diff}), agent_block_dist={agent_block_dist:.1f} "
+                  f"(max {max_agent_block_dist})")
     # dataset states are 5-dim (no velocity); pad to match with_velocity=True's
     # 7-dim format -- generate_state() itself hardcodes agent velocity to 0
     # regardless, so zero-padding matches the existing convention exactly.
@@ -206,17 +228,22 @@ def block_success(goal_state: np.ndarray, cur_state: np.ndarray) -> dict:
 def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regime: PhysicsRegime,
                  seed: int, max_steps: int, num_act_stepped: int, states: np.ndarray,
                  seq_lengths: list[int], log_planner_diagnostics: bool = False,
-                 min_block_pos_diff: float = 40.0) -> dict:
+                 min_block_pos_diff: float = 40.0,
+                 max_agent_block_dist: float = DEFAULT_MAX_AGENT_BLOCK_DIST) -> dict:
     device = agent.device
 
     rs = np.random.RandomState(seed)
     init_state, goal_state = sample_dataset_init_goal(states, seq_lengths, rs,
-                                                        min_block_pos_diff=min_block_pos_diff)
+                                                        min_block_pos_diff=min_block_pos_diff,
+                                                        max_agent_block_dist=max_agent_block_dist)
     # Logged so episode difficulty is auditable straight from episodes.jsonl,
     # without recomputing from states.pth -- this is exactly the number the
     # min_block_pos_diff filter above controls.
     init_block_pos_diff = float(np.linalg.norm(goal_state[2:4] - init_state[2:4]))
     init_block_angle_diff = float(np.abs((goal_state[4] - init_state[4] + np.pi) % (2 * np.pi) - np.pi))
+    # P2d: logged so a dead (unreachable) episode is auditable straight from
+    # episodes.jsonl without recomputing from states.pth.
+    init_agent_block_dist = float(np.linalg.norm(init_state[0:2] - init_state[2:4]))
 
     goal_obs, _ = prepare_with_visual(base_env, regime, seed, goal_state)
     agent.set_goal(make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
@@ -278,6 +305,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
             break
     result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
               "init_block_pos_diff": init_block_pos_diff, "init_block_angle_diff": init_block_angle_diff,
+              "init_agent_block_dist": init_agent_block_dist,
               "total_contacts": total_contacts,
               **{k: v for k, v in final_check.items() if k != "success"}}
     if log_planner_diagnostics:
@@ -323,6 +351,14 @@ def main() -> None:
                               "real pushing. Confirmed empirically: unfiltered sampling gave 5/10 "
                               "baseline R0 episodes finishing in <=8 raw steps. See "
                               "sample_dataset_init_goal()'s docstring.")
+    parser.add_argument("--max-agent-block-dist", type=float, default=DEFAULT_MAX_AGENT_BLOCK_DIST,
+                         help="Maximum agent-to-block distance (px) allowed in a sampled init "
+                              "state -- rejects pairs the agent cannot plausibly reach within the "
+                              "episode's step budget (E0_RECOVERY_PLAN.md P2d). Derived from P1 "
+                              "Step-4 data: episode 2's agent_block_dist=184.37px made zero "
+                              "contact in ALL THREE calibration cells, while the next-highest "
+                              "reachable distance among the other 14 episodes was 150.48px -- the "
+                              "default sits in that gap. See sample_dataset_init_goal()'s docstring.")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -429,7 +465,8 @@ def main() -> None:
                                       num_act_stepped=args.num_act_stepped, states=states,
                                       seq_lengths=seq_lengths,
                                       log_planner_diagnostics=args.log_planner_diagnostics,
-                                      min_block_pos_diff=args.min_block_pos_diff)
+                                      min_block_pos_diff=args.min_block_pos_diff,
+                                      max_agent_block_dist=args.max_agent_block_dist)
                 results.append(result)
                 f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime,
                                      "regime_config": resolved_regime_cfg, **result}) + "\n")
@@ -464,6 +501,7 @@ def main() -> None:
         "episodes": len(all_records),
         "num_samples": args.num_samples, "iterations": args.iterations, "horizon": args.horizon,
         "num_act_stepped": args.num_act_stepped,
+        "min_block_pos_diff": args.min_block_pos_diff, "max_agent_block_dist": args.max_agent_block_dist,
         "success_rate": success_rate, "mean_wall_time_s": mean_time, "peak_gpu_memory_gb": peak_mem_gb,
     }, indent=2))
 

@@ -1,6 +1,153 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
-## 🟢 CURRENT (2026-08-25, post T1–T8 fix): first real post-fix results — frozen baseline + 3 trained charts
+## 🟢 R0 CONFOUND CHECK (2026-08-25) — headroom is REAL and quantified; the "dilution" theory was wrong
+
+Frozen baseline at **R0** on the identical P2d-filtered sampler, N=20, all four arms confirmed
+paired (20/20 episode indices, no mismatches).
+
+**R0 = 19/20 = 95.0%.** Versus R2 baseline's 45.0% → **+50.0pp, 95% CI [+30.0, +70.0]**. The
+confound closes decisively in the "headroom is real" direction, and the gap is *larger* than the
+pre-P2d calibration estimate of 40pp. The benchmark is sound.
+
+### The recoverable set — E0's real denominator
+
+Episodes R0 solves but the shifted baseline loses: **10 of 20** — `[2,3,5,10,12,14,15,17,18,19]`.
+
+| Arm | recovers | of 10 |
+|---|---|---|
+| `ln_act` × dataset | ep17 | **1/10** |
+| `ln_act` × hybrid | ep18 | **1/10** |
+
+**Normalised recovery = (10 − 9)/(19 − 9) = 10%.** This is the number to report — the same
+statistic E1 uses (`atlas/stats.py::normalised_recovery`), with R0-frozen as the ceiling. It is
+far more informative than "+5pp with a CI touching zero": the chart recovers **one tenth** of
+the gap the regime opened.
+
+### Where the headroom lives — and a retracted claim
+
+| init displacement | n | R0 | R2 baseline | R2 + dataset chart | recoverable |
+|---|---|---|---|---|---|
+| 0–80px | 11 | 11/11 | 7/11 | 8/11 | 4 |
+| 80–120px | 2 | 1/2 | 1/2 | 1/2 | 0 |
+| **120–300px** | **7** | **7/7** | **1/7** | **1/7** | **6** |
+
+**🔻 RETRACTION.** The P3 section below theorised that the 120–300px episodes were
+*intrinsically* hard and were diluting the measurement, and proposed adding a difficulty
+**ceiling** to the sampler. **That was wrong.** R0 solves 7/7 of them. They are not hard — they
+are exactly where damping is lethal, and they hold **6 of the 10** recoverable episodes.
+Adding that ceiling would have deleted most of the benchmark's discriminative power. **Do not
+add a `--max-block-pos-diff`.** `min_block_pos_diff=40` with no ceiling is correct as-is.
+
+### The actual diagnosis
+
+Damping-0.5 **selectively destroys long-range pushing** (7/7 → 1/7) while leaving short pushes
+largely intact (11/11 → 7/11). That is consistent with the overshoot mechanism: the predictor
+under-estimates post-contact glide, and that error compounds with distance travelled.
+
+`ln_act` recovered **1 episode in the easy bucket and 0 of the 6 in the hard bucket** — it
+fixes what barely needed fixing. Mechanistically this follows from E0's protocol: at
+`num_act_stepped=6` there is **one replan**, so the whole 30-raw-step episode is planned
+open-loop from t=0 off a 6-model-step prediction, and error compounds across the horizon.
+Short pushes need the first step or two right; long pushes need all six. A 10.7k-parameter
+LayerNorm nudge reduces the error (knock-aways 5→2, +21.3px mean) without surviving six
+compounding steps.
+
+**Two candidate explanations, both still open:**
+
+| # | Explanation | Test |
+|---|---|---|
+| A | **Capacity** — 10.7k params cannot carry the correction; `lora4` (118k) / `full` (20.8M) might | **P4**, now defensible: confound closed, headroom quantified, and E0 cannot be reported complete on one adapter kind |
+| B | **Horizon compounding** — any residual error kills a 6-step open-loop plan; closed-loop replanning would truncate it | **P5's re-baseline, run early**: frozen R0 and R2 at `nas=1` (6 replans). Already required work — see below |
+
+Artifacts: `atlas_out/e0_v3_baseline_R0/{baseline_R0.jsonl,baseline_R0_summary.json}`.
+
+---
+
+## 🔴 P3 DECISION POINT (2026-08-25) — E0 **FAILS** its pre-registered criterion
+
+**Headline: no chart cleared the pre-registered bar (≥15pp SR gain with a paired-bootstrap CI
+excluding 0). Per `CLAUDE.md` §1.8 this is reported as a result, not fixed. E1 is not being
+run; P4 is not being launched.**
+
+Regime R2 = **damping 0.5** (calibrated in `E0_RECOVERY_PLAN.md` §0.5), N=20 paired episodes,
+P2d-filtered sampler, all three arms confirmed paired (20/20 episode indices match).
+
+| Arm | SR | vs baseline | 95% CI (paired bootstrap) |
+|---|---|---|---|
+| baseline (frozen) | 9/20 = 45.0% | — | — |
+| `ln_act` × dataset-trained | 10/20 = 50.0% | +5.0pp | [0.0, +15.0] — touches zero |
+| `ln_act` × hybrid-trained | 8/20 = 40.0% | −5.0pp | [−25.0, +10.0] — wrong direction |
+
+### But "the chart does nothing" is NOT what the episode-level data says
+
+Four independent signals, all pointing the same way for the **dataset-trained** chart:
+
+1. **It is a strict superset of baseline.** Successes: baseline `{1,4,6,7,8,9,11,13,16}`,
+   dataset chart `{…same nine…, 17}`. Gained ep17, **lost nothing**. McNemar discordant pairs
+   b=1, c=0. Noise flips episodes in *both* directions; this did not.
+2. **Knock-aways 5/20 → 2/20** — the mechanism damping-0.5 was chosen to expose, and a
+   prediction **pre-registered before the run** (`E0_RECOVERY_PLAN.md` §0.5). It was confirmed.
+3. **Mean final block distance improved +21.3px across the 10 shared failures** (better on
+   7/10; ep12 alone by 107px — the +198px catastrophe from calibration).
+4. The **hybrid** chart shows none of this: gained ep18 but lost ep1 and ep8 (b=1, c=2), no
+   knock-away improvement (6/20, *worse* than baseline). This is the profile of a chart that
+   is genuinely not helping — and it makes signals 1–3 harder to dismiss as noise.
+
+### Why the improvement didn't convert into success rate
+
+**The benchmark is diluted by intrinsically hard episodes.** Success by initial displacement:
+
+| init_block_pos_diff | n | baseline | dataset chart | hybrid |
+|---|---|---|---|---|
+| 0–80px | 11 | 7/11 | **8/11** | 5/11 |
+| 80–120px | 2 | 1/2 | 1/2 | 1/2 |
+| **120–300px** | **7** | **1/7** | **1/7** | 2/7 |
+
+Seven of twenty episodes ask for a 120–300px block displacement within 30 raw steps. Baseline
+and chart both solve 1 of 7 — that third of the sample contributes almost no discriminative
+power, it just drags both arms toward each other. `min_block_pos_diff=40` sets a floor on task
+difficulty but **no ceiling**.
+
+And the dataset chart's failures sit far from the 20px cliff — final distances
+`[29, 49, 86, 86, 88, 91, 102, 121, 131, 205]`. Only one is near the threshold, so a
+marginally better chart would not convert many of them either.
+
+**Read together: the effect is real but small, and the instrument is too blunt to resolve it.**
+At N=20 paired binary episodes, the minimum detectable effect is roughly 3 episodes (15pp) —
+the pre-registered bar was, in hindsight, near the noise floor of its own sample size.
+
+### The open confound that must be resolved before anything else
+
+**R0's success rate on the P2d-filtered sampler was never measured.** P2d changed the sampler
+(ep2 now resolves to a different, reachable pair), and only R2 was re-baselined. So we cannot
+currently distinguish:
+
+- **R0 ≈ 85%** → the 40pp damping headroom is real, the task is fine, and E0's negative result
+  stands on its own terms (the chart is genuinely too weak).
+- **R0 ≈ 50%** → the filtered sampler is intrinsically hard regardless of physics, damping is
+  no longer what causes failure, and P3 was measuring task difficulty rather than regime
+  adaptation — a **measurement** problem, not an E0 result.
+
+The 1/7 rate on hard episodes for *both* arms makes the second possibility live. One 20-episode
+frozen-baseline run at R0 settles it. **Do that before interpreting this result further.**
+
+### What this settles regardless
+
+**The open-loop-vs-closed-loop question (P2b) is answered: dataset replay wins.** The hybrid
+(closed-loop) collector produced a worse chart on every axis — SR, McNemar, and knock-aways.
+This contradicts the prior expectation recorded in `E0_RECOVERY_PLAN.md` §0.1/P2b that
+closed-loop data would better represent deployment. Recorded as a negative result.
+
+### Artifacts
+
+Modal volume `atlas-data`: `atlas_out/e0_v3_dataset/`, `atlas_out/e0_v3_hybrid/` (charts +
+loss/val curves + seed manifests), `atlas_out/e0_v3_planning_dataset_baseline/`,
+`atlas_out/e0_v3_planning_dataset_ln_act/`, `atlas_out/e0_v3_planning_hybrid_ln_act/`
+(per-episode JSONL + summaries).
+
+---
+
+## 🟡 SUPERSEDED BY P3 ABOVE (2026-08-25, post T1–T8 fix): first real post-fix results — frozen baseline + 3 trained charts
 
 **Status: preliminary (n=10 paired episodes per cell, not T10's full ~20-seed design). Real, trustworthy
 numbers under the repaired pipeline — first data since the rollout fix that can be cited at all — but

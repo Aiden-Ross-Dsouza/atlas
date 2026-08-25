@@ -54,8 +54,15 @@ RegimeName = Literal["R0", "R1", "R2"]
 # visible collision-response difference once contact occurs.
 REGIME_CONFIGS: dict[str, dict] = {
     "R0": {},                              # default: no modifications
-    "R1": {"friction": 0.8},              # high friction: shape.friction = 0.8 (from 0.0)
-    "R2": {"elasticity": 0.9},            # high restitution: shape.elasticity = 0.9 (from 0.0)
+    # Calibrated 2026-08-25 (E0_RECOVERY_PLAN.md P0/P1, see §0.3-0.5). These
+    # are the DEFAULTS so nothing downstream depends on remembering a
+    # --regime-config override flag.
+    "R1": {"friction": 2.0},              # friction saturates here (5.0 measured identical); was 0.8
+    "R2": {"damping": 0.5},               # was elasticity 0.9 -- proven mechanically DEAD (§0.3):
+                                           # space.damping=0 in the shipped env annihilates all
+                                           # restitution velocity before it can displace anything.
+                                           # Re-targeted onto space.damping, the axis that actually
+                                           # expresses itself (§0.3-0.4).
 }
 
 

@@ -4,10 +4,30 @@
 *Read `CLAUDE.md` first (it binds you), then `E0_RESULTS.md`'s 🟢 CURRENT section, then this.*
 *This file supersedes `E0_IMPLEMENTATION_PLAN.md`'s T9/T10 ordering. T1–T8 and T12 are done.*
 
-> **STATUS (2026-08-25): P0 ✅ and P1 ✅ are complete — regimes are settled.**
-> **R1 = friction 2.0** (86.7% → 66.7% SR), **R2 = damping 0.5** (→ 46.7% SR). Damping 0.9 will
-> not be run; elasticity is dropped entirely. Evidence and reasoning: §0.3, §0.4, §0.5.
-> **Next up: P2 (all code, no approval needed), then P3 🛑 on R2.**
+> **STATUS (2026-08-25): P0 ✅ P1 ✅ P2 ✅ P3 ✅ ran — and E0 FAILED its pre-registered test.**
+> Regimes settled: **R1 = friction 2.0**, **R2 = damping 0.5** (§0.3–§0.5). P3 on R2, N=20:
+> baseline 45.0%, `ln_act`/dataset **50.0% (+5pp, CI [0, +15])**, `ln_act`/hybrid 40.0%.
+> Neither clears ≥15pp with a CI excluding 0. **Full result and analysis: `E0_RESULTS.md`'s
+> 🔴 P3 DECISION POINT section (read it first) and §0.6 below.**
+> **R0 confound check ✅ resolved: R0 = 95.0% on the same sampler (+50.0pp over R2, CI
+> [+30, +70]).** Headroom is real. E0's honest metric is **normalised recovery = 1/10 = 10%**.
+> The "dilution" theory and its difficulty-ceiling proposal are **retracted** — R0 solves 7/7 of
+> the long-push episodes, which hold 6 of the 10 recoverable ones. See `E0_RESULTS.md`'s
+> 🟢 R0 CONFOUND CHECK section.
+>
+> **Sanctioned next, in parallel — E1 remains gated:**
+> **(1) P4 capacity matrix** on R2, **`dataset` source only** (hybrid lost P3 on every axis —
+> SR, McNemar, knock-aways — so it is not retrained; this was already how P4 was scoped, not a
+> new restriction). Trains `lora4`, `full`; E0 cannot be reported complete on one adapter kind,
+> and §7.1's rule needs `full` to be applicable at all.
+> **(2) P5's `nas=1` re-baseline, pulled early, run FIRST** — frozen (no chart) baseline only,
+> at R0 and R2, `num_act_stepped=1` (6 replans instead of 1). 2 cells, no training, ~50 min
+> total — cheaper than P4 and diagnostic for how to read it: it separates whether `ln_act`'s
+> weak showing was model *capacity* (→ P4 is the right next question) or an artifact of E0's
+> one-shot 30-step blind-plan protocol (`num_act_stepped=6`) that a bigger adapter cannot fix
+> either (→ P4 would likely just re-discover the same failure at higher GPU cost). Also
+> required work regardless (P5 mandates E1 use `nas=1`), so this is reordering, not new scope.
+> **nas=1 result does not reopen E1's gate** — E0's gate stands on E0's own protocol.
 
 ---
 
@@ -252,6 +272,89 @@ chosen to expose — report that, rather than banking a lucky SR bump.
   deviation justification) and the `REGIME_DESIGN_REVIEW.md` / §6.1b elasticity→damping note.
 - **Re-verify after changing the defaults**: re-run the P0-style UMF diagnostic and confirm
   R1/R2 reproduce §0.4's friction-2.0 (1.67×) and damping-0.5 (2.47×) rows.
+
+### 0.6 P3 result (ran 2026-08-25) — E0 fails; one confound must be resolved before deciding
+
+**Full result, tables, and episode-level analysis: `E0_RESULTS.md`'s 🔴 P3 DECISION POINT
+section.** Summary and the decision it forces:
+
+- **E0 fails the pre-registered criterion.** Baseline 45.0%, `ln_act`/dataset 50.0%
+  (+5pp, CI [0, +15]), `ln_act`/hybrid 40.0%. Neither clears ≥15pp with a CI excluding 0.
+- **But four signals say the dataset chart's effect is real, just small**: it is a strict
+  superset of baseline (gained ep17, lost nothing; McNemar b=1 c=0), knock-aways fell 5/20 →
+  2/20 (the **pre-registered** mechanism prediction, confirmed), mean final distance improved
+  +21.3px across shared failures, and the hybrid chart — which shows none of this — behaves
+  exactly like a chart that isn't helping.
+- **The instrument is too blunt.** 7 of 20 episodes ask for a 120–300px push in 30 raw steps;
+  baseline and chart both solve 1/7. `min_block_pos_diff=40` floors task difficulty but sets no
+  ceiling, so a third of the sample carries almost no discriminative power. At N=20 paired
+  binary episodes the minimum detectable effect is ~3 episodes — the 15pp bar sat near its own
+  sample's noise floor.
+
+#### ✅ RESOLVED — R0 confound check ran 2026-08-25
+
+**R0 = 19/20 = 95.0%** on the identical filtered sampler. R0 − R2 = **+50.0pp, CI [+30, +70]**.
+Headroom is real and larger than calibration estimated. **Full analysis: `E0_RESULTS.md`'s
+🟢 R0 CONFOUND CHECK section.** Key consequences:
+
+- **E0's real metric is normalised recovery = 1/10 = 10%.** The recoverable set (R0 solves,
+  shifted baseline fails) is exactly 10 episodes; the dataset chart recovers one.
+- **🔻 The "dilution" theory below is RETRACTED, and the difficulty-ceiling proposal with it.**
+  R0 solves 7/7 of the 120–300px episodes — they are not intrinsically hard, they hold 6 of the
+  10 recoverable episodes, and capping difficulty would have gutted the benchmark. **Do not add
+  `--max-block-pos-diff`.** The goalpost-hazard section below is therefore moot; no sampler
+  change is warranted or permitted.
+- **The diagnosis:** damping selectively destroys long-range pushing (7/7 → 1/7) while short
+  pushes survive (11/11 → 7/11). `ln_act` recovered 1 easy episode and **0 of the 6 hard ones**.
+
+Two open explanations, and the runs that separate them, are tabulated in `E0_RESULTS.md` —
+**capacity** (→ P4) versus **horizon compounding** (→ run P5's `nas=1` re-baseline early).
+Both are now sanctioned; see the status banner at the top of this file.
+
+<details><summary>Original (superseded) confound-check instructions and goalpost-hazard note</summary>
+
+#### 🔴 Do this next, before anything else: the R0 confound check
+
+**R0's SR on the P2d-filtered sampler was never measured.** P2d changed the sampler and only R2
+was re-baselined, so the 55% failure rate cannot currently be attributed:
+
+| If R0 on the filtered sampler is… | Then… |
+|---|---|
+| **≈ 85%** | the 40pp damping headroom is real, the benchmark is sound, and E0's negative result stands on its own terms — the chart is genuinely too weak. Decide P4 on that basis. |
+| **≈ 50%** | the filtered sampler is intrinsically hard regardless of physics; damping is no longer what causes failure, and P3 measured task difficulty rather than regime adaptation. That is a **measurement bug**, not an E0 result, and it must be repaired before any conclusion stands. |
+
+The 1/7 hard-episode rate for *both* arms makes the second case live. One run settles it:
+
+```bash
+modal run --detach modal/modal_e0_planning.py \
+    --kind baseline --regime R0 --episodes 20 --out-subdir e0_v3_baseline_R0
+```
+
+~20 episodes, ~50 min, no charts. **Do not interpret P3 further or launch P4 until this
+returns.**
+
+#### If the second case holds — the goalpost hazard, stated plainly
+
+The repair would be to bound episode difficulty (a `--max-block-pos-diff` ceiling alongside the
+existing floor), concentrating episodes in the band where the regime shift actually decides the
+outcome. **Changing the sampler after seeing chart results is exactly the shape of
+goalpost-moving**, so it is only legitimate under the same discipline P1 followed:
+
+1. justified by the **frozen-baseline** R0 diagnostic, not by any chart result;
+2. the ceiling chosen from frozen-baseline behaviour alone, pre-registered in writing before
+   any chart is re-evaluated;
+3. **every** arm re-run on the new sampler, baseline included — no mixing of old and new numbers.
+
+If those three cannot be satisfied, report E0's negative result as it stands and stop.
+
+</details>
+
+#### Settled regardless: the open-loop question (P2b)
+
+**Dataset replay beats the closed-loop hybrid collector.** The hybrid chart was worse on SR,
+McNemar, and knock-aways. This contradicts the expectation recorded in §0.1/P2b that
+closed-loop data would better represent deployment — recorded as a negative result, and it
+means `--data-source dataset` stays the default.
 
 ### 0.2 Execution rules
 

@@ -158,7 +158,15 @@ def run_e0_finetune(
     pbar = tqdm(range(n_steps), desc=f"{kind}_{regime}", unit="step")
     for step in pbar:
         optimizer.zero_grad()
-        total_loss = torch.tensor(0.0, device=next(predictor.parameters()).device)
+        total_loss = 0.0
+        # P2a fix (E0_RECOVERY_PLAN.md): backward() per-trajectory instead of
+        # summing all trajectories' loss tensors and calling backward() once
+        # -- the old version kept every trajectory's autograd graph alive
+        # simultaneously, so peak memory scaled O(N trajectories). This is
+        # why `lora4` OOM'd at the same 20x25 budget `ln_act` used and had to
+        # be retrained at a smaller, confounding 10x15. Gradients are
+        # mathematically identical (sum of per-trajectory grads either way);
+        # peak memory becomes O(1 trajectory).
         for traj in trajectories:
             enc_out: torch.Tensor = traj["encoder_output"]  # [T+1, N, D]
             actions: torch.Tensor = traj["actions"]         # [T, action_dim]
@@ -171,11 +179,11 @@ def run_e0_finetune(
             # Predict visual latents open-loop
             z_preds = _open_loop_rollout(world_model, z_ctxt, actions) # [T, N, D]
             loss = compute_trajectory_loss(world_model.model, z_preds, enc_out[1:])
-            total_loss = total_loss + loss
+            (loss / len(trajectories)).backward()
+            total_loss += loss.item()  # detached scalar, for logging only
 
-        (total_loss / len(trajectories)).backward()
         optimizer.step()
-        avg_loss = total_loss.item() / len(trajectories)
+        avg_loss = total_loss / len(trajectories)
         loss_log.append(avg_loss)
         pbar.set_postfix(loss=f"{avg_loss:.6f}")
 

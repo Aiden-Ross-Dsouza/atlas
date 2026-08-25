@@ -33,7 +33,7 @@ from atlas.harness import run_e0_finetune, log_episode
 from atlas.regimes import REGIME_CONFIGS, set_regime_config
 from atlas.score import compute_motion_gate
 
-DataSource = Literal["scripted", "dataset"]
+DataSource = Literal["scripted", "dataset", "hybrid"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -164,7 +164,11 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     # without it, two calls both starting traj_idx at 0 would silently overlap.
     seed_base = {"R0": 2000, "R1": 0, "R2": 1000}.get(regime, 0) + seed_offset
 
-    if source == "dataset":
+    if source in ("dataset", "hybrid"):
+        # hybrid (P2b) needs demo_states for real init sampling but not
+        # demo_rel_actions (actions are generated live, not replayed) --
+        # loaded anyway since _load_pusht_demo_dataset returns both from the
+        # same file and is cached, so there is no extra cost.
         demo_states, demo_rel_actions, demo_seq_lengths = _load_pusht_demo_dataset(data_split)
         # Need traj_len real actions [offset, offset+traj_len) plus the state
         # AFTER the last one (offset+traj_len) as a valid (non-padding) row --
@@ -193,7 +197,7 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
 
             episode_idx: int | None = None
             offset: int | None = None
-            if source == "dataset":
+            if source in ("dataset", "hybrid"):
                 episode_idx = int(valid_eps[rs.randint(len(valid_eps))])
                 max_offset = demo_seq_lengths[episode_idx] - traj_len - 1
                 offset = int(rs.randint(max_offset + 1)) if max_offset > 0 else 0
@@ -435,15 +439,20 @@ def main() -> None:
                               "transitions with no validation signal at all.")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--out", type=Path, default=atlas.OUT_DIR / "e0")
-    parser.add_argument("--data-source", choices=["scripted", "dataset"], default="dataset",
+    parser.add_argument("--data-source", choices=["scripted", "dataset", "hybrid"], default="dataset",
                          help="'dataset' (default, T9): replay real Push-T demo action "
                               "sequences from data/pusht_noise/{--data-split}/ under the "
-                              "shifted regime. 'scripted': the original synthetic aimed-walk "
-                              "sampler (documented fallback per E0_IMPLEMENTATION_PLAN.md T9 "
-                              "-- use if the replay path proves too slow).")
+                              "shifted regime -- OPEN-LOOP: actions never react to the "
+                              "shifted physics. 'hybrid' (P2b): real dataset init state, but "
+                              "actions are the 'scripted' aimed-walk policy driven by the LIVE "
+                              "post-shift agent position each step -- CLOSED-LOOP, real/diverse "
+                              "start states. 'scripted': the original synthetic aimed-walk "
+                              "sampler with a random reset (documented fallback per "
+                              "E0_IMPLEMENTATION_PLAN.md T9 -- use if the replay path proves "
+                              "too slow).")
     parser.add_argument("--data-split", type=str, default="train",
                          help="data/pusht_noise/{split}/ to draw real episodes from "
-                              "(--data-source=dataset only).")
+                              "(--data-source=dataset or hybrid only).")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="atlas-e0", help="WandB project name")
     args = parser.parse_args()
@@ -523,7 +532,7 @@ def main() -> None:
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
 
-        if args.data_source == "dataset":
+        if args.data_source in ("dataset", "hybrid"):
             # T9 acceptance check: real demo episodes should generally involve
             # agent-block contact (they're expert task completions), but verify
             # rather than assume -- especially post-regime-shift, where the

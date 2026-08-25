@@ -76,6 +76,7 @@ def run_e0_planning(
     out_subdir: str = "e0_planning",
     log_planner_diagnostics: bool = False,
     min_block_pos_diff: float = 40.0,
+    max_agent_block_dist: float | None = None,
 ) -> None:
     """Defaults = the SUBSTRATE's own validated Push-T config (CEM 300x30,
     horizon 6, num_act_stepped 6 -> 30 raw steps/episode, 1 replan), the
@@ -90,7 +91,11 @@ def run_e0_planning(
     episodes finished in <=8 raw steps under the old unfiltered sampler).
     Runs with this filter active must use a NEW out_subdir (e.g.
     e0_planning_v2) -- old results under the same seeds were sampled
-    differently and are not resume-compatible with filtered runs."""
+    differently and are not resume-compatible with filtered runs.
+    max_agent_block_dist (P2d, E0_RECOVERY_PLAN.md): rejects init states the
+    agent cannot plausibly reach within the step budget -- None (default)
+    defers to run_e0_planning.py's own DEFAULT_MAX_AGENT_BLOCK_DIST rather
+    than duplicating that data-derived constant here."""
     import subprocess
     import sys
     # Volumes are eventually consistent -- reload() picks up commits made by
@@ -109,6 +114,8 @@ def run_e0_planning(
            "--min-block-pos-diff", str(min_block_pos_diff)]
     if regime_config is not None:
         cmd += ["--regime-config", regime_config]
+    if max_agent_block_dist is not None:
+        cmd += ["--max-agent-block-dist", str(max_agent_block_dist)]
     if log_planner_diagnostics:
         cmd.append("--log-planner-diagnostics")
     subprocess.run(cmd, check=True, cwd="/src")
@@ -120,10 +127,12 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
           episodes: int = 10,
           num_samples: int = 300, iterations: int = 30, horizon: int = 6,
           num_act_stepped: int = 6, charts_subdir: str = "e0", out_subdir: str = "e0_planning",
-          log_planner_diagnostics: bool = False, min_block_pos_diff: float = 40.0) -> None:
+          log_planner_diagnostics: bool = False, min_block_pos_diff: float = 40.0,
+          max_agent_block_dist: float | None = None) -> None:
     run_e0_planning.remote(kind=kind, regime=regime, regime_config=regime_config, episodes=episodes,
                             num_samples=num_samples, iterations=iterations, horizon=horizon,
                             min_block_pos_diff=min_block_pos_diff,
+                            max_agent_block_dist=max_agent_block_dist,
                             num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
                             out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics)
 
