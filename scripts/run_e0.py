@@ -33,7 +33,7 @@ from atlas.harness import run_e0_finetune, log_episode
 from atlas.regimes import REGIME_CONFIGS, set_regime_config
 from atlas.score import compute_motion_gate
 
-DataSource = Literal["scripted", "dataset", "hybrid"]
+DataSource = Literal["scripted", "dataset", "hybrid", "closed_loop"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -70,7 +70,7 @@ def _load_pusht_demo_dataset(split: str = "train"):
     return states, rel_actions, seq_lengths
 
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train") -> list[dict]:
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None) -> list[dict]:
     """
     Collects real trajectories from PushTEnv under the specified regime and
     encodes them through the frozen vision backbone.
@@ -151,6 +151,20 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
     from atlas.regimes import PhysicsRegime
 
+    if source == "closed_loop":
+        # Reused rather than reimplemented: run_e0_planning.py already owns the
+        # exact (init, goal) sampler, env-reset path and obs-TensorDict layout
+        # the planner is validated against. Importing the sibling script keeps
+        # collection and evaluation on literally the same code (a divergence
+        # here would train on one task distribution and evaluate on another).
+        from einops import rearrange
+        from run_e0_planning import (DEFAULT_MAX_AGENT_BLOCK_DIST, make_obs_td,
+                                      prepare_with_visual, sample_dataset_init_goal)
+        if agent is None:
+            raise ValueError("source='closed_loop' requires a GC_Agent (pass agent=...)")
+        if max_agent_block_dist is None:
+            max_agent_block_dist = DEFAULT_MAX_AGENT_BLOCK_DIST
+
     if traj_len % frameskip != 0:
         raise ValueError(
             f"traj_len={traj_len} must be divisible by frameskip={frameskip} so "
@@ -164,7 +178,7 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     # without it, two calls both starting traj_idx at 0 would silently overlap.
     seed_base = {"R0": 2000, "R1": 0, "R2": 1000}.get(regime, 0) + seed_offset
 
-    if source in ("dataset", "hybrid"):
+    if source in ("dataset", "hybrid", "closed_loop"):
         # hybrid (P2b) needs demo_states for real init sampling but not
         # demo_rel_actions (actions are generated live, not replayed) --
         # loaded anyway since _load_pusht_demo_dataset returns both from the
@@ -197,7 +211,19 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
 
             episode_idx: int | None = None
             offset: int | None = None
-            if source in ("dataset", "hybrid"):
+            if source == "closed_loop":
+                # Goal must be prepared BEFORE the init reset: prepare_with_visual
+                # resets the env to whatever state it renders, so rendering the
+                # goal last would leave the env sitting on the goal.
+                init_state7, goal_state = sample_dataset_init_goal(
+                    demo_states, demo_seq_lengths, rs, traj_len=traj_len,
+                    min_block_pos_diff=min_block_pos_diff,
+                    max_agent_block_dist=max_agent_block_dist)
+                goal_obs, _ = prepare_with_visual(base_env, env, seed, goal_state)
+                agent.set_goal(make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
+                base_env.seed(seed)
+                base_env.reset_to_state = init_state7
+            elif source in ("dataset", "hybrid"):
                 episode_idx = int(valid_eps[rs.randint(len(valid_eps))])
                 max_offset = demo_seq_lengths[episode_idx] - traj_len - 1
                 offset = int(rs.randint(max_offset + 1)) if max_offset > 0 else 0
@@ -240,6 +266,32 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
                     imgs.append(obs["visual"])
                     proprios.append(obs["proprio"])
                     raw_actions.append(act)
+            elif source == "closed_loop":
+                # ON-POLICY data (the P4 follow-up): actions come from the CEM
+                # planner replanning against the LIVE regime-shifted state, so
+                # the trajectory contains the model's own overshoot AND the
+                # correction it then attempts. Replay ('dataset') and the
+                # scripted-reactive 'hybrid' collector both lack the latter --
+                # the diagnosed reason every P4 chart failed (E0_RESULTS.md).
+                #
+                # The agent MUST be built with num_act_stepped=1: at the eval
+                # config's nas=6 a single plan covers the whole trajectory
+                # open-loop, which would reproduce exactly the non-reactive data
+                # this collector exists to replace.
+                n_chunks = traj_len // frameskip
+                for chunk_idx in range(n_chunks):
+                    obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
+                    act_chunk = agent.act(obs_td, steps_left=max(n_chunks - chunk_idx, 1))
+                    # [1, frameskip*2] -> [frameskip, 2] raw env actions, matching
+                    # run_e0_planning.py::run_episode's own conversion exactly.
+                    act_chunk = rearrange(act_chunk.cpu(), "t (f d) -> (t f) d", d=2)
+                    act_chunk = agent.preprocessor.denormalize_actions(act_chunk).numpy()
+                    for act in act_chunk[:frameskip]:
+                        obs, reward, done, info = env.step(act)
+                        total_contacts += info["n_contacts"]
+                        imgs.append(obs["visual"])
+                        proprios.append(obs["proprio"])
+                        raw_actions.append(act)
             else:
                 block_xy = state[2:4]
                 # One persistent random target near the block, sampled once per
@@ -439,7 +491,7 @@ def main() -> None:
                               "transitions with no validation signal at all.")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--out", type=Path, default=atlas.OUT_DIR / "e0")
-    parser.add_argument("--data-source", choices=["scripted", "dataset", "hybrid"], default="dataset",
+    parser.add_argument("--data-source", choices=["scripted", "dataset", "hybrid", "closed_loop"], default="dataset",
                          help="'dataset' (default, T9): replay real Push-T demo action "
                               "sequences from data/pusht_noise/{--data-split}/ under the "
                               "shifted regime -- OPEN-LOOP: actions never react to the "
@@ -449,10 +501,32 @@ def main() -> None:
                               "start states. 'scripted': the original synthetic aimed-walk "
                               "sampler with a random reset (documented fallback per "
                               "E0_IMPLEMENTATION_PLAN.md T9 -- use if the replay path proves "
-                              "too slow).")
+                              "too slow). 'closed_loop': ON-POLICY -- real (init, goal) pair "
+                              "from run_e0_planning.py's own sampler, actions produced by the "
+                              "CEM planner replanning every model chunk against the live "
+                              "shifted state. The only source whose trajectories contain the "
+                              "model's own overshoot AND its attempted correction; 'hybrid' is "
+                              "reactive but its corrections come from a scripted policy, not "
+                              "from the model being adapted. Costs one CEM search per chunk -- "
+                              "see --collect-num-samples.")
     parser.add_argument("--data-split", type=str, default="train",
                          help="data/pusht_noise/{split}/ to draw real episodes from "
-                              "(--data-source=dataset or hybrid only).")
+                              "(--data-source=dataset, hybrid or closed_loop only).")
+    parser.add_argument("--collect-num-samples", type=int, default=100,
+                         help="CEM population for --data-source=closed_loop COLLECTION only "
+                              "(eval keeps the substrate's validated 300). Collection needs "
+                              "trajectories that react to the shift, not optimal ones, and "
+                              "cost is linear here: 300x30 would be ~9x this, putting a "
+                              "28-trajectory collection into GPU-hours. Deviation from the "
+                              "validated planner config -- record it with any result.")
+    parser.add_argument("--collect-iterations", type=int, default=10,
+                         help="CEM iterations for closed_loop collection (see "
+                              "--collect-num-samples for the cost rationale).")
+    parser.add_argument("--collect-max-tries", type=int, default=2,
+                         help="Contact-rejection retries per trajectory for closed_loop. Much "
+                              "lower than the default 8: each retry is a full planned episode, "
+                              "and a goal-directed planner should make contact far more often "
+                              "than the scripted sampler it was tuned for.")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="atlas-e0", help="WandB project name")
     args = parser.parse_args()
@@ -495,6 +569,26 @@ def main() -> None:
         for regime in args.regimes:
             set_regime_config(regime, resolved_cfg)
 
+    # Built from the PRISTINE predictor, before any chart is applied: the point
+    # of on-policy collection is data showing what the FROZEN model gets wrong,
+    # which is what the chart is then fit to correct. Collecting under an
+    # already-adapted model would be a second DAgger round, not this experiment.
+    collector_agent = None
+    if args.data_source == "closed_loop":
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from run_e0_planning import build_cfg
+        from evals.simu_env_planning.planning.gc_agent import GC_Agent
+        # num_act_stepped=1 is the whole point: it forces a replan every model
+        # chunk, which is what makes the collected trajectory reactive.
+        collector_agent = GC_Agent(
+            build_cfg(args.collect_num_samples, args.collect_iterations, horizon=6,
+                      num_act_stepped=1),
+            wrapper, dset=None, preprocessor=prep)
+        collector_agent.device = device
+        print(f"closed_loop collection: CEM {args.collect_num_samples}x"
+              f"{args.collect_iterations}, num_act_stepped=1 (replan every chunk)", flush=True)
+
     # [Debug print statement] Print setup info
     print(f"\nE0: {len(args.kinds)} kinds × {len(args.regimes)} regimes "
           f"= {len(args.kinds) * len(args.regimes)} fine-tunes", flush=True)
@@ -515,12 +609,16 @@ def main() -> None:
         # scales with length, kept short); eval runs under no_grad (cheap, kept
         # long since UMF needs real accumulated displacement). See --train-traj-len
         # / --eval-traj-len help text and code-review.md Bug #6d/#6e.
+        collect_kw = ({"agent": collector_agent, "max_tries": args.collect_max_tries}
+                      if args.data_source == "closed_loop" else {})
         train_trajectories = load_regime_trajectories(
             wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
-            device=device, seed_offset=0, source=args.data_source, data_split=args.data_split)
+            device=device, seed_offset=0, source=args.data_source, data_split=args.data_split,
+            **collect_kw)
         val_trajectories = load_regime_trajectories(
             wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
-            seed_offset=10_000, source=args.data_source, data_split=args.data_split)
+            seed_offset=10_000, source=args.data_source, data_split=args.data_split,
+            **collect_kw)
         seed_manifest[regime] = {
             "source": args.data_source,
             "regime_config": dict(REGIME_CONFIGS.get(regime, {})),
@@ -532,7 +630,7 @@ def main() -> None:
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
 
-        if args.data_source in ("dataset", "hybrid"):
+        if args.data_source in ("dataset", "hybrid", "closed_loop"):
             # T9 acceptance check: real demo episodes should generally involve
             # agent-block contact (they're expert task completions), but verify
             # rather than assume -- especially post-regime-shift, where the

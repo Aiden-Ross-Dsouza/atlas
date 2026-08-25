@@ -72,6 +72,9 @@ def atlas_step(
     # next_chunk is only needed for full ATLAS expansion; pass None otherwise
     next_encoder_output: torch.Tensor | None = None,
     next_actions: torch.Tensor | None = None,
+    proprio_ctxt: torch.Tensor | None = None,
+    next_proprio_ctxt: torch.Tensor | None = None,
+    rng=None,
 ) -> StepInfo:
     """
     Execute one ATLAS decision step (SCORE + SELECT + EXPAND).
@@ -91,6 +94,15 @@ def atlas_step(
         regime_label:         True regime label (oracle router only).
         next_encoder_output:  Next chunk for expansion verification (ATLAS mode).
         next_actions:         Next chunk actions (ATLAS mode).
+        proprio_ctxt:         Encoded first-frame proprio for `encoder_output`
+                              [1, 1, P_tok, D] — see score.umf()'s docstring
+                              (required in practice for this checkpoint).
+        next_proprio_ctxt:    Encoded first-frame proprio for
+                              `next_encoder_output` (ATLAS mode only).
+        rng:                  random.Random instance for the "random" router
+                              — thread the episode seed here for
+                              reproducibility. Falls back to the unseeded
+                              global `random` module if None.
 
     Returns:
         StepInfo with selected chart index and diagnostics.
@@ -107,6 +119,8 @@ def atlas_step(
         hysteresis=cfg.hysteresis,
         regime_label=regime_label,
         label_to_chart=cfg.label_to_chart,
+        proprio_ctxt=proprio_ctxt,
+        rng=rng,
     )
 
     scores = route_info["scores"]
@@ -123,19 +137,20 @@ def atlas_step(
     probe_outcome: ProbeOutcome = "not_ready"
 
     if cfg.expansion_mode == "atlas":
-        expander.record(best_umf, encoder_output, actions)
+        expander.record(best_umf, encoder_output, actions, proprio_ctxt)
         if (
             next_encoder_output is not None
             and next_actions is not None
             and expander._strikes >= cfg.q
         ):
             probe_outcome = expander.maybe_expand(
-                library, world_model, next_encoder_output, next_actions, cfg.motion_gate
+                library, world_model, next_encoder_output, next_actions, cfg.motion_gate,
+                next_proprio_ctxt,
             )
 
     elif cfg.expansion_mode == "detect_only":
         # Detect-and-spawn: commit immediately when strikes ≥ q, no verification.
-        expander.record(best_umf, encoder_output, actions)
+        expander.record(best_umf, encoder_output, actions, proprio_ctxt)
         if expander._strikes >= cfg.q and not library.is_full():
             best_idx = selected_idx
             new_chart = library.clone_from(best_idx)
@@ -164,6 +179,9 @@ def atlas_refine(
     encoder_output: torch.Tensor,
     actions: torch.Tensor,
     lr: float = 5e-4,
+    *,
+    proprio_ctxt: torch.Tensor | None = None,
+    optimizer=None,
 ) -> float:
     """
     One AdaJEPA gradient step on the selected chart.
@@ -181,22 +199,33 @@ def atlas_refine(
                         world_model.model.predictor.
         encoder_output: Current chunk [T+1, N, D].
         actions:        Executed actions [T, action_dim].
-        lr:             Learning rate.
+        lr:             Learning rate. Ignored if `optimizer` is given.
+        proprio_ctxt:   Encoded first-frame proprio [1, 1, P_tok, D] — see
+                        score.umf()'s docstring (required in practice for
+                        this checkpoint).
+        optimizer:      Pre-built Adam optimizer over this chart's params, so
+                        the CALLER (E3/E4's ArmState, one Adam per chart
+                        index) can retain moment state across replans instead
+                        of a fresh Adam being built (and its momentum
+                        discarded) on every call -- the same setup AdaJEPA
+                        uses. If None, a fresh Adam is built (back-compat for
+                        callers with no persistent-optimizer state).
 
     Returns:
         Scalar loss value for logging.
     """
     import torch.optim as optim
-    from atlas.score import _open_loop_rollout
+    from atlas.score import _open_loop_rollout, _make_z_ctxt
 
     predictor = world_model.model.predictor
     chart.apply_(predictor)
     params = [p for n, p in predictor.named_parameters() if n in chart._param_names]
-    optimizer = optim.Adam(params, lr=lr)
+    if optimizer is None:
+        optimizer = optim.Adam(params, lr=lr)
 
     optimizer.zero_grad()
-    z_vis = encoder_output[0]
-    z_preds = _open_loop_rollout(world_model, z_vis, actions)  # [T, N, D]
+    z_ctxt = _make_z_ctxt(world_model, encoder_output[0], proprio_ctxt)
+    z_preds = _open_loop_rollout(world_model, z_ctxt, actions)  # [T, N, D]
     loss = (z_preds - encoder_output[1:]).pow(2).mean(dim=-1).mean()
     loss.backward()
     optimizer.step()

@@ -201,6 +201,8 @@ def run_e0_train(
     data_source: str = "dataset",
     data_split: str = "train",
     out_subdir: str = "e0_v2",
+    collect_num_samples: int = 100,
+    collect_iterations: int = 10,
 ) -> None:
     """scripts/run_e0.py -- offline chart fine-tuning, T9: real-data replay
     (data_source='dataset') + early stopping (eval_every/patience) on a held-
@@ -227,6 +229,9 @@ def run_e0_train(
            "--data-source", data_source,
            "--data-split", data_split,
            "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+    if data_source == "closed_loop":
+        cmd += ["--collect-num-samples", str(collect_num_samples),
+                "--collect-iterations", str(collect_iterations)]
     if regime_config is not None:
         cmd += ["--regime-config", regime_config]
     subprocess.run(cmd, check=True, cwd="/src")
@@ -240,10 +245,12 @@ def run_e0_train_entrypoint(kinds: str = "ln_act", regimes: str = "R1",
                               num_val_trajs: int = 8, eval_traj_len: int = 50,
                               eval_every: int = 25, patience: int = 5,
                               data_source: str = "dataset", data_split: str = "train",
-                              out_subdir: str = "e0_v2") -> None:
+                              out_subdir: str = "e0_v2", collect_num_samples: int = 100,
+                              collect_iterations: int = 10) -> None:
     run_e0_train.remote(kinds=kinds, regimes=regimes, regime_config=regime_config, steps=steps,
                          num_train_trajs=num_train_trajs, train_traj_len=train_traj_len,
                          num_val_trajs=num_val_trajs, eval_traj_len=eval_traj_len,
                          eval_every=eval_every, patience=patience,
                          data_source=data_source, data_split=data_split,
-                         out_subdir=out_subdir)
+                         out_subdir=out_subdir, collect_num_samples=collect_num_samples,
+                         collect_iterations=collect_iterations)

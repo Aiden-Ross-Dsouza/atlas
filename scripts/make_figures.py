@@ -26,11 +26,18 @@ def load_jsonl(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-def make_f1(e4_log: Path, out_dir: Path) -> None:
-    """F1 — Money plot: rolling success vs episode for all 7 arms."""
+def make_f1(e4_log: Path, out_dir: Path, summary_path: Path | None = None) -> None:
+    """F1 — Money plot: rolling success vs episode for all 7 arms.
+
+    Segment boundaries/regime labels are read from the run's e4_summary.json
+    (episodes_per_segment, segment_regimes) rather than hardcoded 20-episode/
+    6-segment/R0-R1 defaults (E3_E4_IMPLEMENTATION_PLAN.md §7b) — falls back
+    to those defaults only if no summary is found, so a 10-episode R0/R2 run
+    (or any other --episodes/--segment-regimes combination) still plots
+    correctly.
+    """
     episodes = load_jsonl(e4_log)
     arms = sorted(set(ep["arm"] for ep in episodes))
-    n_episodes = max(ep.get("global_episode_idx", 0) for ep in episodes) + 1
 
     arm_outcomes: dict[str, np.ndarray] = {}
     for arm in arms:
@@ -38,10 +45,25 @@ def make_f1(e4_log: Path, out_dir: Path) -> None:
         arm_eps.sort(key=lambda e: e.get("global_episode_idx", 0))
         arm_outcomes[arm] = np.array([ep["success"] for ep in arm_eps], dtype=float)
 
-    # Segment boundaries (20 episodes per segment, 6 segments).
+    if summary_path is None:
+        summary_path = e4_log.parent / "e4_summary.json"
     eps_per_seg = 20
+    regime_a, regime_b = "R0", "R1"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        eps_per_seg = summary.get("episodes_per_segment", eps_per_seg)
+        seg_regimes = summary.get("segment_regimes")
+        if seg_regimes and len(seg_regimes) == 2:
+            regime_a, regime_b = seg_regimes
+    else:
+        # Fall back to inferring episodes-per-segment from the data itself
+        # (segment_idx==0's episode count), rather than a hardcoded 20.
+        seg0_eps = [ep for ep in episodes if ep.get("arm") == arms[0] and ep.get("segment_idx") == 0]
+        if seg0_eps:
+            eps_per_seg = len(seg0_eps)
+
     boundaries = [i * eps_per_seg for i in range(6)]
-    regime_labels = ["R0", "R1", "R0", "R1", "R0", "R1"]
+    regime_labels = [regime_a, regime_b, regime_a, regime_b, regime_a, regime_b]
 
     # Extract commit/reject episode indices from atlas arm.
     atlas_eps = [ep for ep in episodes if ep["arm"] == "atlas"]

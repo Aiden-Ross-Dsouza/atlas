@@ -4,8 +4,9 @@ defaults:
 
 e4:
   stream: s2
-  episodes_per_segment: 20
-  seeds: 3
+  segment_regimes: [R0, R2]   # atlas.streams.stream_s2's default pair (E3_E4_IMPLEMENTATION_PLAN.md §1c)
+  episodes_per_segment: 10    # cut from 20 -- see budget ladder below
+  seeds: 1                    # cut from 3 -- see budget ladder below
   arms:
     - frozen
     - adajepa
@@ -16,9 +17,27 @@ e4:
     - oracle_id
   out_subdir: e4
 
-  # Budget calibration (plan §7.0): if > 40 s/episode, cut in this order:
-  # 1. cem_opt_steps: 10 → 6
-  # 2. episodes_per_segment: 20 → 15
-  # 3. max_mpc_steps: 30 → 20
-  # 4. drop atlas_fixed arm
-  # These cuts are applied manually after profiling; do not set auto-cut here.
+  # Budget calibration (E3_E4_IMPLEMENTATION_PLAN.md §0.2, corrected
+  # 2026-08-25 -- the OLD "if > 40 s/episode" ladder below this comment was
+  # written against AdaJEPA's planner budget (200 samples/10 iters/horizon
+  # 25), not this project's measured cost. Measured on L4 at this
+  # substrate's own CEM config (num_samples=300, iterations=30, horizon=6):
+  # ~146-151 s/episode for ONE replan. E4 needs MULTIPLE replans/episode
+  # (routing + refinement + Expander's next-chunk verification all require
+  # it), so at num_act_stepped=1 (6 replans/episode): ~900 s/episode.
+  # 7 arms x 6 segments x 20 eps x 3 seeds x 900s =~ 630 GPU-h =~ $500 on L4
+  # -- INFEASIBLE. Applied cut ladder (uniform across every arm, reported in
+  # the paper per plan §7.0's own instruction):
+  #   1. iterations: 30 -> 10          (~3x)   -- validate frozen@R0 SR stays >=~85%
+  #   2. episodes_per_segment: 20 -> 10 (2x)
+  #   3. seeds: 3 -> 1                  (3x)   -- no cross-seed CI band on F1
+  #   4. one Modal container per (arm, seed_run) -- same GPU-h, buys wall time
+  # Recommended target (this file's defaults): iterations=10, episodes=10,
+  # seeds=1, 7 arms -> 420 episodes x ~300s =~ 35 GPU-h =~ $28, ~5h wall with
+  # 7 parallel containers. Re-profile with `scripts/run_e4.py --profile`
+  # before trusting these numbers for a real run -- see Phase 5's STOP gate.
+  num_samples: 300
+  iterations: 10       # cut from 30 -- validate against frozen@R0 first (Phase 5)
+  horizon: 6
+  num_act_stepped: 1   # E4 deviation, see configs/atlas/default.yaml's planner block
+  max_mpc_steps: 30

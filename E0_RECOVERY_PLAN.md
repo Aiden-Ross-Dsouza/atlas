@@ -15,19 +15,26 @@
 > the long-push episodes, which hold 6 of the 10 recoverable ones. See `E0_RESULTS.md`'s
 > 🟢 R0 CONFOUND CHECK section.
 >
-> **Sanctioned next, in parallel — E1 remains gated:**
-> **(1) P4 capacity matrix** on R2, **`dataset` source only** (hybrid lost P3 on every axis —
-> SR, McNemar, knock-aways — so it is not retrained; this was already how P4 was scoped, not a
-> new restriction). Trains `lora4`, `full`; E0 cannot be reported complete on one adapter kind,
-> and §7.1's rule needs `full` to be applicable at all.
-> **(2) P5's `nas=1` re-baseline, pulled early, run FIRST** — frozen (no chart) baseline only,
-> at R0 and R2, `num_act_stepped=1` (6 replans instead of 1). 2 cells, no training, ~50 min
-> total — cheaper than P4 and diagnostic for how to read it: it separates whether `ln_act`'s
-> weak showing was model *capacity* (→ P4 is the right next question) or an artifact of E0's
-> one-shot 30-step blind-plan protocol (`num_act_stepped=6`) that a bigger adapter cannot fix
-> either (→ P4 would likely just re-discover the same failure at higher GPU cost). Also
-> required work regardless (P5 mandates E1 use `nas=1`), so this is reordering, not new scope.
-> **nas=1 result does not reopen E1's gate** — E0's gate stands on E0's own protocol.
+> **P4 capacity matrix on R2, `dataset` source only — IN PROGRESS, and the result so far points
+> AWAY from capacity being the bottleneck.** `nas=1` diagnostic was launched, found to cost
+> ~6x nas=6's wall time (877.67s/ep, ~4h52m for 20 episodes — the "~50 min" estimate was wrong,
+> see §0.7), and was **cancelled by the user after 1/20 episodes** — no result from it exists.
+> The open capacity-vs-horizon question is being answered by P4 itself instead.
+>
+> **`lora4` result (ran 2026-08-25): capacity theory is disfavoured.** `lora4` (118k params) —
+> eval UMF 0.329 (marginally better than `ln_act`'s 0.336 offline) — scores **8/20 = 40.0% in
+> planning, WORSE than both baseline (45.0%) and `ln_act` (50.0%).** Knock-aways revert to 4/20
+> (near baseline's 5/20, worse than `ln_act`'s 2/20). Episode-level: `lora4` loses `ln_act`'s one
+> distinguishing win (ep17) and gains an unrelated one (ep19) — not a scaled-up version of
+> `ln_act`'s fix, looks like noise. Full analysis: §0.7 below.
+>
+> **`full` result: pending — planning evaluation launched 2026-08-25, in progress.** `full`'s
+> offline eval UMF (0.728, near the UMF≈1.0 "no better than static" ceiling despite the LOWEST
+> train loss of all three kinds — a clear overfit signature, 20.8M params on 20 trajectories)
+> already independently supports the same conclusion `lora4`'s planning result does. Running its
+> planning episodes anyway as the "cheap formality" §7.1's pre-registered rule requires (the rule
+> is defined relative to `full`'s gain, so E0 cannot be formally closed without this number
+> existing), not because a different outcome is expected.
 
 ---
 
@@ -348,6 +355,74 @@ goalpost-moving**, so it is only legitimate under the same discipline P1 followe
 If those three cannot be satisfied, report E0's negative result as it stands and stop.
 
 </details>
+
+### 0.7 P4 capacity matrix (ran 2026-08-25) — `lora4` result: capacity is not the bottleneck
+
+**Training.** `lora4` and `full` both trained on `dataset` (the P3 winner), R2, identical budget
+to P3's `ln_act` (20 train trajs × 25 length, 8 val trajs). Both confirmed `regime_config ==
+{"damping": 0.5}` via `e0_seed_manifest.json` before evaluation. **No OOM on either** — P2a's
+fix holds under the real Modal config, not just the local 6GB smoke test.
+
+| Kind | Params | Train loss | Eval UMF |
+|---|---|---|---|
+| `ln_act` (P3) | 10,764 | 0.131 | 0.336 |
+| `lora4` | 118,176 trainable | **0.055** | 0.329 |
+| `full` | 20,800,884 | **0.035 (lowest)** | **0.728 (worst — near the 1.0 no-better-than-static ceiling)** |
+
+`full`'s combination — best train loss, worst eval loss — is a textbook overfit: 20.8M
+parameters memorizing 20 training trajectories rather than learning the correction. This is
+independent evidence against the capacity theory, before any planning episode was spent on it.
+
+**`lora4` planning result, N=20, paired, identical protocol to P3:**
+
+| Arm | SR | vs baseline | vs `ln_act` |
+|---|---|---|---|
+| baseline | 9/20 = 45.0% | — | — |
+| `ln_act` | 10/20 = 50.0% | +5.0pp | — |
+| **`lora4`** | **8/20 = 40.0%** | **−5.0pp, CI [−20, +10]** | **−10.0pp, CI [−30, +10]** |
+
+Pairing verified: `init_block_pos_diff` identical across all 20 episode indices in all three
+arms (baseline, `ln_act`, `lora4`).
+
+**Knock-aways revert:** `lora4` 4/20 — almost back to baseline's 5/20, worse than `ln_act`'s
+2/20. Whatever mechanism `ln_act` was correcting, `lora4` does less of it, not more.
+
+**Episode-level pattern is the clearest signal.** `ln_act`'s one distinguishing win over
+baseline was ep17 (strict superset, McNemar b=1 c=0 — see §0.6). `lora4` **loses that exact
+episode**, plus ep1 and ep4 (all losses vs. baseline too), and gains only ep19 — solved by
+neither baseline nor `ln_act`. A real capacity-driven improvement should look like `ln_act`'s
+pattern scaled up (more wins, same losses). Instead it looks scrambled — consistent with noise,
+not a bigger version of the same fix.
+
+**Reading, combining all three signals:** `full`'s offline overfit, `lora4`'s worse-not-better
+planning result, and `lora4`'s scrambled (not superset) episode pattern all point the same
+direction. This matches the mechanistic prediction made before these results existed (see the
+user's framing, recorded here for the record): the failure is *not* representational capacity —
+10.7k LN params are already expressive enough for a low-dimensional, one-directional "stop
+believing the block halts on contact" correction. The likely bottleneck is that the training
+signal itself is incomplete: open-loop replay trajectories never show the model *recovering*
+from an overshoot, so more parameters just fit the same incomplete correction more precisely
+(and, at `full`'s scale on only 20 trajectories, overfit it outright).
+
+**`full`'s planning evaluation:** launched 2026-08-25 as the formality §7.1's pre-registered
+rule requires (defined relative to `full`'s gain) — not because a different outcome is
+expected, given its offline UMF already sits near the no-better-than-static ceiling.
+
+#### nas=1 diagnostic — attempted, cancelled, no result
+
+A cheap-looking diagnostic to separate "capacity" from "horizon compounding" (frozen baseline
+only, R2, `num_act_stepped=1` instead of 6 — 6 replans/episode instead of 1) was proposed and
+launched. **The cost estimate was wrong.** `num_act_stepped=1` requires a full CEM search (300
+samples × 30 iterations) at *every* replan, so 6 replans/episode costs ~6× a `nas=6` episode's
+wall time, not the same. Real measured rate: **877.67s/episode** (vs. ~150s/episode for every
+`nas=6` run in this project) → **~4h52m for 20 episodes**, not the "~50 min" originally
+estimated. **Cancelled by the user after 1/20 episodes** (`ap-Mn8BxQ03n2VARhp2wIAMp2`, stopped
+via `modal app stop --yes`) — no usable result exists from this attempt. The capacity-vs-horizon
+question is being resolved by the P4 matrix itself instead (see above): `lora4`'s
+worse-than-`ln_act` result already argues against capacity, independent of whether horizon
+compounding is also a contributing factor. **If a future session wants this diagnostic, budget
+~5 hours or cut episode count substantially (e.g. N=6-8) before launching — do not assume
+`nas=6` timing transfers.**
 
 #### Settled regardless: the open-loop question (P2b)
 

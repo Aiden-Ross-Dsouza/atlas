@@ -30,17 +30,32 @@ def test_paired_seed_unique():
 
 
 def test_s2_structure():
-    """S2 has 6 segments of alternating R0/R1."""
+    """S2_REGIMES documents the alternating structure (kept for reference)."""
     assert S2_REGIMES == ["R0", "R1", "R0", "R1", "R0", "R1"]
 
 
-def test_get_stream_s2():
+def test_get_stream_s2_default_regimes():
+    """Default regimes are R0/R2 (E0_RECOVERY_PLAN calibration -- see streams.py)."""
     streams = get_stream("s2", episodes_per_segment=5, seeds=2)
     assert len(streams) == 2
     for stream in streams:
         assert len(stream) == 6 * 5
         for ep in stream:
-            assert ep.regime in ("R0", "R1")
+            assert ep.regime in ("R0", "R2")
+        seg_regimes = [stream[i * 5].regime for i in range(6)]
+        assert seg_regimes == ["R0", "R2", "R0", "R2", "R0", "R2"]
+
+
+def test_get_stream_s2_custom_regimes():
+    streams = get_stream("s2", episodes_per_segment=5, seeds=1, regimes=("R0", "R1"))
+    for ep in streams[0]:
+        assert ep.regime in ("R0", "R1")
+
+
+def test_episode_spec_global_episode_idx():
+    streams = get_stream("s2", episodes_per_segment=5, seeds=1)
+    for i, ep in enumerate(streams[0]):
+        assert ep.global_episode_idx == i
 
 
 def test_get_stream_unknown():

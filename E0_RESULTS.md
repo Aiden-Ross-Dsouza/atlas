@@ -1,5 +1,82 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## 🔴 P4 CAPACITY MATRIX COMPLETE (2026-08-25) — E0 fails; capacity is not the bottleneck
+
+All four arms on calibrated **R2 (`{"damping": 0.5}`)**, N=20, P2d-filtered sampler,
+`nas=6`. Pairing verified: `init_block_pos_diff` and `init_agent_block_dist` identical
+across all four arms on all 20 episode indices, 0 mismatches. `regime_config` confirmed
+`{'damping': 0.5}` in every JSONL.
+
+Sources: `atlas_out/e0_v3_planning_dataset_baseline/`, `e0_v3_planning_dataset_ln_act/`,
+`e0_v4_planning_lora4/`, `e0_v4_planning_full/`.
+
+| Arm | trainable params | SR | Δ vs baseline | knock-aways | mean progress | zero-contact eps |
+|---|---:|---:|---|---:|---:|---:|
+| baseline (`c0`) | 0 | 45.0% (9/20) | — | 5/20 | +19.6px | 0 |
+| **`ln_act`** | 10,764 | **50.0% (10/20)** | +5.0pp, CI [−10, +20] | **2/20** | **+37.3px** | 0 |
+| `lora4` | 118,176 | 40.0% (8/20) | −5.0pp, CI [−20, +10] | 4/20 | +29.9px | 0 |
+| `full` | 20,800,884 | 20.0% (4/20) | **−25.0pp, CI [−45, −10]** | 6/20 | **−2.9px** | **3** |
+
+**Normalised recovery** against the 10-episode recoverable set `[2,3,5,10,12,14,15,17,18,19]`
+(see R0 confound section below): `ln_act` **1/10**, `lora4` **1/10** (ep19), `full` **0/10**.
+
+### Verdict — pre-registered criteria
+
+- **§7.1's capacity rule ("smallest kind reaching ≥90% of `full`'s gain") cannot be applied
+  as stated.** `full`'s gain is **negative** (−25.0pp). There is no winner to name. Report
+  this as an inapplicable rule, not as a rule satisfied by the smallest arm by default.
+- **E0's ≥15pp bar: FAILED.** The best arm (`ln_act`) reaches +5.0pp with a CI spanning zero,
+  and recovers one tenth of the regime-opened gap.
+- The **only statistically real effect in the matrix** is `full`'s degradation — the sole
+  comparison whose CI excludes zero, and it points *against* the adapter.
+
+### Mechanism — what `full` actually did
+
+`full` is the only arm with **zero-contact episodes** (7, 14, 19: `block_pos_diff` byte-identical
+to `init_block_pos_diff`), and the only arm with **negative mean progress** (−2.9px overall,
+**−32.0px on easy episodes**). It is not overshooting a correction — CEM's plans stopped being
+goal-directed. Fine-tuning 20.8M parameters on 20 trajectories degraded the frozen predictor's
+goal-relevant structure outright. Its offline eval UMF (0.728, near the "no better than static"
+ceiling, despite the lowest train loss) flagged this before planning ever ran.
+
+**Honest scoping of this claim:** `full`'s failure is **confounded with training-set size**. It
+is evidence that *capacity without proportionate data* hurts on this substrate — **not** a clean
+demonstration that capacity per se is harmful. Do not write the stronger claim.
+
+### ⚠️ Post-hoc, exploratory — NOT a pre-registered result
+
+Splitting on initial block displacement at 90px (a threshold chosen **after** seeing the data —
+garden-of-forking-paths hazard, treat as hypothesis only):
+
+| Split | Arm | SR | mean final err | mean progress | knock-aways |
+|---|---|---:|---:|---:|---:|
+| Easy (<90px, n=11) | baseline | 7/11 | 55.8 | +1.8 | 2 |
+| | **`ln_act`** | **8/11** | **30.9** | **+26.8** | **1** |
+| | `lora4` | 6/11 | 55.6 | +2.0 | 3 |
+| | `full` | 3/11 | 89.7 | −32.0 | 4 |
+| Hard (≥90px, n=9) | baseline | 2/9 | 99.3 | +41.2 | 3 |
+| | `ln_act` | 2/9 | 90.3 | +50.2 | **1** |
+| | **`lora4`** | 2/9 | **76.6** | **+63.9** | **1** |
+| | `full` | 1/9 | 107.8 | +32.7 | 2 |
+
+`ln_act` and `lora4` appear to have **complementary competences** — `ln_act` owns short-range
+correction, `lora4` reduces long-range error substantially (ep0 120→67.5, ep3 157→60.0,
+ep5 82→46.9, ep15 104→64.1) without crossing the 20px success threshold. Aggregate SR hides
+this because the effects cancel. **SR is identical (2/9) on the hard split** — the difference is
+visible only in the continuous metric. This does **not** rescue E0's failed SR test. If it
+survives a pre-registered replication it is an argument *for* a routed library; until then it is
+a hypothesis.
+
+### Interpretation
+
+Across four capacity levels spanning three orders of magnitude, no adapter clears the bar, and
+the largest actively regresses. Combined with the open-loop nature of the replay training data
+(trajectories never show the model recovering from an overshoot), the evidence favours **the
+training signal, not model capacity, as the bottleneck**. That is a reportable negative result
+under §1.8 — not something to fix by tuning.
+
+---
+
 ## 🟢 R0 CONFOUND CHECK (2026-08-25) — headroom is REAL and quantified; the "dilution" theory was wrong
 
 Frozen baseline at **R0** on the identical P2d-filtered sampler, N=20, all four arms confirmed

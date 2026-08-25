@@ -1,5 +1,18 @@
 # Push-T physics regime configurations
-# Values are exact as specified in implementation plan §6.1
+#
+# NOTHING LOADS THIS FILE (atlas/regimes.py's REGIME_CONFIGS dict is the
+# live, code-enforced source of truth) -- this is documentation only, kept
+# in sync with regimes.py so it doesn't silently drift into a foot-gun.
+#
+# CORRECTED 2026-08-25 (E3_E4_IMPLEMENTATION_PLAN.md Phase 8): the values
+# below previously described R1 as a T-block mass x0.2 scaling and R2 as
+# space.damping=0.3 -- BOTH SUPERSEDED. Push-T's pusher agent is a
+# pymunk.Body(KINEMATIC); Chipmunk2D's impulse solver treats a kinematic
+# body as infinite mass, so post-collision velocity is algebraically
+# INDEPENDENT of the body it hits' mass at ANY scale (confirmed empirically,
+# 0.001x-1000x, byte-identical trajectories every time) -- no mass value can
+# ever produce a regime shift here. See REGIME_DESIGN_REVIEW.md and
+# ATLAS_implementation_plan_v2.md §6.1a for the full writeup.
 
 regimes:
   R0:
@@ -7,19 +20,28 @@ regimes:
     physics: {}
 
   R1:
-    description: "Light block — T-block mass × 0.2 (gain-like shift)"
+    description: >
+      High friction — agent+block shape.friction raised to 2.0 (was:
+      T-block mass x0.2, proven physically dead against a kinematic
+      pusher -- see module-level note above).
     physics:
-      mass_scale: 0.2      # applied to both body.mass and body.moment
+      friction: 2.0
 
   R2:
     description: >
-      High damping — space.damping = 0.3 (contact-like shift).
-      NOTE: pymunk damping is a per-second RETENTION factor (1.0 = no damping).
-      Decreasing it (0.9 → 0.3) INCREASES damping. Get the sign right.
+      High damping — space.damping = 0.5 (was: shape.elasticity 0.9,
+      proven mechanically dead: space.damping=0 in the shipped env
+      annihilates all restitution velocity before it can displace
+      anything -- see module-level note above). pymunk damping is a
+      per-second RETENTION factor (1.0 = no damping); 0.5 INCREASES
+      damping relative to the shipped default.
     physics:
-      damping: 0.3
+      damping: 0.5
 
 # Which regimes are used in each experiment:
 #   E0: R1, R2  (two regimes to test adapter capacity on two shift kinds)
-#   S2: R0, R1  (alternating stream for E4/E3)
+#   S2 (E4/E3):  R0, R2 by default (atlas.streams.stream_s2's `regimes` arg;
+#                every trained/evaluated E0 chart targets R2 -- see
+#                E3_E4_IMPLEMENTATION_PLAN.md §1c). Overridable via
+#                scripts/run_e4.py's --segment-regimes.
 #   E2: see e2.yaml  (2×2 cells combining regimes and corruptions)

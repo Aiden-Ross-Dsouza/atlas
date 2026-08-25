@@ -16,10 +16,18 @@ adajepa:
   refine_steps: 1   # gradient steps per replan
 
 planner:
-  cem_samples: 200
-  cem_opt_steps: 10
-  horizon: 25
-  executed_actions: 5
+  # Corrected 2026-08-25 (E3_E4_IMPLEMENTATION_PLAN.md Phase 8): the values
+  # below (200/10/25/5) were AdaJEPA's own budget (a DIFFERENT substrate --
+  # see ATLAS_implementation_plan_v2.md §7.0a), not this project's. Corrected
+  # to dino_wm_pusht's own validated Push-T config (the one it reports ~90%
+  # SR under), plus E4's num_act_stepped=1 deviation (nas=6 gives ONE replan
+  # per 30-raw-step episode, which cannot exercise routing/refinement/
+  # Expander verification -- see scripts/run_e4.py's own CEM_NUM_ACT_STEPPED
+  # comment for the full reasoning).
+  cem_samples: 300
+  cem_opt_steps: 30
+  horizon: 6
+  executed_actions: 1     # num_act_stepped, E4 deviation (see comment above)
   max_mpc_steps: 30
 
 # Informative-chunk gate computed from training data (10th percentile of displacement)
