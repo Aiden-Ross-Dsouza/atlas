@@ -85,6 +85,7 @@ from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv  # noqa: E
 from evals.simu_env_planning.envs.pusht_gym_wrap import PushTWrapper  # noqa: E402
 from evals.simu_env_planning.planning.gc_agent import GC_Agent  # noqa: E402
 
+import atlas.score as score  # noqa: E402
 from atlas.chart import Chart  # noqa: E402
 from atlas.regimes import PhysicsRegime, REGIME_CONFIGS, set_regime_config  # noqa: E402
 
@@ -229,7 +230,8 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                  seed: int, max_steps: int, num_act_stepped: int, states: np.ndarray,
                  seq_lengths: list[int], log_planner_diagnostics: bool = False,
                  min_block_pos_diff: float = 40.0,
-                 max_agent_block_dist: float = DEFAULT_MAX_AGENT_BLOCK_DIST) -> dict:
+                 max_agent_block_dist: float = DEFAULT_MAX_AGENT_BLOCK_DIST,
+                 world_model=None, log_umf: bool = False) -> dict:
     device = agent.device
 
     rs = np.random.RandomState(seed)
@@ -268,6 +270,9 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
     total_contacts = 0
     final_check = {"block_pos_diff": None, "block_angle_diff": None}
     planner_diagnostics = []  # per-replan CEM elite-cost convergence, if requested
+    umf_per_replan = []  # per-replan UMF of the EXECUTED chunk under the predictor
+                          # state already in effect (chart, if any, applied once by
+                          # main() before the episode loop -- NOT re-applied here)
     t_start = time.time()
     for replan_idx in range(n_replans_target):
         if elapsed >= max_steps:
@@ -291,16 +296,55 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
         action = rearrange(action.cpu(), "t (f d) -> (t f) d", d=2)
         action = agent.preprocessor.denormalize_actions(action).numpy()
 
+        imgs = [obs["visual"]]
+        proprios = [obs["proprio"]]
+        step_actions = []
         for a in action:
             if elapsed >= max_steps:
                 break
             obs, reward, done, info = base_env.step(a)
+            imgs.append(obs["visual"])
+            proprios.append(obs["proprio"])
+            step_actions.append(a)
             elapsed += 1
             total_contacts += info["n_contacts"]
             final_check = block_success(goal_state, info["state"])
             if final_check["success"]:
                 success = True
                 break
+
+        if log_umf and world_model is not None:
+            # Mirrors atlas/harness.py::run_e1_episode's executed-chunk encoding
+            # exactly (E0_IMPLEMENTATION_PLAN.md T4 pattern) -- world_model.encode()
+            # (not preprocessor.transform_obs_visual+encode_obs) so real proprio is
+            # captured, since this checkpoint's predictor requires it. If success
+            # cut this replan short mid-frameskip-group, truncate to the largest
+            # prefix divisible by FRAMESKIP; skip UMF entirely if that's 0 raw steps.
+            n_raw = (len(step_actions) // FRAMESKIP) * FRAMESKIP
+            if n_raw == 0:
+                umf_per_replan.append(None)
+            else:
+                keep_idx = list(range(0, n_raw + 1, FRAMESKIP))
+                imgs_sub = np.stack([imgs[i] for i in keep_idx], axis=0)
+                proprios_sub = np.stack([proprios[i] for i in keep_idx], axis=0)
+                visual_t = torch.from_numpy(imgs_sub.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
+                proprio_t = torch.from_numpy(proprios_sub.astype(np.float32)).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
+                    enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)  # [T_model+1, N, D]
+                    proprio_enc = enc["proprio"]                                  # [1, T_model+1, P_tok, D_p]
+
+                acts_np = np.stack(step_actions[:n_raw], axis=0)  # [n_raw, 2]
+                act_norm = agent.preprocessor.normalize_actions(
+                    torch.from_numpy(acts_np).float().unsqueeze(0)
+                ).squeeze(0)  # [n_raw, 2]
+                act_model_used = act_norm.reshape(n_raw // FRAMESKIP, FRAMESKIP * 2).to(device)  # [T_model, 10]
+
+                umf_value = score.rollout_umf(
+                    world_model, enc_out, act_model_used, proprio_ctxt=proprio_enc[:, 0:1],
+                )
+                umf_per_replan.append(umf_value)
+
         if success:
             break
     result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
@@ -310,6 +354,10 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
               **{k: v for k, v in final_check.items() if k != "success"}}
     if log_planner_diagnostics:
         result["planner_diagnostics"] = planner_diagnostics
+    if log_umf:
+        umf_valid = [v for v in umf_per_replan if v is not None]
+        result["umf_per_replan"] = umf_per_replan
+        result["umf_mean"] = (sum(umf_valid) / len(umf_valid)) if umf_valid else None
     return result
 
 
@@ -343,6 +391,26 @@ def main() -> None:
                          help="Where to write per-episode JSONL + summary JSON.")
     parser.add_argument("--log-planner-diagnostics", action="store_true",
                          help="Log CEM's per-iteration elite-cost mean/std (free -- already computed).")
+    parser.add_argument("--no-log-umf", action="store_true",
+                         help="Disable per-replan UMF logging (on by default). UMF is computed on "
+                              "the ALREADY-EXECUTED chunk under whatever predictor state is in effect "
+                              "(chart applied once at episode start, or frozen for --kind baseline) -- "
+                              "reuses atlas/harness.py::run_e1_episode's encode pattern, no extra CEM "
+                              "compute, adds one encode() + one predictor unroll per replan. Writes "
+                              "umf_per_replan/umf_mean into each episode record, giving an "
+                              "episode-level (UMF, success) pair for the dissociation figure instead "
+                              "of only 5 arm-level ones.")
+    parser.add_argument("--episode-start", type=int, default=0,
+                         help="First episode/seed index this invocation runs (inclusive) -- lets two "
+                              "Modal containers split one N-episode request into non-overlapping "
+                              "shards (e.g. --episode-start 0 --episodes 50 and --episode-start 50 "
+                              "--episodes 100) that run concurrently and write to separate files via "
+                              "--out-suffix. seed == episode index throughout this script, so shards "
+                              "never collide on RNG draws. Merge with scripts/merge_planning_shards.py.")
+    parser.add_argument("--out-suffix", type=str, default="",
+                         help="Appended to the output JSONL/summary filenames (e.g. '_shard0'), so "
+                              "concurrent shards of the same kind/regime don't overwrite each other's "
+                              "output file. Leave empty for a single-container run.")
     parser.add_argument("--min-block-pos-diff", type=float, default=40.0,
                          help="Minimum block displacement (px) required between a sampled real "
                               "init/goal pair -- rejects pairs where the block barely moved over "
@@ -430,7 +498,12 @@ def main() -> None:
     # (seed=ep, no skipping) -- so on-disk episode indices are contiguous from
     # 0 by construction, unless the file was hand-edited or came from a
     # different (kind, regime) run merged in by mistake.
-    jsonl_path = args.out_dir / f"{args.kind}_{args.regime}.jsonl"
+    # --out-suffix keeps concurrent shards (--episode-start-split runs) in
+    # separate files; --episode-start shifts the starting seed/episode index
+    # so two containers can cover non-overlapping ranges of the same
+    # (kind, regime). seed == episode index everywhere in this script, so
+    # shards never collide on RNG draws regardless of run order.
+    jsonl_path = args.out_dir / f"{args.kind}_{args.regime}{args.out_suffix}.jsonl"
     existing_records = []
     if jsonl_path.exists():
         with open(jsonl_path) as f:
@@ -439,14 +512,16 @@ def main() -> None:
                 if line:
                     existing_records.append(json.loads(line))
         existing_eps = sorted(r["episode"] for r in existing_records)
-        if existing_eps != list(range(len(existing_eps))):
-            print(f"WARNING: {jsonl_path} episode indices are not contiguous from 0 "
-                  f"({existing_eps}) -- resume logic assumes contiguity; treating "
-                  f"already_done as max(episode)+1, which may re-run or skip unexpectedly "
-                  f"if the file was hand-edited or mixes runs.")
-        already_done = (max(existing_eps) + 1) if existing_eps else 0
+        expected = list(range(args.episode_start, args.episode_start + len(existing_eps)))
+        if existing_eps != expected:
+            print(f"WARNING: {jsonl_path} episode indices are not contiguous from "
+                  f"--episode-start={args.episode_start} ({existing_eps}) -- resume logic "
+                  f"assumes contiguity within a shard; treating already_done as "
+                  f"max(episode)+1, which may re-run or skip unexpectedly if the file was "
+                  f"hand-edited or mixes runs.")
+        already_done = (max(existing_eps) + 1) if existing_eps else args.episode_start
     else:
-        already_done = 0
+        already_done = args.episode_start
 
     if existing_records and args.episodes <= already_done:
         print(f"Requested --episodes {args.episodes} already satisfied by {already_done} "
@@ -455,18 +530,20 @@ def main() -> None:
     else:
         results = []
         new_eps = range(already_done, args.episodes)
-        if already_done:
-            print(f"Resuming: {already_done} episode(s) already in {jsonl_path}, "
-                  f"running {len(new_eps)} new episode(s) (seeds {already_done}..{args.episodes - 1}).")
-        pbar = tqdm(new_eps, desc=f"{args.kind}_{args.regime}", unit="ep")
-        with open(jsonl_path, "a" if already_done else "w") as f:
+        if already_done > args.episode_start:
+            print(f"Resuming: {already_done - args.episode_start} episode(s) already in "
+                  f"{jsonl_path}, running {len(new_eps)} new episode(s) "
+                  f"(seeds {already_done}..{args.episodes - 1}).")
+        pbar = tqdm(new_eps, desc=f"{args.kind}_{args.regime}{args.out_suffix}", unit="ep")
+        with open(jsonl_path, "a" if already_done > args.episode_start else "w") as f:
             for ep in pbar:
                 result = run_episode(agent, base_env, wrapper, regime, seed=ep, max_steps=args.max_steps,
                                       num_act_stepped=args.num_act_stepped, states=states,
                                       seq_lengths=seq_lengths,
                                       log_planner_diagnostics=args.log_planner_diagnostics,
                                       min_block_pos_diff=args.min_block_pos_diff,
-                                      max_agent_block_dist=args.max_agent_block_dist)
+                                      max_agent_block_dist=args.max_agent_block_dist,
+                                      world_model=model, log_umf=not args.no_log_umf)
                 results.append(result)
                 f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime,
                                      "regime_config": resolved_regime_cfg, **result}) + "\n")
@@ -495,14 +572,20 @@ def main() -> None:
         print(f"Peak GPU memory (THIS PROCESS ONLY, not necessarily over all "
               f"{len(all_records)} accumulated episodes if this was a resumed run): {peak_mem_gb:.2f} GB")
 
-    summary_path = args.out_dir / f"{args.kind}_{args.regime}_summary.json"
+    umf_means = [r["umf_mean"] for r in all_records if r.get("umf_mean") is not None]
+
+    summary_path = args.out_dir / f"{args.kind}_{args.regime}{args.out_suffix}_summary.json"
     summary_path.write_text(json.dumps({
         "kind": args.kind, "regime": args.regime, "regime_config": resolved_regime_cfg,
         "episodes": len(all_records),
+        "episode_start": args.episode_start, "out_suffix": args.out_suffix,
         "num_samples": args.num_samples, "iterations": args.iterations, "horizon": args.horizon,
         "num_act_stepped": args.num_act_stepped,
         "min_block_pos_diff": args.min_block_pos_diff, "max_agent_block_dist": args.max_agent_block_dist,
         "success_rate": success_rate, "mean_wall_time_s": mean_time, "peak_gpu_memory_gb": peak_mem_gb,
+        "log_umf": not args.no_log_umf,
+        "umf_mean_of_means": (sum(umf_means) / len(umf_means)) if umf_means else None,
+        "umf_episodes_with_value": len(umf_means),
     }, indent=2))
 
 

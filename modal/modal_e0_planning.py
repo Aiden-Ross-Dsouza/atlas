@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tqdm import tqdm
+
 import modal
 
 atlas_volume = modal.Volume.from_name("atlas-data", create_if_missing=True)
@@ -77,6 +79,9 @@ def run_e0_planning(
     log_planner_diagnostics: bool = False,
     min_block_pos_diff: float = 40.0,
     max_agent_block_dist: float | None = None,
+    episode_start: int = 0,
+    out_suffix: str = "",
+    log_umf: bool = True,
 ) -> None:
     """Defaults = the SUBSTRATE's own validated Push-T config (CEM 300x30,
     horizon 6, num_act_stepped 6 -> 30 raw steps/episode, 1 replan), the
@@ -95,7 +100,13 @@ def run_e0_planning(
     max_agent_block_dist (P2d, E0_RECOVERY_PLAN.md): rejects init states the
     agent cannot plausibly reach within the step budget -- None (default)
     defers to run_e0_planning.py's own DEFAULT_MAX_AGENT_BLOCK_DIST rather
-    than duplicating that data-derived constant here."""
+    than duplicating that data-derived constant here.
+    episode_start/out_suffix: for splitting one N-episode request across
+    multiple concurrent Modal calls (e.g. episode_start=0/episodes=50 and
+    episode_start=50/episodes=100, out_suffix='_shard0'/'_shard1') -- see
+    scripts/merge_planning_shards.py to combine them afterward. log_umf:
+    on by default -- logs per-replan UMF of the executed chunk alongside
+    success, giving an episode-level (UMF, success) pair for free."""
     import subprocess
     import sys
     # Volumes are eventually consistent -- reload() picks up commits made by
@@ -111,14 +122,38 @@ def run_e0_planning(
            "--num-act-stepped", str(num_act_stepped),
            "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
            "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}",
-           "--min-block-pos-diff", str(min_block_pos_diff)]
+           "--min-block-pos-diff", str(min_block_pos_diff),
+           "--episode-start", str(episode_start),
+           "--out-suffix", out_suffix]
     if regime_config is not None:
         cmd += ["--regime-config", regime_config]
     if max_agent_block_dist is not None:
         cmd += ["--max-agent-block-dist", str(max_agent_block_dist)]
     if log_planner_diagnostics:
         cmd.append("--log-planner-diagnostics")
+    if not log_umf:
+        cmd.append("--no-log-umf")
     subprocess.run(cmd, check=True, cwd="/src")
+    atlas_volume.commit()
+
+
+@app.function(
+    volumes={ATLAS_MOUNT_PATH: atlas_volume},
+    timeout=600,
+)
+def merge_shards(kind: str, regime: str, out_subdir: str, shards: list[str]) -> None:
+    """Runs scripts/merge_planning_shards.py inside a container with the
+    volume mounted, so combining shard outputs needs no local download."""
+    import subprocess
+    import sys
+    atlas_volume.reload()
+    subprocess.run(
+        [sys.executable, "scripts/merge_planning_shards.py",
+         "--kind", kind, "--regime", regime,
+         "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}",
+         "--shards", *shards],
+        check=True, cwd="/src",
+    )
     atlas_volume.commit()
 
 
@@ -128,13 +163,64 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
           num_samples: int = 300, iterations: int = 30, horizon: int = 6,
           num_act_stepped: int = 6, charts_subdir: str = "e0", out_subdir: str = "e0_planning",
           log_planner_diagnostics: bool = False, min_block_pos_diff: float = 40.0,
-          max_agent_block_dist: float | None = None) -> None:
-    run_e0_planning.remote(kind=kind, regime=regime, regime_config=regime_config, episodes=episodes,
-                            num_samples=num_samples, iterations=iterations, horizon=horizon,
-                            min_block_pos_diff=min_block_pos_diff,
-                            max_agent_block_dist=max_agent_block_dist,
-                            num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
-                            out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics)
+          max_agent_block_dist: float | None = None,
+          episode_start: int = 0, out_suffix: str = "", log_umf: bool = True,
+          num_shards: int = 1) -> None:
+    """num_shards > 1: splits [episode_start, episodes) into that many
+    contiguous, near-equal ranges, launches each as its own CONCURRENT Modal
+    container (via .spawn(), not sequential .remote() calls), waits for all
+    to finish, then merges them into the canonical {kind}_{regime}.jsonl via
+    merge_shards(). This is the actual wall-clock lever on a deadline -- the
+    workload is a sequential per-episode CEM loop on a small model (not
+    GPU-flop-bound at this batch size), so N containers in parallel beats a
+    single faster GPU. E.g. --episodes 100 --num-shards 4 runs four L4s
+    concurrently instead of one L4 for 4x as long, for the same total cost."""
+    if num_shards <= 1:
+        run_e0_planning.remote(kind=kind, regime=regime, regime_config=regime_config, episodes=episodes,
+                                num_samples=num_samples, iterations=iterations, horizon=horizon,
+                                min_block_pos_diff=min_block_pos_diff,
+                                max_agent_block_dist=max_agent_block_dist,
+                                num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
+                                out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics,
+                                episode_start=episode_start, out_suffix=out_suffix, log_umf=log_umf)
+        return
+
+    total = episodes - episode_start
+    if total <= 0:
+        raise ValueError(f"episodes ({episodes}) must exceed episode_start ({episode_start}).")
+    base, rem = divmod(total, num_shards)
+    bounds = []
+    start = episode_start
+    for i in range(num_shards):
+        size = base + (1 if i < rem else 0)  # first `rem` shards get one extra episode
+        if size == 0:
+            continue  # more shards requested than episodes to cover
+        bounds.append((start, start + size))
+        start += size
+
+    print(f"Splitting episodes [{episode_start},{episodes}) into {len(bounds)} shard(s): {bounds}")
+    shard_suffixes = [f"_shard{i}" for i in range(len(bounds))]
+    calls = [
+        run_e0_planning.spawn(
+            kind=kind, regime=regime, regime_config=regime_config, episodes=e,
+            num_samples=num_samples, iterations=iterations, horizon=horizon,
+            min_block_pos_diff=min_block_pos_diff, max_agent_block_dist=max_agent_block_dist,
+            num_act_stepped=num_act_stepped, charts_subdir=charts_subdir, out_subdir=out_subdir,
+            log_planner_diagnostics=log_planner_diagnostics,
+            episode_start=s, out_suffix=suffix, log_umf=log_umf,
+        )
+        for (s, e), suffix in zip(bounds, shard_suffixes)
+    ]
+    # Containers run concurrently (already launched via .spawn() above); this
+    # loop only blocks LOCALLY waiting for results, one shard at a time, in
+    # whatever order they were spawned -- not the order they actually finish
+    # in. That's fine for a progress bar (all N will complete regardless),
+    # just don't read bar order as "shard i finished i-th".
+    for call in tqdm(calls, desc=f"{kind}_{regime} shards", unit="shard"):
+        call.get()
+    print("All shards complete -- merging into the canonical file...")
+    merge_shards.remote(kind=kind, regime=regime, out_subdir=out_subdir, shards=shard_suffixes)
+    print(f"Merged: atlas_out/{out_subdir}/{kind}_{regime}.jsonl")
 
 
 @app.function(
