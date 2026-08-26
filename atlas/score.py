@@ -113,6 +113,50 @@ def umf(
     return numerator / displacement
 
 
+@torch.no_grad()
+def rollout_umf(
+    world_model,
+    encoder_output: torch.Tensor,
+    actions: torch.Tensor,
+    proprio_ctxt: torch.Tensor | None = None,
+    motion_gate: float | None = None,
+) -> float | None:
+    """
+    Same computation as umf(), for a predictor that is ALREADY in the state to
+    be scored — no chart apply_/restore_ here. umf()'s own apply/restore would
+    undo a chart a caller needs to stay applied for the rest of an episode
+    (e.g. E0 planning's post-hoc per-replan UMF logging, where the chart was
+    applied once at episode start and CEM keeps planning against it).
+    """
+    if encoder_output.ndim != 3:
+        raise ValueError(
+            f"encoder_output must be [T+1, N_patches, D], got {encoder_output.shape}"
+        )
+    T = actions.shape[0]
+    if encoder_output.shape[0] != T + 1:
+        raise ValueError(
+            f"encoder_output has {encoder_output.shape[0]} frames but {T} actions imply {T+1} frames"
+        )
+
+    z = encoder_output
+    z0 = z[0]
+
+    observed_displacement = (z[-1] - z0).norm(p="fro").item()
+    if motion_gate is not None and observed_displacement <= motion_gate:
+        return None
+
+    z_ctxt = _make_z_ctxt(world_model, z0, proprio_ctxt)
+    z_hat = _open_loop_rollout(world_model, z_ctxt, actions)
+
+    z_targets = z[1:]
+    numerator = (z_hat - z_targets).pow(2).sum().item()
+    displacement = (z_targets - z0.unsqueeze(0)).pow(2).sum().item()
+    if displacement == 0.0:
+        return None
+
+    return numerator / displacement
+
+
 def _make_z_ctxt(enc_pred_wm, z0: torch.Tensor, proprio_ctxt: torch.Tensor | None):
     """Build the z_ctxt _open_loop_rollout expects: a TensorDict with real
     proprio when available (required for dino_wm_pusht — see umf()'s
