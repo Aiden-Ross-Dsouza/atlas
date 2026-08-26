@@ -274,7 +274,12 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                           # state already in effect (chart, if any, applied once by
                           # main() before the episode loop -- NOT re-applied here)
     t_start = time.time()
-    for replan_idx in range(n_replans_target):
+    # Nested progress bar -- at low num_act_stepped (e.g. nas=2 -> 15 replans/episode,
+    # each a FULL CEM search), a single episode can take several minutes with zero
+    # visibility otherwise; leave=False so it clears once the episode's own line
+    # (in main()'s outer episode-level bar) takes over.
+    replan_pbar = tqdm(range(n_replans_target), desc="  replans", unit="replan", leave=False)
+    for replan_idx in replan_pbar:
         if elapsed >= max_steps:
             break
         obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
@@ -345,8 +350,11 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                 )
                 umf_per_replan.append(umf_value)
 
+        replan_pbar.set_postfix(steps=elapsed, success=success,
+                                 elapsed_s=f"{time.time() - t_start:.0f}")
         if success:
             break
+    replan_pbar.close()
     result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
               "init_block_pos_diff": init_block_pos_diff, "init_block_angle_diff": init_block_angle_diff,
               "init_agent_block_dist": init_agent_block_dist,

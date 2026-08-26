@@ -59,9 +59,13 @@ app = modal.App("atlas-e0-planning", image=image)
 
 
 @app.function(
-    gpu="L4",  # 24GB @ $0.80/h -- best ROI: comfortable headroom over the ~13.5GB
-               # measured need, well under L40S ($1.95/h)/A100 pricing. Avoid "T4"
-               # (16GB, too close to the measured requirement to risk OOM).
+    gpu="L4",  # 24GB @ $0.80/h -- reverted from T4 (2026-08-26): T4 measured ~3x slower
+               # for planning specifically (450-465s/ep vs L4's ~148s/ep) despite fitting
+               # comfortably in memory either way -- CEM's compute-bound candidate batch
+               # apparently hits T4's weaker raw FLOPs much harder than training's
+               # backward-pass-bound workload did (T4 was only ~1.65x slower there).
+               # L4 costs more per hour but finishes faster, and wall-clock is now the
+               # binding constraint, not $/hour alone.
     volumes={ATLAS_MOUNT_PATH: atlas_volume},
     timeout=3600 * 6,
 )
@@ -224,36 +228,44 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
 
 
 @app.function(
-    gpu="L4",
+    gpu="T4",  # 16GB @ $0.59/h -- same K=300 CEM search as run_e0_planning.py
+               # (measured 6.45GB peak there), plus K cheap CPU-only env
+               # rollouts per kind for the true-outcome side of the diagnostic.
     volumes={ATLAS_MOUNT_PATH: atlas_volume},
     timeout=3600,
 )
 def diagnose_cem_costs(
-    kind: str = "baseline",
+    kinds: str = "baseline,ln_act",
     regime: str = "R1",
     seed: int = 0,
     num_samples: int = 300,
     iterations: int = 30,
     horizon: int = 6,
     num_act_stepped: int = 6,
+    charts_subdir: str = "e0",
+    out_subdir: str = "cost_ranking",
 ) -> None:
-    """scripts/diagnose_cem_costs.py -- captures CEM's per-candidate costs at
-    iteration 0 (same RNG seed -> same candidates regardless of chart) and the
-    final iteration, to check whether a chart distorts CEM's cost ranking."""
+    """scripts/diagnose_cem_costs.py -- cost-ranking diagnostic: for ONE fixed
+    (init, goal) pair, captures CEM's iteration-0 per-candidate costs under
+    each kind (same K candidates every kind, by construction), rolls all K
+    out for real in the env to get each candidate's TRUE final block
+    distance, and reports Spearman rho(cost, true_dist) per kind -- the
+    mechanism figure for why UMF and planning success can dissociate even
+    when UMF looks good. kinds: comma-separated, e.g. 'baseline,ln_act'."""
     import subprocess
     import sys
     atlas_volume.reload()
     subprocess.run(
         [sys.executable, "scripts/diagnose_cem_costs.py",
-         "--kind", kind,
+         "--kinds", *kinds.split(","),
          "--regime", regime,
          "--seed", str(seed),
          "--num-samples", str(num_samples),
          "--iterations", str(iterations),
          "--horizon", str(horizon),
          "--num-act-stepped", str(num_act_stepped),
-         "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0",
-         "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/e0_planning/cem_diagnostics"],
+         "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
+         "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"],
         check=True,
         cwd="/src",
     )
@@ -261,15 +273,20 @@ def diagnose_cem_costs(
 
 
 @app.local_entrypoint(name="diagnose_cem_costs")
-def diagnose_cem_costs_entrypoint(kind: str = "baseline", regime: str = "R1", seed: int = 0,
+def diagnose_cem_costs_entrypoint(kinds: str = "baseline,ln_act", regime: str = "R1", seed: int = 0,
                                     num_samples: int = 300, iterations: int = 30, horizon: int = 6,
-                                    num_act_stepped: int = 6) -> None:
-    diagnose_cem_costs.remote(kind=kind, regime=regime, seed=seed, num_samples=num_samples,
-                               iterations=iterations, horizon=horizon, num_act_stepped=num_act_stepped)
+                                    num_act_stepped: int = 6, charts_subdir: str = "e0",
+                                    out_subdir: str = "cost_ranking") -> None:
+    diagnose_cem_costs.remote(kinds=kinds, regime=regime, seed=seed, num_samples=num_samples,
+                               iterations=iterations, horizon=horizon, num_act_stepped=num_act_stepped,
+                               charts_subdir=charts_subdir, out_subdir=out_subdir)
 
 
 @app.function(
-    gpu="L4",
+    gpu="T4",  # 16GB @ $0.59/h -- offline fine-tuning (backprop through the adapter's
+               # <=20.8M params only, no CEM candidate batch) needs less memory than
+               # planning's measured 6.45GB peak, so T4's headroom is even more
+               # comfortable here than in run_e0_planning (see that function's comment).
     volumes={ATLAS_MOUNT_PATH: atlas_volume},
     timeout=3600 * 6,
 )
@@ -362,8 +379,11 @@ def run_e2(
     probe_tau: float = 0.5,
     charts_subdir: str = "e0_v6_R1",
     out_subdir: str = "e2",
+    confusion_matrix: bool = False,
 ) -> None:
-    """scripts/run_e2.py -- E2's 2x2 routing-accuracy grid.
+    """scripts/run_e2.py -- E2's 2x2 routing-accuracy grid. confusion_matrix=True
+    runs the 3-chart {c0, chart_R1, chart_R2} diagnostic instead (chance=1/3,
+    needs chart_{kind}_R1.pt AND chart_{kind}_R2.pt in charts_subdir).
 
     No CEM planner: routing accuracy is a property of UMF scoring on an observed
     chunk, so this is collection + scoring only and costs ~1 GPU-h rather than
@@ -396,6 +416,8 @@ def run_e2(
            "--probe-tau", str(probe_tau),
            "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
            "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+    if confusion_matrix:
+        cmd.append("--confusion-matrix")
     subprocess.run(cmd, check=True, cwd="/src")
     atlas_volume.commit()
 
@@ -406,9 +428,11 @@ def run_e2_entrypoint(cells: str = "A,B,C,D", routers: str = "umf,sdyn",
                        kind: str = "ln_act", chart_regime: str = "R1",
                        corruption: str = "dark", corruption_severity: float = 0.5,
                        dynamics_regime: str = "R1", probe_q: int = 3, probe_tau: float = 0.5,
-                       charts_subdir: str = "e0_v6_R1", out_subdir: str = "e2") -> None:
+                       charts_subdir: str = "e0_v6_R1", out_subdir: str = "e2",
+                       confusion_matrix: bool = False) -> None:
     run_e2.remote(cells=cells, routers=routers, episodes=episodes, seeds=seeds,
                    traj_len=traj_len, kind=kind, chart_regime=chart_regime,
                    corruption=corruption, corruption_severity=corruption_severity,
                    dynamics_regime=dynamics_regime, probe_q=probe_q, probe_tau=probe_tau,
-                   charts_subdir=charts_subdir, out_subdir=out_subdir)
+                   charts_subdir=charts_subdir, out_subdir=out_subdir,
+                   confusion_matrix=confusion_matrix)

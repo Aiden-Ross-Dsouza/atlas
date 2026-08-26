@@ -573,6 +573,17 @@ def main() -> None:
     for p in wm.encoder.parameters():
         p.requires_grad_(False)
 
+    # T7 throughput fix (E0_IMPLEMENTATION_PLAN.md), never ported here from
+    # run_e0_planning.py: SDPA is absent from the eval YAML so it defaults
+    # False, falling back to manual attention that materialises the full
+    # attention matrix in fp32 every layer -- measured to cost 7.4-7.5s/step
+    # on T4 for a 10.7k-param ln_act fine-tune, an order of magnitude slower
+    # than this workload should need. Enabled post-load, not via YAML.
+    for m in wm.predictor.modules():
+        if hasattr(m, "use_sdpa"):
+            m.use_sdpa = True
+    torch.set_float32_matmul_precision("high")
+
     # Pristine snapshot of the predictor, taken once before any fine-tuning.
     # run_e0_finetune() mutates wm.predictor in-place for ln_act/full charts and
     # never restores it (Chart.restore_ just re-applies the already-updated chart

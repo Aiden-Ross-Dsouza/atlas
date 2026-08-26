@@ -77,6 +77,27 @@ def build_library(charts_dir: Path, predictor, kind: str, regime: str) -> Librar
     return library
 
 
+def build_confusion_library(charts_dir: Path, predictor, kind: str) -> Library:
+    """Library = {c0, chart_R1, chart_R2} for the 3-chart confusion-matrix
+    diagnostic (E2_RESULTS.md Limitations #4: '2-entry library is the minimum
+    that makes routing meaningful' -- this is the 3-entry follow-up, chance
+    accuracy 1/3 instead of 1/2). Index i's regime is REGIME_ORDER[i]."""
+    library = Library(Chart(predictor, kind=kind), max_size=10)
+    for regime in REGIME_ORDER[1:]:  # R0 is index 0 = c0, already added above
+        chart_path = charts_dir / f"chart_{kind}_{regime}.pt"
+        if not chart_path.exists():
+            raise FileNotFoundError(
+                f"{chart_path} not found — --confusion-matrix needs a chart_{kind}_{{regime}}.pt "
+                f"for every regime in {REGIME_ORDER[1:]}. Point --charts-dir at a directory "
+                f"holding both."
+            )
+        library.add(Chart.load(str(chart_path), predictor))
+    return library
+
+
+REGIME_ORDER = ["R0", "R1", "R2"]  # library index i <-> REGIME_ORDER[i]'s chart
+
+
 def _best_umf(info: dict) -> float | None:
     scores = info.get("scores") or []
     finite = [s for s in scores if s is not None]
@@ -131,6 +152,12 @@ def main() -> None:
     parser.add_argument("--corruption-severity", type=float, default=0.5)
     parser.add_argument("--charts-dir", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--out", type=Path, default=atlas.OUT_DIR / "e2")
+    parser.add_argument("--confusion-matrix", action="store_true",
+                        help="Run the 3-chart {c0, chart_R1, chart_R2} confusion-matrix "
+                             "diagnostic instead of the 2x2 cells (E2_RESULTS.md Limitations "
+                             "#4: a 2-entry library's chance accuracy is 0.5; this is 1/3). "
+                             "Needs chart_{kind}_R1.pt AND chart_{kind}_R2.pt in --charts-dir. "
+                             "Ignores --cells/--corruption/--dynamics-regime/--chart-regime.")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -150,6 +177,19 @@ def main() -> None:
         if hasattr(m, "use_sdpa"):
             m.use_sdpa = True
     torch.set_float32_matmul_precision("high")
+
+    if args.confusion_matrix:
+        gate_trajs = load_regime_trajectories(wrapper, prep, "R0", num_trajs=8,
+                                              traj_len=args.traj_len, device=device,
+                                              seed_offset=90_000, source="dataset")
+        gate_displacements = torch.tensor([
+            (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
+            for t in gate_trajs
+        ])
+        motion_gate = compute_motion_gate(gate_displacements)
+        print(f"motion_gate (10th pct of R0 train displacement) = {motion_gate:.4f}", flush=True)
+        run_confusion_matrix(args, wrapper, prep, device, motion_gate)
+        return
 
     if args.chart_regime != args.dynamics_regime:
         print(f"  [WARN] --chart-regime={args.chart_regime} but "
@@ -244,6 +284,15 @@ def main() -> None:
                 probe_library.add(library[1].clone())
                 commits = 0
 
+                # Sequential hysteresis (E2_RESULTS.md Limitations #2): carry each
+                # router's own previously-selected chart forward as the next
+                # decision's current_idx, instead of hardcoding 0 every episode.
+                # current_idx=0 always meant hysteresis always favoured c0,
+                # inflating R0-condition accuracy and deflating shifted-condition
+                # accuracy. Reset per (cell, cond, seed) -- a fresh condition is a
+                # fresh deployment starting from the identity chart, same as before.
+                current_idx_by_router = {router: 0 for router in args.routers}
+
                 for ep, traj in enumerate(tqdm(trajs, desc=f"route_{cell}{cond}_s{seed}",
                                                unit="ep", leave=False)):
                     enc = traj["encoder_output"]
@@ -253,8 +302,10 @@ def main() -> None:
                     umf_info = None
                     for router in args.routers:
                         idx, info = route(router, library, wrapper, enc, acts,
-                                          current_idx=0, motion_gate=motion_gate,
+                                          current_idx=current_idx_by_router[router],
+                                          motion_gate=motion_gate,
                                           proprio_ctxt=proprio_ctxt)
+                        current_idx_by_router[router] = idx
                         if router == "umf":
                             umf_info = info
                         gated = bool(info.get("gated", False))
@@ -360,6 +411,89 @@ def main() -> None:
         print(f"[warn] F2a not written: {e}")
 
     print(f"Results: {jsonl_path}")
+
+
+def run_confusion_matrix(args, wrapper, prep, device, motion_gate: float | None) -> None:
+    """3-chart {c0, chart_R1, chart_R2} routing accuracy, chance=1/3 instead of
+    the 2x2 cells' 2-entry-library 0.5 (E2_RESULTS.md Limitations #4: 'nothing
+    here speaks to selection among 3+ charts'). No appearance corruption --
+    pure dynamics discrimination across R0/R1/R2, with the same sequential
+    hysteresis fix as the 2x2 path (current_idx carried forward per router,
+    reset at the start of each (regime, seed) sequence)."""
+    wm = wrapper.model if hasattr(wrapper, "model") else wrapper
+    library = build_confusion_library(args.charts_dir, wm.predictor, args.kind)
+    print(f"Confusion-matrix library: {len(library)} charts "
+          f"(0=c0, 1=chart_{args.kind}_R1, 2=chart_{args.kind}_R2), chance=1/3", flush=True)
+
+    records: list[dict] = []
+    t_start = time.time()
+    for true_idx, regime in enumerate(REGIME_ORDER):
+        for seed in range(args.seeds):
+            # Distinct offset block from the 2x2 path's own seeding scheme
+            # (200_000+) so a shared --out dir never draws identical episodes.
+            offset = 300_000 + 10_000 * seed + 1_000 * true_idx
+            trajs = load_regime_trajectories(
+                wrapper, prep, regime, num_trajs=args.episodes,
+                traj_len=args.traj_len, device=device, seed_offset=offset,
+                source="dataset")
+
+            current_idx_by_router = {router: 0 for router in args.routers}
+            for ep, traj in enumerate(tqdm(trajs, desc=f"confusion_{regime}_s{seed}",
+                                           unit="ep", leave=False)):
+                enc = traj["encoder_output"]
+                acts = traj["actions"]
+                proprio_ctxt = traj["proprio"][0:1].unsqueeze(0)
+                for router in args.routers:
+                    idx, info = route(router, library, wrapper, enc, acts,
+                                      current_idx=current_idx_by_router[router],
+                                      motion_gate=motion_gate, proprio_ctxt=proprio_ctxt)
+                    current_idx_by_router[router] = idx
+                    gated = bool(info.get("gated", False))
+                    records.append({
+                        "regime": regime, "true_idx": true_idx, "seed": seed, "episode": ep,
+                        "router": router, "selected": idx,
+                        "hit": (None if gated else int(idx == true_idx)),
+                        "gated": gated, "scores": info.get("scores"),
+                    })
+
+    jsonl_path = args.out / "e2_confusion_episodes.jsonl"
+    with open(jsonl_path, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+    confusion: dict[str, list[list[int]]] = {}
+    accuracy: dict[str, float] = {}
+    for router in args.routers:
+        mat = [[0, 0, 0] for _ in REGIME_ORDER]  # rows=true regime, cols=selected chart idx
+        n_ungated = n_correct = 0
+        for r in records:
+            if r["router"] != router or r["hit"] is None:
+                continue
+            mat[r["true_idx"]][r["selected"]] += 1
+            n_ungated += 1
+            n_correct += r["hit"]
+        confusion[router] = mat
+        accuracy[router] = (n_correct / n_ungated) if n_ungated else float("nan")
+
+    summary = {
+        "confusion_matrix": confusion,
+        "accuracy": accuracy, "chance_accuracy": 1 / 3,
+        "config": {"episodes": args.episodes, "seeds": args.seeds, "kind": args.kind,
+                   "traj_len": args.traj_len, "motion_gate": motion_gate,
+                   "regime_order": REGIME_ORDER,
+                   "planner": "none -- collected trajectories, see module docstring"},
+        "wall_time": time.time() - t_start,
+    }
+    with open(args.out / "e2_confusion_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n-- E2 3-chart confusion matrix (rows=true regime, cols=selected) --")
+    for router in args.routers:
+        print(f"\nrouter={router}  accuracy={accuracy[router]:.3f}  (chance=0.333)")
+        print("            " + "  ".join(f"sel={r}" for r in REGIME_ORDER))
+        for i, row in enumerate(confusion[router]):
+            print(f"true={REGIME_ORDER[i]:<4}  " + "  ".join(f"{v:5d}" for v in row))
+    print(f"\nResults: {jsonl_path}")
 
 
 if __name__ == "__main__":
