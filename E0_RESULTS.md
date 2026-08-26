@@ -1,5 +1,320 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## 🟡 NAS=2 CLOSED-LOOP ARM (2026-08-26) — direction flips positive vs. nas=6, but N=20 is underpowered to confirm
+
+**Tests explanation B (horizon compounding) from this file's earlier sections: does closing the
+loop — more, smaller replans instead of one 30-step open-loop plan — change whether the chart
+helps?** `num_act_stepped=2` (vs. the substrate-default nas=6) with `horizon=6` unchanged means
+**3 replans per episode instead of 1** (each replan executes `num_act_stepped * FRAMESKIP = 2*5 =
+10` raw steps, so a 30-step episode needs 30/10 = 3 — **not** the 15 the loop's own
+`n_replans_target = max_steps // num_act_stepped` bound suggests; that formula mixes raw
+`max_steps` with model-chunk `num_act_stepped` and is documented in `run_e0_planning.py`'s own
+comment as a loose upper bound, with the real stopping condition being `elapsed >= max_steps`
+inside the loop — confirmed directly from the live per-replan progress bar, which correctly exits
+at 3/15 rather than running all 15 slots). Each of those 3 replans is still a full
+300-candidate/30-iteration CEM search. The `nas=1` diagnostic that would have answered this was
+cancelled earlier in the project on a cost estimate that turned out to be for a different
+(AdaJEPA-derived) config; nas=2 under the *current* substrate config was never actually priced or
+run until now. Real measured cost: **456s for a single worst-case (`success=0`) episode** (3
+replans, one-episode smoke test on L4), and the full 40-episode run (baseline + `ln_act`, N=20
+each) came in around **$3.0 total** — cheaper than the pre-run estimate, not more.
+
+| Arm | SR (N=20) | Δ vs baseline | 95% CI | McNemar |
+|---|---:|---|---|---|
+| baseline (nas=2) | 40.0% (8/20) | — | — | — |
+| `ln_act`/R2, 20 traj (nas=2) | 50.0% (10/20) | **+10.0pp** | **[−10.0, +30.0]** | p=0.625 (b=3, c=1) |
+
+**The CI still spans zero — this is not a significant result at N=20, and should not be reported as
+one.** But the *direction* is genuinely different from every nas=6 result in this file: the 20-traj
+chart's nas=6 comparison (N=100, well-powered) sat at −1.0pp; here, at nas=2, the point estimate is
++10pp with discordant pairs favoring the chart 3-to-1 rather than symmetric. Kendall τ(UMF,
+success) stays significant and negative in both arms (baseline: τ=−0.617, p=0.0018; `ln_act`:
+τ=−0.645, p=0.0011, both n=19) — the within-arm UMF-success link that held at nas=6 holds here too.
+
+**Honest read:** this is suggestive, not confirmatory. N=20 per arm at nas=2 has the same
+statistical-power problem the N=20→N=100 lesson earlier in this file already demonstrated once —
+the CI is wide enough that a true null and a true +15-20pp effect are both consistent with this
+data. Whether horizon-compounding is real would need the same N=100-scale re-run this file already
+did once for nas=6, which was not run here (budget/time chose N=20 deliberately, per an explicit
+cost-vs-power tradeoff discussion before launch). Report as: "closed-loop replanning shows a
+directionally positive, not-yet-significant signal that nas=6's single-shot open-loop plan may be
+suppressing the chart's real benefit — worth a properly powered re-run, not yet a finding."
+
+Artifacts: `atlas_out/e0_planning_nas2/{baseline_R2,ln_act_R2}.jsonl` (merged, 20 episodes each,
+auto-merged successfully this time — both local `modal run --detach` launchers survived to
+completion) + matching `_summary.json`.
+
+---
+
+## 🟢 COST-RANKING DIAGNOSTIC (2026-08-26) — planner cost's link to true outcome is real but wildly task-dependent, and this is TRUE OF THE FROZEN BASELINE TOO
+
+**Mechanism check for why UMF and planning success dissociate (this file's N=100 section below):
+does the planner's own cost function actually rank candidate actions the way real physics would?**
+Rewrote `scripts/diagnose_cem_costs.py` (the pre-fix version used a stale 3-arg
+`prepare_with_visual()` signature and wrapped `PhysicsRegime` around `PushTWrapper`, both changed
+in T6 — it would not have run correctly). For 10 fixed (state, goal) pairs (same sampler as every
+other E0 planning run), captured CEM's iteration-0 candidate batch (K=300, identical across
+`baseline`/`ln_act` by construction — CEM's first draw doesn't depend on the model) under both
+kinds, then rolled every one of the 300 candidates out for REAL in the physics sim (cheap CPU-only,
+no extra GPU cost) to get each candidate's true final block distance — an outcome no model, chart
+or baseline, ever sees. Reports Spearman ρ(planner cost, true final distance) per (seed, kind);
+both are "lower = better," so a well-calibrated cost should give ρ near +1.
+
+| | pooled ρ (n=3000, all seeds mixed) | **mean of per-seed ρ** | per-seed range |
+|---|---:|---:|---|
+| baseline (frozen, no chart) | 0.206 (p≈5e-30) | **−0.072** | −0.453 to +0.373 |
+| `ln_act`/R2 (`e0_v3_dataset`) | 0.227 (p≈3e-36) | **−0.051** | −0.441 to +0.340 |
+
+**The per-seed ρ swings from strongly, significantly negative to strongly, significantly positive
+depending on which (state, goal) task instance it is — for the untouched frozen baseline, not just
+the chart.** Several seeds show highly significant *inverted* rankings (the action CEM's cost rates
+best is, by real physics, one of the worst; e.g. seed 7: ρ=−0.453, p=1.4e-16) while others show real
+positive tracking (seed 5: ρ=0.373, p=2.6e-11). **Averaged across seeds, both kinds land slightly
+negative — essentially no reliable within-task ranking signal**, despite `ln_act` having a real,
+measured UMF advantage over the frozen baseline (0.336 vs baseline's own, higher, UMF at this
+regime).
+
+**Why the pooled number (0.21–0.23, both highly significant) is the wrong number to read as "the
+result":** pooling all 3000 candidates across 10 different tasks mixes *across-task* variance
+(harder tasks tend to have both higher absolute cost and higher absolute true distance, which
+correlates the two in aggregate) with *within-task* ranking quality. What CEM's `argmin` actually
+needs, every single replan, is the within-task number — does cost correctly order *this task's*
+300 candidates — and that is the per-seed statistic, which sits at ≈0.
+
+**Baseline and `ln_act`'s per-seed ρ track each other closely — same sign in 9 of 10 seeds, similar
+magnitude every time** (e.g. seed 7: baseline −0.453 / `ln_act` −0.441; seed 5: baseline 0.373 /
+`ln_act` 0.340). **Whatever determines ranking quality here is a property of the task instance
+(which state/goal pair, which specific 300-candidate draw), not something the chart meaningfully
+changes** — `ln_act` neither fixes nor worsens the frozen model's cost-ranking instability. This is
+consistent with, and gives a concrete mechanism for, the UMF-vs-planning-success dissociation: a
+chart can reduce open-loop rollout error (UMF) while the planner's actual candidate ranking — the
+thing CEM literally uses to choose an action — remains just as unreliable as it was frozen.
+
+**Scope, stated plainly:** this measures CEM's **iteration-0** candidates — the raw prior draw
+(mean=0, std=var_scale) — not the **iteration-30** elite/converged set CEM actually executes from.
+`--iterations 1` was used deliberately (this diagnostic only ever reads iteration-0's captured
+costs regardless of how many iterations run, so cutting to 1 saves 29/30 of the compute for free) —
+this measures the search's *starting* cost landscape, not its refined endpoint. One regime (R2),
+one chart kind (`ln_act`). Ran locally (no GPU contention with the concurrent Modal jobs), verified
+against a corrupted-download-style check (JSON re-loaded and parsed before trusting the printed
+numbers).
+
+Artifacts: `atlas_out/cost_ranking_R2/cost_ranking_R2_seeds0-1-2-3-4-5-6-7-8-9.json` (per-seed +
+pooled summary; raw per-candidate costs/distances are not retained past the run, only the summary
+statistics — re-run to regenerate raw data if needed).
+
+---
+
+## 🟢 TRAINING-SIZE SCALING CURVE (2026-08-26) — COMPLETE: UMF improves monotonically with data; planning success stays flat at every size
+
+**Framing, stated explicitly per this file's own "E0 CLOSED" section below: this is a capacity-ceiling
+probe, not a claim that the chart got better.** Every chart in this project (including the N=100
+result above) was trained on 20 real trajectories, a number that was never varied — `full`'s
+failure is already scoped in this file as "confounded with training-set size." This closes that
+confound for `ln_act`/R2, the one arm with any positive signal at all: same recipe as the existing
+20-trajectory chart (`atlas_out/e0_v3_dataset`) — real demo replay under the calibrated R2 regime
+(`{"damping": 0.5}`), `--train-traj-len 25 --num-val-trajs 8`, early stopping — with only
+`--num-train-trajs` varied (60, then 100; 200 was planned but 100 was substituted per a live
+decision to prioritize the paired N=40 planning re-eval over a fourth training-size data point).
+
+| Trajectories | Train loss | Eval loss | **Eval UMF** | Early-stopped at (best step) |
+|---|---:|---:|---:|---|
+| 20 (existing, `e0_v3_dataset`) | 0.131 | 0.338 | **0.3357** | not recorded (no saved loss curve) |
+| 60 (`e0_train_sweep_60`) | 0.107 | 0.298 | **0.3023** | step 325 (best: 200) |
+| 100 (`e0_train_sweep_100`) | 0.101 | 0.264 | **0.2678** | step 550 (best: 425) |
+
+**UMF falls monotonically with more data — no sign of saturation yet at 5×.** Whether this
+converts to planning success is the open question this table cannot answer by itself (the
+established UMF-vs-SR dissociation — this file's N=100 section above, Kendall τ significant
+within-arm but the chart-vs-baseline planning gap sits at CI [−9,+7]pp — means a falling UMF is
+not evidence of anything about SR on its own). A real full-batch-per-step training loop
+(`atlas/harness.py::run_e0_finetune`, `for traj in trajectories: ...` every step) means step count
+and epoch count are identical; the 2000-step ceiling was never approached at any size.
+
+**Both charts' N=40 planning re-evals are DONE — the cleanest possible outcome for the dissociation
+story, at every training-data size tested.** Paired against this file's existing
+`e0_planning_n100/baseline_R2.jsonl`'s first 40 episodes (same seeds, pairing verified exactly —
+0.000000px mismatch every time, no need to re-run baseline):
+
+| Chart | SR | Δ vs baseline | 95% CI | McNemar |
+|---|---:|---|---|---|
+| `ln_act`/R2, 20 traj (existing, N=100) | 43.0% | −1.0pp | [−9.0, +7.0] | p=1.000 (b=8, c=9) |
+| `ln_act`/R2, 60 traj (N=40) | 40.0% (16/40) | 0.0pp | [−12.5, +12.5] | p=1.000 (b=3, c=3) |
+| `ln_act`/R2, **100 traj (N=40)** | **42.5% (17/40)** | **+2.5pp** | **[−12.5, +17.5]** | **p=1.000 (b=5, c=4)** |
+
+**Every CI comfortably spans zero, every McNemar discordant-pair count is essentially symmetric
+(8/9, 3/3, 5/4), at 1x, 3x, and 5x the original training data — while UMF fell monotonically the
+entire time (0.336 → 0.302 → 0.268).** This is the strongest form of the dissociation result in the
+whole project: across a 5x range of training-data budget, more data reliably buys a better offline
+predictive-fitness score and reliably buys nothing in planning success. Kendall τ(UMF, success)
+stays significant and negative within every arm (baseline −0.406, 20-traj-arm-implied via N=100
+above, 60-traj: −0.510 p=0.0002, 100-traj: −0.402 p=0.0036) — UMF keeps predicting success *within*
+an arm while being simultaneously useless for predicting whether *more training data* moves SR.
+Combined with the cost-ranking diagnostic above (baseline's own cost-vs-outcome ranking is already
+near-zero and task-dependent, not something training data volume touches), this is a coherent,
+three-way-converging mechanism: the offline metric improves, the within-episode UMF-success link
+holds, and none of it touches the planner's actual candidate ranking — because that ranking was
+never what any of these training runs optimised.
+
+Artifacts: `atlas_out/e0_train_sweep_{60,100}/` (chart `.pt`, `results.json`, loss curves, seed
+manifest — downloaded locally, verified to load without corruption) and
+`atlas_out/e0_planning_sweep_{60,100}/ln_act_R2.jsonl` (merged, 40 episodes each) +
+matching `_summary.json`. **Operational note, both runs:** the merges had to be done manually — the
+local `modal run --detach` launchers that were supposed to auto-merge each pair of shards on
+completion got killed partway through this session (unrelated to the GPU work itself, which
+finished and committed fine both times); shard files were pulled from the volume and merged after
+the fact via `scripts/merge_planning_shards.py`. If any future sharded run's local launcher dies
+mid-flight (a real risk with `--detach` — it protects the remote GPU containers, not the local
+orchestrating script), check for a missing merged `{kind}_{regime}.jsonl` before trusting one exists.
+
+---
+
+## 🟢 N=100 POWER CONFIRMATION (2026-08-26) — the null replicates at 5× power; UMF-vs-success dissociation now significant within-arm
+
+**The single biggest open methodological hole in the "E0 CLOSED" section below — every planning
+comparison sat at N=20, giving CIs of roughly ±15–20pp against a 5pp headline effect — is now
+closed.** Re-ran baseline vs. `ln_act`/dataset on R2 at **N=100 paired episodes**, same protocol,
+same chart, same substrate config (`num_samples=300, iterations=30, horizon=6,
+num_act_stepped=6` — nas=6, unchanged from every other number in this file). Only N changed.
+
+Pairing verified exactly, not just assumed: `init_block_pos_diff` matches to 6 decimal places
+across all 100 episode indices between arms (max mismatch = 0.000000px) — both arms drew the
+identical (init, goal) pair per seed.
+
+| Arm | SR | Δ vs baseline | 95% CI (paired bootstrap) | McNemar |
+|---|---:|---|---|---|
+| baseline (`c0`) | 44.0% (44/100) | — | — | — |
+| `ln_act`/dataset | 43.0% (43/100) | **−1.0pp** | **[−9.0, +7.0]** | p=1.000 (b=8, c=9) |
+
+**This is a well-powered null, not an inconclusive one.** The N=20 result above read +5.0pp with
+a CI wide enough that a reviewer could plausibly argue "underpowered, retest before trusting the
+negative." At 5× the sample the CI has roughly halved (±8pp vs. ±15–20pp) and the point estimate
+itself lands almost exactly on zero, with McNemar's discordant pairs nearly symmetric (8 vs. 9 —
+noise, not a directional effect in either direction). The chart does not help on R2. This
+replicates, it doesn't just fail to reject.
+
+**Both arms individually show a real, significant UMF-vs-success relationship** — episode-level
+UMF was logged for every replan this run (new capability, piggybacks on the same episodes, no
+extra CEM cost): Kendall τ(UMF, success) = **−0.406** (baseline, n=92, p<0.0001) and **−0.449**
+(`ln_act`, n=94, p<0.0001). Negative sign is the expected direction (higher UMF = worse
+prediction = lower success). This is the first *statistically significant* UMF-vs-success
+correlation in the project, and it upgrades the dissociation story from 5 arm-level points to
+~186 real episode-level ones: **UMF predicts success within an arm, but selecting the
+lower-UMF chart across arms doesn't move success at all.** That's the mechanism worth leading
+the paper's dissociation figure with.
+
+**Scope, explicitly:** this settles the *power* objection, not the *horizon* one. Every episode
+here is still nas=6 (one open-loop 30-step replan) — it says nothing about whether closed-loop
+replanning would change the outcome. **Update:** nas=2 was subsequently run (this file's top
+section) — N=20, directionally positive (+10pp) but not itself significant. Don't conflate the two
+results; each has its own scope note.
+
+Artifacts: `atlas_out/e0_planning_n100/{baseline_R2,ln_act_R2}.jsonl` (per-episode, includes
+`umf_per_replan`/`umf_mean` — new fields, not present in any earlier E0 planning run) +
+matching `_summary.json` files (Kendall τ computed there too). Produced via
+`scripts/run_e0_planning.py`'s new `--episode-start`/`--out-suffix` sharding
+(`scripts/merge_planning_shards.py` combines them) driven by
+`modal/modal_e0_planning.py::main --num-shards 4` — 4 concurrent L4 containers per arm.
+
+---
+
+## 🟢 E0 CLOSED (2026-08-26) — three rescue hypotheses tested, all three rejected
+
+The pre-registered P3 test failed (below). Three follow-up hypotheses for *why* were each
+cheaply testable, and each was tested and rejected. **E0 is complete; no further chart training
+is planned on this substrate/regime.** The project's next and last experiment is **E2**
+(routing/selector quality against a real two-regime library), not E1 (see "What's next" below).
+
+**The five-arm R2 matrix, all paired on the identical 20 episodes, `regime_config ==
+{"damping": 0.5}` confirmed in every arm's `e0_seed_manifest.json`:**
+
+| Arm | Params | SR | Δ vs baseline | Knock-aways | Mean progress | Zero-contact |
+|---|---:|---:|---|---:|---:|---:|
+| baseline (`c0`) | 0 | 45.0% (9/20) | — | 5/20 | +19.6px | 0 |
+| **`ln_act`/dataset** | 10,764 | **50.0% (10/20)** | +5.0pp, CI [0, +15] | **2/20 (best)** | **+37.3px (best)** | 0 |
+| `lora4`/dataset | 118,176 | 40.0% (8/20) | −5.0pp, CI [−20, +10] | 4/20 | +29.9px | 0 |
+| `ln_act`/closed_loop | 10,764 | 35.0% (7/20) | −10.0pp, CI [−30, +10] | 6/20 (worst, tied) | +10.8px | 1 |
+| `full`/dataset | 20,800,884 | 20.0% (4/20) | **−25.0pp, CI [−45, −10]** | 6/20 (worst, tied) | **−2.9px** | **3** |
+
+### Hypothesis 1 — capacity. Rejected.
+
+10.7k → 118k → 20.8M parameters: success rate falls **monotonically** above the smallest chart.
+Full detail: the P4 section immediately below.
+
+### Hypothesis 2 — training signal quality. Rejected.
+
+Three data-collection strategies for `ln_act`, in increasing sophistication:
+**`dataset`** (blind replay of real recorded actions) → **`hybrid`** (real init state, reactive
+scripted heuristic, 40.0%) → **`closed_loop`** (real init state, actions from the live CEM
+planner itself replanning every model chunk against the shifted physics — the only source whose
+trajectories contain the model's *own* overshoot and its own attempted correction).
+
+The most sophisticated collector scored **worst of the three**: 35.0% SR, 6/20 knock-aways
+(worse than the 5/20 baseline it was meant to improve on), and the only arm besides `full` to
+produce a zero-contact episode. `closed_loop − ln_act/dataset` = −15.0pp (CI [−35, +5]) — the
+largest gap measured against the best-performing arm in the whole project. On-policy data was
+the most theoretically promising remaining lever tried; it made things worse, not better.
+
+**A methodology note, not a result:** `closed_loop`'s offline eval UMF (0.4233) is **not**
+comparable to `ln_act`/dataset's 0.336 or `lora4`'s 0.329 — those two share an eval distribution
+(dataset replay); `closed_loop`'s eval trajectories come from live planner rollouts, a
+plausibly harder distribution on its own terms. The internally-valid comparison (each arm's own
+train→eval loss ratio) puts `closed_loop` at 4.2×, mid-pack — not an outlier. **Only the paired
+planning success rate, identical protocol across every arm, is what actually settled this.**
+
+**A live, unverified hypothesis for *why* the best-collector-so-far did worst:** `closed_loop`'s
+collection budget was deliberately cheap (CEM 100×10, vs. eval's validated 300×30 — collection
+needs reactive trajectories, not optimal ones, and cost is linear in both). The chart may have
+learned to imitate a noisier, less competent recovery than the eval-time planner (300×30) would
+ever need. Plausible, not tested.
+
+### Hypothesis 3 — the UMF metric itself. Rejected.
+
+Reported the same day: localizing UMF to only the moving tokens, an attempted fix for the
+UMF-vs-planning-success inversion already on record (§0.4/P3 — this substrate's UMF and
+planning success disagree), made the inversion **worse**, not better. UMF still discriminates
+coarsely — it correctly flagged `closed_loop` as worst-by-offline-UMF (0.4971 on a token-local
+recomputation), matching its near-worst SR — but not finely: it still ranks `lora4` above
+`ln_act`, backwards from the real planning result.
+
+### Two corrections to numbers already cited elsewhere in this file
+
+1. **`lora4`'s parameter count.** Every table below (and `atlas_out/e0_v6_R1/results.json`,
+   which reuses `Chart.n_params()`'s naive sum) can show **10,292,640** — that figure adds 12
+   frozen base-weight restore copies (10,174,464 elements, never trained) on top of the real
+   adapter. The correct trainable capacity, used in every capacity comparison in this file, is
+   **118,176** (12 × `lora_A` + 12 × `lora_B`). Do not carry the larger number into any
+   external write-up.
+2. **A local backup of `chart_full_R2.pt` was corrupted** (truncated mid-transfer by a batch
+   `modal volume get` loop hitting a shell timeout — `PytorchStreamReader failed reading file
+   data/17`). Re-pulled from the Modal volume and verified (`torch.load` succeeds). If you have
+   an older local `atlas_out/` clone, re-pull this file before trusting it.
+
+### R1 charts now exist (unblocks E2)
+
+`atlas_out/e0_v6_R1/chart_{ln_act,lora4}_R1.pt`, both trained and on the Modal volume:
+
+| Chart | Train loss | Eval loss | Eval UMF |
+|---|---:|---:|---:|
+| `ln_act` R1 | 0.0645 | 0.2479 | 0.2845 |
+| `lora4` R1 | 0.0438 | 0.2542 | 0.2876 |
+
+### E1 vs E2 — and E2 has already run
+
+E1's pre-registered gate needs an oracle-random SR gap ≥10pp to report anything at all. With
+every chart tested across five arms landing at or below the frozen baseline, that gap cannot
+plausibly clear 10pp regardless of routing algorithm — this was the day-one prediction in
+`E0_RECOVERY_PLAN.md` §0, and everything measured since has confirmed rather than overturned it.
+**E1 remains not worth running.**
+
+**E2 asked the different, still-open question — does a selector correctly route between regimes
+at all — and it has already run, using the R1 charts above. See `E2_RESULTS.md` for the full
+result: UMF-based routing passes decisively on R2 (Cell B accuracy 0.880 vs. S-dyn's 0.324) and
+correctly commits nothing on appearance-only shifts (Cell C). This is orthogonal to E0's
+failure — it validates the selector, not chart quality.** Not duplicated here; read that file.
+
+---
+
 ## 🔴 P4 CAPACITY MATRIX COMPLETE (2026-08-25) — E0 fails; capacity is not the bottleneck
 
 All four arms on calibrated **R2 (`{"damping": 0.5}`)**, N=20, P2d-filtered sampler,

@@ -4,37 +4,66 @@
 *Read `CLAUDE.md` first (it binds you), then `E0_RESULTS.md`'s 🟢 CURRENT section, then this.*
 *This file supersedes `E0_IMPLEMENTATION_PLAN.md`'s T9/T10 ordering. T1–T8 and T12 are done.*
 
-> **STATUS (2026-08-25): P0 ✅ P1 ✅ P2 ✅ P3 ✅ ran — and E0 FAILED its pre-registered test.**
-> Regimes settled: **R1 = friction 2.0**, **R2 = damping 0.5** (§0.3–§0.5). P3 on R2, N=20:
-> baseline 45.0%, `ln_act`/dataset **50.0% (+5pp, CI [0, +15])**, `ln_act`/hybrid 40.0%.
-> Neither clears ≥15pp with a CI excluding 0. **Full result and analysis: `E0_RESULTS.md`'s
-> 🔴 P3 DECISION POINT section (read it first) and §0.6 below.**
-> **R0 confound check ✅ resolved: R0 = 95.0% on the same sampler (+50.0pp over R2, CI
-> [+30, +70]).** Headroom is real. E0's honest metric is **normalised recovery = 1/10 = 10%**.
-> The "dilution" theory and its difficulty-ceiling proposal are **retracted** — R0 solves 7/7 of
-> the long-push episodes, which hold 6 of the 10 recoverable ones. See `E0_RESULTS.md`'s
-> 🟢 R0 CONFOUND CHECK section.
+> **STATUS (2026-08-26): E0 IS COMPLETE, and E2 HAS ALSO ALREADY RUN — read `E2_RESULTS.md`.**
+> Three independent rescue hypotheses for E0 tested; all three rejected. Regimes settled:
+> **R1 = friction 2.0**, **R2 = damping 0.5** (§0.3–§0.5). The pre-registered P3 test failed,
+> and every follow-up attempt to save it — bigger charts, better training data, a refined
+> metric — failed too. **Full closing analysis: §0.8 below.** Separately, **E2 (routing/selector
+> quality) has already run and found the project's one clean positive result: UMF-based routing
+> correctly discriminates a dynamics shift from an appearance shift on R2 (Cell B accuracy 0.880
+> vs. S-dyn's 0.324), while correctly committing nothing on appearance alone (Cell C). This is
+> orthogonal to E0's failure — it validates the *selector*, not the *library*: the chart it
+> routes to still doesn't improve planning success. Full detail, limitations, and the R1-vs-R2
+> mechanism: `E2_RESULTS.md`, not duplicated here.** If you are picking this project up fresh,
+> read `HANDOFF.md` first — it index-links every results doc and flags what's session-verified
+> vs. relayed.
 >
-> **P4 capacity matrix on R2, `dataset` source only — IN PROGRESS, and the result so far points
-> AWAY from capacity being the bottleneck.** `nas=1` diagnostic was launched, found to cost
-> ~6x nas=6's wall time (877.67s/ep, ~4h52m for 20 episodes — the "~50 min" estimate was wrong,
-> see §0.7), and was **cancelled by the user after 1/20 episodes** — no result from it exists.
-> The open capacity-vs-horizon question is being answered by P4 itself instead.
+> **The five-arm R2 matrix, all paired on the same 20 episodes, `{"damping": 0.5}` throughout:**
 >
-> **`lora4` result (ran 2026-08-25): capacity theory is disfavoured.** `lora4` (118k params) —
-> eval UMF 0.329 (marginally better than `ln_act`'s 0.336 offline) — scores **8/20 = 40.0% in
-> planning, WORSE than both baseline (45.0%) and `ln_act` (50.0%).** Knock-aways revert to 4/20
-> (near baseline's 5/20, worse than `ln_act`'s 2/20). Episode-level: `lora4` loses `ln_act`'s one
-> distinguishing win (ep17) and gains an unrelated one (ep19) — not a scaled-up version of
-> `ln_act`'s fix, looks like noise. Full analysis: §0.7 below.
+> | Arm | Params | SR | vs baseline | Knock-aways | Zero-contact |
+> |---|---|---|---|---|---|
+> | baseline (frozen) | 0 | 45.0% | — | 5/20 | 0 |
+> | **`ln_act`/dataset** | 10,764 | **50.0%** | +5.0pp (CI touches 0) | **2/20 (best)** | 0 |
+> | `lora4`/dataset | 118,176 trainable | 40.0% | −5.0pp | 4/20 | 0 |
+> | `ln_act`/closed_loop | 10,764 | 35.0% | −10.0pp | 6/20 (worst, tied) | 1 |
+> | `full`/dataset | 20,800,884 | 20.0% | −25.0pp (CI excludes 0) | 6/20 (worst, tied) | 3 |
 >
-> **`full` result: pending — planning evaluation launched 2026-08-25, in progress.** `full`'s
-> offline eval UMF (0.728, near the UMF≈1.0 "no better than static" ceiling despite the LOWEST
-> train loss of all three kinds — a clear overfit signature, 20.8M params on 20 trajectories)
-> already independently supports the same conclusion `lora4`'s planning result does. Running its
-> planning episodes anyway as the "cheap formality" §7.1's pre-registered rule requires (the rule
-> is defined relative to `full`'s gain, so E0 cannot be formally closed without this number
-> existing), not because a different outcome is expected.
+> **The two rescue hypotheses this matrix kills:**
+> - **Capacity** (10.7k → 118k → 20.8M): monotonically *worse* above the smallest chart.
+> - **Training signal** (open-loop replay → reactive-but-goal-blind hybrid → live on-policy CEM
+>   collection): the *most* sophisticated collector (`closed_loop`) scored worst of the three
+>   `ln_act` variants — worse knock-aways (6 vs. 2), worse mean progress (+10.8px vs. +37.3px),
+>   and the only arm besides `full` to produce a zero-contact episode. On-policy data was
+>   supposed to be the most promising remaining lever; it wasn't.
+> - **The metric** (reported same day, not independently re-run in this file's own session):
+>   localizing UMF to only the moving tokens was tried as a fix for the UMF-vs-success
+>   inversion (§0.4/§0.6 already noted UMF and planning success disagree in this substrate) —
+>   it made the inversion *worse*, not better. UMF still discriminates coarsely (it correctly
+>   flagged `closed_loop` as the worst offline UMF, 0.4971, matching its near-worst SR) but not
+>   finely (it still ranks `lora4` above `ln_act`, backwards from the real result).
+>
+> **Two corrections to numbers already in circulation, both now fixed:**
+> 1. **`lora4`'s reported parameter count was wrong.** `e0_v6_R1/results.json` (and by
+>    extension anything computed from `Chart.n_params()`'s naive sum) reports 10,292,640 —
+>    that figure sums ALL stored tensors, including 12 frozen base-weight copies
+>    (10,174,464 elements) kept only as restore references. The real trainable capacity is
+>    **118,176** (12 × `lora_A` + 12 × `lora_B`), which is what every capacity comparison in
+>    this file and in `E0_RESULTS.md` already used — do not let `results.json`'s raw number
+>    into any external write-up.
+> 2. **The local backup of `chart_full_R2.pt` was corrupted** (`PytorchStreamReader failed
+>    reading file data/17` — almost certainly truncated by a batch-download loop hitting a
+>    shell timeout mid-transfer). Re-pulled from the Modal volume and verified it now
+>    deserializes correctly (`torch.load` succeeds, `dict` with `kind`/`params` keys as
+>    expected). **If you have an older local clone of this repo's `atlas_out/`, re-pull this
+>    file before trusting it.**
+>
+> **R1 charts are now trained and on the volume** (`atlas_out/e0_v6_R1/chart_{ln_act,lora4}_R1.pt`),
+> unblocking E2 (needs a real `chart_R1` for library index 1, not a placeholder):
+>
+> | Chart | Train loss | Eval loss | Eval UMF |
+> |---|---|---|---|
+> | `ln_act` R1 | 0.0645 | 0.2479 | 0.2845 |
+> | `lora4` R1 | 0.0438 | 0.2542 | 0.2876 |
 
 ---
 
@@ -430,6 +459,72 @@ compounding is also a contributing factor. **If a future session wants this diag
 McNemar, and knock-aways. This contradicts the expectation recorded in §0.1/P2b that
 closed-loop data would better represent deployment — recorded as a negative result, and it
 means `--data-source dataset` stays the default.
+
+### 0.8 `closed_loop` result (ran 2026-08-26) — **E0 is complete; three rescue hypotheses, three rejections**
+
+**Training.** `ln_act` trained on `closed_loop`-collected data: the live CEM planner (frozen,
+pristine predictor — no chart applied during collection) replans against the shifted R2
+physics every model chunk (`num_act_stepped=1`), so the resulting 20 train + 8 val trajectories
+contain the model's own real overshoot *and* its own attempted correction — the ingredient
+`dataset` (blind replay) and `hybrid` (reactive but from an unrelated scripted heuristic, not
+the model itself) both structurally lack. Collection budget deliberately cheaper than eval
+(100×10 vs. the substrate's validated 300×30 — collection needs reactive trajectories, not
+optimal ones; documented deviation, ~180 CEM searches total). Confirmed
+`regime_config == {"damping": 0.5}` via `e0_seed_manifest.json` before evaluating. Smoke-tested
+first (2 train + 1 val trajectories, ~8 min): contact rate 3/3, confirmed the collector was
+genuinely interacting with the shifted physics before the real 20+8 run was launched.
+
+**A methodology note for offline-metric comparisons across data sources:** `closed_loop`'s
+offline eval UMF (0.4233) is **not directly comparable** to `ln_act`/dataset's 0.336 or
+`lora4`'s 0.329 — those two share the same eval distribution (dataset-replay trajectories),
+while `closed_loop`'s eval set is drawn from live planner rollouts, plausibly a harder
+distribution (more varied, more extreme states) on its own terms. A higher UMF there is not by
+itself evidence of a worse chart. The one internally-valid comparison is each arm's own
+train→eval loss ratio (a generalisation-gap proxy): `closed_loop` sits at 4.2×, `ln_act`/dataset
+at 2.6×, `lora4` at 5.9×, `full` at 17.0× — `closed_loop` is not an outlier on this axis. **The
+only number that actually resolves anything is planning success, evaluated identically across
+every arm** (see table in the status banner above).
+
+**Planning result: 7/20 = 35.0%, worse than baseline (45.0%) and worse than `ln_act`/dataset
+(50.0%).** `closed_loop − baseline` = −10.0pp, CI [−30%, +10%]; `closed_loop − ln_act/dataset` =
+−15.0pp, CI [−35%, +5%] — both touch zero, but both point the wrong direction for the
+hypothesis. Knock-aways: 6/20, tied with `full` for the worst of any arm — the exact mechanism
+`closed_loop` was built to fix (recovering from overshoot) got *worse*, not better. Episode-level:
+baseline beat `closed_loop` on 3 episodes it previously lost (1, 4, 8); `closed_loop` only won
+back 1 (19) — a losing trade, the inverse of `ln_act`/dataset's clean superset pattern (§0.6).
+All 20 episodes confirmed paired (`init_block_pos_diff` identical) against every other R2 arm.
+
+**Why the most sophisticated data source did worst is itself informative, not just a null
+result.** A speculative but consistent reading: `closed_loop`'s collector used a cheap CEM
+budget (100×10) specifically so collection stayed affordable — but that means the "corrections"
+in its training data are themselves drawn from a *weaker* planner than the one ultimately being
+evaluated (300×30). The chart may have learned to imitate a noisier, less competent recovery
+attempt than the eval-time planner would ever need. This is a plausible explanation, not a
+verified one — nothing in this session tested it directly.
+
+**Combined with capacity (§0.7) and the metric refinement mentioned in the status banner, this
+closes out the three live explanations for E0's failure that this project could identify and
+cheaply test.** None rescues it. `ln_act`/dataset remains the best-performing arm found, with a
+real but small (+5pp, not statistically significant at N=20) effect — the finding stands as:
+**no capacity level, no data-collection strategy, and no cheap metric refinement recovers
+planning competence on this substrate under a damping shift.** Per `CLAUDE.md` §1.8, this is
+reported as the result, not chased further with a fourth speculative fix.
+
+**Local-artifact hygiene, discovered during this close-out (see status banner for the fix):**
+`chart_full_R2.pt`'s local backup was corrupted (truncated by a batch `modal volume get` loop
+hitting a shell timeout mid-transfer) and has been re-pulled and verified. `lora4`'s
+`Chart.n_params()`-derived parameter count (10,292,640, still what `e0_v6_R1/results.json`
+reports) double-counts 12 frozen base-weight restore copies; the real trainable capacity used
+throughout every table in this file and `E0_RESULTS.md` is the correct **118,176**.
+
+**What's next: E2, not E1.** E1 requires an oracle-random SR gap ≥10pp to report anything —
+with every chart tested landing at or below baseline, that gap will not clear 10pp regardless of
+routing algorithm (see the original day-one argument in §0, now confirmed rather than
+overturned by everything since). **E2 tests something different and still open**: given a
+library with a real (if weak) `chart_R1` and `chart_R2`, does a selector correctly route between
+regimes at all — a question about the *selection mechanism*, not chart quality, and the one
+claim in the proposal E0 has not already settled. R1 charts (`ln_act`, `lora4`, both trained,
+on the volume at `atlas_out/e0_v6_R1/`) unblock this at an estimated ~$1 of Modal spend.
 
 ### 0.2 Execution rules
 
@@ -959,7 +1054,16 @@ skipped. Do not let `--all` read as a clean pass while G1 is vacuous.
 - Do not reuse §0.5's 86.7 / 66.7 / 46.7 as P3/P4 baselines — they predate P2d's reachability
   filter. Re-measure via P3's `c0` arm.
 - Do not change any `CLAUDE.md` §1.7 hyperparameter.
-- Do not run E1 before P3 passes and P5 lands.
+- **Do not run E1.** E0 is complete (§0.8) and failed under every variant tested (capacity,
+  data source, metric refinement) — the oracle-random gap E1 needs (≥10pp) will not clear that
+  bar with charts that don't beat baseline. This is settled, not pending.
 - Do not use `atlas_out/e0/*.pt` (pre-rollout-fix, invalidated) for anything but wiring smoke
   tests.
+- Do not use a local `atlas_out/e0_v4_full/chart_full_R2.pt` without re-pulling it from the
+  Modal volume first — the original local copy was corrupted (§0.8); a re-pull has been
+  verified to load correctly.
+- Do not cite `Chart.n_params()`'s raw sum for `lora4` (10,292,640, still what
+  `e0_v6_R1/results.json` reports) as its capacity — it double-counts 12 frozen base-weight
+  restore copies. The real trainable capacity, used everywhere else in this file and
+  `E0_RESULTS.md`, is **118,176** (§0.8).
 - Do not `git commit` or `git push`.
