@@ -254,3 +254,75 @@ def run_e0_train_entrypoint(kinds: str = "ln_act", regimes: str = "R1",
                          data_source=data_source, data_split=data_split,
                          out_subdir=out_subdir, collect_num_samples=collect_num_samples,
                          collect_iterations=collect_iterations)
+
+
+@app.function(
+    gpu="L4",
+    volumes={ATLAS_MOUNT_PATH: atlas_volume},
+    timeout=3600 * 4,
+)
+def run_e2(
+    cells: str = "A,B,C,D",
+    routers: str = "umf,sdyn",
+    episodes: int = 40,
+    seeds: int = 3,
+    traj_len: int = 50,
+    kind: str = "ln_act",
+    chart_regime: str = "R1",
+    corruption: str = "dark",
+    corruption_severity: float = 0.5,
+    dynamics_regime: str = "R1",
+    probe_q: int = 3,
+    probe_tau: float = 0.5,
+    charts_subdir: str = "e0_v6_R1",
+    out_subdir: str = "e2",
+) -> None:
+    """scripts/run_e2.py -- E2's 2x2 routing-accuracy grid.
+
+    No CEM planner: routing accuracy is a property of UMF scoring on an observed
+    chunk, so this is collection + scoring only and costs ~1 GPU-h rather than
+    plan 7.3's 6. See run_e2.py's module docstring for that deviation.
+
+    corruption defaults to 'dark', NOT plan 6.3's colour: colour_change was
+    measured to alter only ~5.6% of pixels on this env (Push-T renders are ~97%
+    white and an HSV hue rotation is a no-op on desaturated pixels), which would
+    let Cell C's committed==0 pass vacuously. 'dark' changes 100% -- the
+    conservative direction. run_e2.py reports the measured magnitude either way.
+
+    charts_subdir defaults to e0_v6_R1, the post-rollout-fix R1 charts; the
+    charts in atlas_out/e0 are the INVALIDATED pre-fix set.
+    """
+    import subprocess
+    import sys
+    atlas_volume.reload()
+    cmd = [sys.executable, "scripts/run_e2.py",
+           "--cells", *cells.split(","),
+           "--routers", *routers.split(","),
+           "--episodes", str(episodes),
+           "--seeds", str(seeds),
+           "--traj-len", str(traj_len),
+           "--kind", kind,
+           "--chart-regime", chart_regime,
+           "--corruption", corruption,
+           "--corruption-severity", str(corruption_severity),
+           "--dynamics-regime", dynamics_regime,
+           "--probe-q", str(probe_q),
+           "--probe-tau", str(probe_tau),
+           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
+           "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+    subprocess.run(cmd, check=True, cwd="/src")
+    atlas_volume.commit()
+
+
+@app.local_entrypoint(name="run_e2")
+def run_e2_entrypoint(cells: str = "A,B,C,D", routers: str = "umf,sdyn",
+                       episodes: int = 40, seeds: int = 3, traj_len: int = 50,
+                       kind: str = "ln_act", chart_regime: str = "R1",
+                       corruption: str = "dark", corruption_severity: float = 0.5,
+                       dynamics_regime: str = "R1", probe_q: int = 3, probe_tau: float = 0.5,
+                       charts_subdir: str = "e0_v6_R1", out_subdir: str = "e2") -> None:
+    run_e2.remote(cells=cells, routers=routers, episodes=episodes, seeds=seeds,
+                   traj_len=traj_len, kind=kind, chart_regime=chart_regime,
+                   corruption=corruption, corruption_severity=corruption_severity,
+                   dynamics_regime=dynamics_regime, probe_q=probe_q, probe_tau=probe_tau,
+                   charts_subdir=charts_subdir, out_subdir=out_subdir)

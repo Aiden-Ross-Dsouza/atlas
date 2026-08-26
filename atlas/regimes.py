@@ -184,23 +184,49 @@ class VisualCorruption(gym.ObservationWrapper):
         severity:  Strength parameter (interpretation depends on kind).
     """
 
-    def __init__(self, env: gym.Env, kind: CorruptionKind, severity: float = 0.5) -> None:
+    def __init__(self, env: gym.Env, kind: CorruptionKind, severity: float = 0.5,
+                 seed: int = 0) -> None:
         super().__init__(env)
         if kind not in ("blur", "salt_pepper", "dark", "colour_change", "none"):
             raise ValueError(f"Unknown corruption kind: {kind!r}")
         self.kind = kind
         self.severity = severity
+        # Own RNG rather than a fresh default_rng() per frame: salt_pepper is
+        # otherwise non-reproducible, which silently breaks G5's paired-seed
+        # guarantee (two arms on the same seed would get different noise).
+        self._rng = np.random.default_rng(seed)
 
-    def observation(self, obs: np.ndarray) -> np.ndarray:
+    def reset(self, **kwargs):
+        # PushTEnv.reset() returns (obs, state), not a bare obs -- legacy
+        # gym.ObservationWrapper.reset() would hand that whole TUPLE to
+        # observation(). Same wrapper-API mismatch PhysicsRegime had.
+        out = self.env.reset(**kwargs)
+        if isinstance(out, tuple):
+            return (self.observation(out[0]),) + tuple(out[1:])
+        return self.observation(out)
+
+    def observation(self, obs):
         if self.kind == "none":
             return obs
+        # PushTEnv's obs is a dict {"visual": [H,W,3] uint8, "proprio": [...]}.
+        # Corrupt ONLY the image: proprio and physics must stay untouched, which
+        # is exactly what makes E2's Cell C an appearance-only shift.
+        if isinstance(obs, dict):
+            if "visual" not in obs:
+                return obs
+            out = dict(obs)
+            out["visual"] = _corrupt(np.asarray(out["visual"]), self.kind,
+                                     self.severity, self._rng)
+            return out
+        obs = np.asarray(obs)
         if obs.ndim == 1:
             # Flattened; return as-is (not an image).
             return obs
-        return _corrupt(obs, self.kind, self.severity)
+        return _corrupt(obs, self.kind, self.severity, self._rng)
 
 
-def _corrupt(img: np.ndarray, kind: CorruptionKind, severity: float) -> np.ndarray:
+def _corrupt(img: np.ndarray, kind: CorruptionKind, severity: float,
+             rng: "np.random.Generator | None" = None) -> np.ndarray:
     """Apply a visual corruption to a uint8 image array [..., H, W, C] or [H, W, C]."""
     import cv2
 
@@ -210,7 +236,7 @@ def _corrupt(img: np.ndarray, kind: CorruptionKind, severity: float) -> np.ndarr
         img = cv2.GaussianBlur(img, (ksize, ksize), 0)
 
     elif kind == "salt_pepper":
-        rng = np.random.default_rng()
+        rng = np.random.default_rng() if rng is None else rng
         mask = rng.random(img.shape[:2])
         img[mask < severity / 2] = 0
         img[mask > 1 - severity / 2] = 255
@@ -232,6 +258,7 @@ def build_env(
     regime: RegimeName = "R0",
     corruption: CorruptionKind = "none",
     corruption_severity: float = 0.5,
+    corruption_seed: int = 0,
 ) -> gym.Env:
     """
     Compose a Push-T environment with the specified regime and visual corruption.
@@ -247,5 +274,5 @@ def build_env(
     """
     env = PhysicsRegime(base_env, regime)
     if corruption != "none":
-        env = VisualCorruption(env, corruption, corruption_severity)
+        env = VisualCorruption(env, corruption, corruption_severity, seed=corruption_seed)
     return env

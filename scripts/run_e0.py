@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Literal
 
 import torch
+from tqdm import tqdm
 import atlas
 from atlas.chart import Chart, ChartKind
 from atlas.harness import run_e0_finetune, log_episode
@@ -70,7 +71,7 @@ def _load_pusht_demo_dataset(split: str = "train"):
     return states, rel_actions, seq_lengths
 
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None) -> list[dict]:
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None, corruption: str = "none", corruption_severity: float = 0.5) -> list[dict]:
     """
     Collects real trajectories from PushTEnv under the specified regime and
     encodes them through the frozen vision backbone.
@@ -196,7 +197,8 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
             )
 
     trajectories = []
-    for traj_idx in range(num_trajs):
+    traj_pbar = tqdm(range(num_trajs), desc=f"collect_{source}_{regime}", unit="traj")
+    for traj_idx in traj_pbar:
         for attempt in range(max_tries):
             seed = seed_base + traj_idx * max_tries + attempt
             rs = np.random.RandomState(seed)
@@ -208,6 +210,13 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
             # it) -- see E0_IMPLEMENTATION_PLAN.md T3.
             base_env = PushTEnv(render_size=224, with_velocity=True)
             env = PhysicsRegime(base_env, regime)
+            if corruption != "none":
+                # E2 only: appearance shifts on top of (or instead of) a physics
+                # shift. Wraps OUTSIDE PhysicsRegime so physics is untouched --
+                # the corruption only rewrites obs["visual"] on its way out.
+                # Seeded per trajectory so paired arms see identical noise.
+                from atlas.regimes import VisualCorruption
+                env = VisualCorruption(env, corruption, corruption_severity, seed=seed)
 
             episode_idx: int | None = None
             offset: int | None = None
@@ -280,6 +289,14 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
                 # this collector exists to replace.
                 n_chunks = traj_len // frameskip
                 for chunk_idx in range(n_chunks):
+                    # Each chunk is a full CEM search (collect_num_samples x
+                    # collect_iterations candidates) -- by far the slowest step
+                    # in this branch, and otherwise invisible until the whole
+                    # trajectory finishes. Surface it on the outer traj_pbar
+                    # rather than a nested bar, since num_trajs/n_chunks is
+                    # normally small and a second bar would just add noise.
+                    traj_pbar.set_postfix(chunk=f"{chunk_idx + 1}/{n_chunks}",
+                                          contacts=total_contacts, attempt=attempt + 1)
                     obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
                     act_chunk = agent.act(obs_td, steps_left=max(n_chunks - chunk_idx, 1))
                     # [1, frameskip*2] -> [frameskip, 2] raw env actions, matching

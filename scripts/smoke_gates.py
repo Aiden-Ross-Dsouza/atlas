@@ -48,45 +48,87 @@ def _make_synthetic_proprio_ctxt(wm, grid: int, device) -> torch.Tensor | None:
     return proprio_ctxt
 
 
-def gate_g1(predictor, encoder, env) -> None:
-    """G1: Library {c₀} only must be bit-identical to frozen baseline."""
+def gate_g1(wm, wrapper) -> None:
+    """G1: an identity-initialised chart must change NOTHING.
+
+    Rewritten (the previous version tested nothing it claimed to): it built a
+    Chart, never applied it, never called the model, and compared two env
+    rollouts driven by SEPARATE unseeded action_space.sample() draws -- so it
+    could only ever have compared different action sequences against each
+    other. It also used gymnasium's reset(seed=)/5-tuple step() against this
+    legacy-gym env.
+
+    What identity actually means here, and what is checked below:
+      1. apply_() of a freshly-cloned chart (LoRA B=0, LN at pretrained values)
+         leaves the predictor's OUTPUT bit-identical -- torch.equal, not
+         allclose. This is CLAUDE.md 1.4's non-negotiable.
+      2. restore_() puts every predictor tensor back bit-identically, so charts
+         cannot contaminate each other (the leak that invalidated E0's first
+         chart set).
+    Runs headless on synthetic latents -- no env needed, so it executes under
+    --all instead of being permanently skipped.
+    """
     print("G1: identity chart bit-identity check...", end=" ")
+    predictor = wm.predictor
+    grid = wm.grid_size
+    D = 384
+    N = grid * grid
+    device = next(predictor.parameters()).device
 
-    # Build c₀ from the current predictor state (pretrained, untouched).
-    c0 = Chart(predictor, kind="ln_act")
-    library = Library(c0, max_size=1)
+    pristine = {k: v.detach().clone() for k, v in predictor.state_dict().items()}
 
-    # Collect a short rollout with c₀ active.
-    obs, _ = env.reset(seed=42)
-    obs_c0 = [obs]
-    with torch.no_grad():
-        for _ in range(5):
-            action = env.action_space.sample()
-            obs, _, done, trunc, _ = env.step(action)
-            obs_c0.append(obs)
-            if done or trunc:
-                break
+    # Fixed synthetic context + action: identical inputs across all three
+    # forwards below, so any output difference is attributable to the chart.
+    torch.manual_seed(0)
+    z = torch.randn(1, 1, 1, grid, grid, D, device=device)
+    a_raw = torch.randn(1, 1, wm.action_dim, device=device)
 
-    # Collect the SAME rollout with NO chart (frozen baseline).
-    env.reset(seed=42)
-    obs_frozen = [obs_c0[0]]  # same start
-    with torch.no_grad():
-        for _ in range(5):
-            action = env.action_space.sample()
-            obs, _, done, trunc, _ = env.step(action)
-            obs_frozen.append(obs)
-            if done or trunc:
-                break
+    def _forward():
+        with torch.no_grad():
+            act_feats = wm.encode_act(a_raw)
+            prop_feats = None
+            if getattr(wm, "proprio_encoder", None) is not None:
+                prop_dim = wm.proprio_encoder.embed_dim
+                prop_feats = torch.zeros(1, 1, 1, prop_dim, device=device)
+                if getattr(wm, "proprio_encoding", None) == "feature":
+                    prop_feats = prop_feats.repeat(1, 1, grid * grid, 1)
+            pred_vis, _, _ = wm.forward_pred(z, act_feats, prop_feats)
+        return pred_vis.reshape(N, D)
 
-    # Since c₀ initialises to pretrained weights and apply_/restore_ are correct,
-    # predictions must be identical.
-    import numpy as np
-    for i, (o_c0, o_fr) in enumerate(zip(obs_c0, obs_frozen)):
-        if not np.allclose(o_c0, o_fr, atol=0.0):
+    out_frozen = _forward()
+
+    for kind in ("ln_act", "lora4"):
+        c0 = Chart(predictor, kind=kind)
+        c0.apply_(predictor)
+        out_c0 = _forward()
+        if not torch.equal(out_frozen, out_c0):
+            max_abs = (out_frozen - out_c0).abs().max().item()
+            c0.restore_(predictor)
             raise AssertionError(
-                f"G1 FAILED: c0 observation at step {i} differs from frozen baseline. "
-                "check chart.apply_() / restore_() implementation."
+                f"G1 FAILED: kind={kind} identity chart changed the predictor "
+                f"output (max |diff| = {max_abs:.3e}, required exactly 0). "
+                "A freshly-cloned chart must be a no-op -- check Chart.apply_() "
+                "and the kind's identity initialisation (LoRA B=0, LN at "
+                "pretrained values)."
             )
+        c0.restore_(predictor)
+
+        after = predictor.state_dict()
+        for k, v0 in pristine.items():
+            if not torch.equal(v0, after[k]):
+                raise AssertionError(
+                    f"G1 FAILED: kind={kind} restore_() did not return "
+                    f"predictor tensor {k!r} to its pretrained value -- charts "
+                    "would contaminate each other."
+                )
+
+        out_restored = _forward()
+        if not torch.equal(out_frozen, out_restored):
+            raise AssertionError(
+                f"G1 FAILED: kind={kind} predictor output changed after "
+                "restore_() despite an identical state_dict."
+            )
+
     print("PASSED")
 
 
@@ -446,7 +488,7 @@ def main() -> None:
     # G5 does not require loading the model checkpoint
     run_gate("G5", gate_g5)
 
-    if run_all or run in ("G2", "G3a", "G3b", "G6"):
+    if run_all or run in ("G1", "G2", "G3a", "G3b", "G6"):
         import torch
         print("Loading dino_wm_pusht...")
         model, prep = torch.hub.load(
@@ -462,15 +504,16 @@ def main() -> None:
         for p in wm.encoder.parameters():
             p.requires_grad_(False)
 
+        run_gate("G1", gate_g1, wm, wrapper)
         run_gate("G2", gate_g2, wm, wrapper)
         run_gate("G3a", gate_g3a, wm, wrapper)
         run_gate("G3b", gate_g3b, wm, wrapper)
         run_gate("G6", gate_g6, wm, wrapper)
 
-    if run_all or run in ("G1", "G4"):
-        print("\nNote: G1 and G4 require a running Push-T environment.")
-        print("Integrate these gates with the jepa-wms env setup (see README §Setup).")
-        print("Skipping G1, G4 in headless mode.")
+    if run_all or run == "G4":
+        print("\nNote: G4 requires a running Push-T environment.")
+        print("Integrate this gate with the jepa-wms env setup (see README Setup).")
+        print("Skipping G4 in headless mode.")
 
     if failed:
         print(f"\n{'='*40}")
