@@ -228,57 +228,80 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
 
 
 @app.function(
-    gpu="T4",  # 16GB @ $0.59/h -- same K=300 CEM search as run_e0_planning.py
-               # (measured 6.45GB peak there), plus K cheap CPU-only env
-               # rollouts per kind for the true-outcome side of the diagnostic.
+    gpu="L4",  # 24GB @ $0.80/h -- switched from T4 2026-08-27 per user request
+               # (L4 measured faster for this checkpoint's CEM workload in
+               # run_e0_planning.py, same reasoning applies here: same K=300
+               # candidate batch per seed, plus K cheap CPU-only env rollouts
+               # per kind for the true-outcome side of the diagnostic).
     volumes={ATLAS_MOUNT_PATH: atlas_volume},
-    timeout=3600,
+    timeout=3600 * 3,  # was 3600 -- at ~178s/seed, 20 seeds is ~3560s of pure
+                       # compute, plus model-load overhead pushes it over a
+                       # 1-hour timeout (confirmed the hard way 2026-08-27:
+                       # two dose-response jobs died at 19/20 and ~15/20
+                       # seeds respectively, and since this script only
+                       # writes its output ONCE AT THE END -- unlike
+                       # run_e0_planning.py's resumable per-episode writes --
+                       # a timeout this close to the true runtime loses
+                       # EVERY completed seed, not just the unfinished one).
 )
 def diagnose_cem_costs(
     kinds: str = "baseline,ln_act",
     regime: str = "R1",
-    seed: int = 0,
+    regime_config: str | None = None,
+    seeds: str = "0",
     num_samples: int = 300,
     iterations: int = 30,
     horizon: int = 6,
     num_act_stepped: int = 6,
+    capture_iteration: str = "first",
     charts_subdir: str = "e0",
     out_subdir: str = "cost_ranking",
 ) -> None:
-    """scripts/diagnose_cem_costs.py -- cost-ranking diagnostic: for ONE fixed
-    (init, goal) pair, captures CEM's iteration-0 per-candidate costs under
-    each kind (same K candidates every kind, by construction), rolls all K
-    out for real in the env to get each candidate's TRUE final block
-    distance, and reports Spearman rho(cost, true_dist) per kind -- the
-    mechanism figure for why UMF and planning success can dissociate even
-    when UMF looks good. kinds: comma-separated, e.g. 'baseline,ln_act'."""
+    """scripts/diagnose_cem_costs.py -- cost-ranking diagnostic: for each
+    fixed (init, goal) pair (one per seed in `seeds`, comma-separated, e.g.
+    '0,1,2,3,4,5,6,7,8,9'), captures a CEM candidate batch under each kind
+    (same K candidates every kind, by construction, in capture_iteration=
+    'first' mode only), rolls all K out for real in the env to get each
+    candidate's TRUE final block distance, and reports Spearman
+    rho(cost, true_dist) per kind -- the mechanism figure for why UMF and
+    planning success can dissociate even when UMF looks good. kinds:
+    comma-separated, e.g. 'baseline,ln_act'. capture_iteration: 'first'
+    (default, iteration-0 raw draw) or 'last' (final/converged population --
+    OPUS_REMAINING_TASKS.md C.25). regime_config (added 2026-08-27, for the
+    dose-response sweep): JSON dict overriding this regime's default physics
+    param, e.g. '{"damping": 0.25}' for an intermediate severity between
+    R0's implicit 0 and R2's default 0.5 -- same mechanism as
+    run_e0_planning.py's identical flag."""
     import subprocess
     import sys
     atlas_volume.reload()
-    subprocess.run(
-        [sys.executable, "scripts/diagnose_cem_costs.py",
-         "--kinds", *kinds.split(","),
-         "--regime", regime,
-         "--seed", str(seed),
-         "--num-samples", str(num_samples),
-         "--iterations", str(iterations),
-         "--horizon", str(horizon),
-         "--num-act-stepped", str(num_act_stepped),
-         "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
-         "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"],
-        check=True,
-        cwd="/src",
-    )
+    cmd = [sys.executable, "scripts/diagnose_cem_costs.py",
+           "--kinds", *kinds.split(","),
+           "--regime", regime,
+           "--seeds", *seeds.split(","),
+           "--num-samples", str(num_samples),
+           "--iterations", str(iterations),
+           "--horizon", str(horizon),
+           "--num-act-stepped", str(num_act_stepped),
+           "--capture-iteration", capture_iteration,
+           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
+           "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+    if regime_config is not None:
+        cmd += ["--regime-config", regime_config]
+    subprocess.run(cmd, check=True, cwd="/src")
     atlas_volume.commit()
 
 
 @app.local_entrypoint(name="diagnose_cem_costs")
-def diagnose_cem_costs_entrypoint(kinds: str = "baseline,ln_act", regime: str = "R1", seed: int = 0,
+def diagnose_cem_costs_entrypoint(kinds: str = "baseline,ln_act", regime: str = "R1",
+                                    regime_config: str | None = None, seeds: str = "0",
                                     num_samples: int = 300, iterations: int = 30, horizon: int = 6,
-                                    num_act_stepped: int = 6, charts_subdir: str = "e0",
+                                    num_act_stepped: int = 6, capture_iteration: str = "first",
+                                    charts_subdir: str = "e0",
                                     out_subdir: str = "cost_ranking") -> None:
-    diagnose_cem_costs.remote(kinds=kinds, regime=regime, seed=seed, num_samples=num_samples,
-                               iterations=iterations, horizon=horizon, num_act_stepped=num_act_stepped,
+    diagnose_cem_costs.remote(kinds=kinds, regime=regime, regime_config=regime_config, seeds=seeds,
+                               num_samples=num_samples, iterations=iterations, horizon=horizon,
+                               num_act_stepped=num_act_stepped, capture_iteration=capture_iteration,
                                charts_subdir=charts_subdir, out_subdir=out_subdir)
 
 
@@ -436,3 +459,91 @@ def run_e2_entrypoint(cells: str = "A,B,C,D", routers: str = "umf,sdyn",
                    dynamics_regime=dynamics_regime, probe_q=probe_q, probe_tau=probe_tau,
                    charts_subdir=charts_subdir, out_subdir=out_subdir,
                    confusion_matrix=confusion_matrix)
+
+
+@app.function(
+    gpu="L4",  # 24GB @ $0.80/h -- same CEM search shape as run_e0_planning
+               # (this script wraps scripts/run_e1.py, which uses the same
+               # CEM_NUM_SAMPLES/ITERATIONS/HORIZON defaults). Added 2026-08-27:
+               # modal_app.py has an older run_e1 wrapper but its image installs
+               # atlas-wm from a stale GitHub remote missing this session's
+               # fixes (see modal_e0_planning.py's own module docstring above) --
+               # this one reuses the correct local-build image instead.
+    volumes={ATLAS_MOUNT_PATH: atlas_volume},
+    timeout=3600 * 6,
+)
+def run_e1(
+    kind: str = "ln_act",
+    routers: str = "umf,random,oracle_id",
+    episodes: int = 20,
+    seeds: int = 1,
+    regime: str = "R2",
+    library_regimes: str = "R1,R2",
+    num_samples: int = 300,
+    iterations: int = 30,
+    horizon: int = 6,
+    num_act_stepped: int = 2,
+    max_mpc_steps: int = 6,
+    charts_subdir: str = "e1_charts_ln_act",
+    out_subdir: str = "e1_reduced_v2",
+) -> None:
+    """scripts/run_e1.py -- fitness routing ("THE GATE"). Defaults here are a
+    DELIBERATELY REDUCED spec, not the pre-registered one (60 episodes x 3
+    seeds x 5 routers at num_act_stepped=6): at nas=6 each episode gets only
+    1 actual replan (elapsed>=max_steps after the first CEM search), leaving
+    no room for E1's "2 warmup replans then route" design -- flagged as an
+    unresolved blocker in implementation_plan_v2.md section 7.0a.
+
+    IMPORTANT, learned the hard way 2026-08-27: unlike run_e0_planning.py,
+    E1's own MAX_MPC_STEPS is NOT in raw-step units -- n_replans_target =
+    max_mpc_steps // num_act_stepped, and N_WARMUP_REPLANS=2 is hardcoded in
+    run_e1.py, so max_mpc_steps=6 at nas=2 gives exactly 3 replans (2 warmup
+    + 1 routed) -- the MINIMUM viable "warm up then route" episode, at
+    ~3x nas=6's per-replan cost per replan (matching CODE_AUDIT.md's
+    documented run_e0_planning nas=2 tradeoff), NOT ~3x per EPISODE the way
+    the old max_mpc_steps=30 default silently gave (that produced 15
+    replans/episode, 150 raw steps, ~2043s/episode measured on Modal --
+    5x more expensive than intended and enough to burn through an entire
+    $8 account in a fraction of a 60-episode run). Do not raise
+    max_mpc_steps casually -- verify the real n_replans_target and re-derive
+    the per-episode cost before changing it. routers trimmed to the
+    three that answer "does routing help at all" (umf/random/oracle_id) --
+    drop 'e1'/'sdyn' unless specifically needed. charts_subdir must contain
+    BOTH chart_{kind}_R1.pt and chart_{kind}_R2.pt (unlike run_e0_planning's
+    charts_subdir, which only needs the one regime being evaluated) --
+    stage both into one directory first, e.g.:
+        modal volume put atlas-data <local_dir> atlas_out/e1_charts_ln_act
+    """
+    import subprocess
+    import sys
+    atlas_volume.reload()
+    cmd = [sys.executable, "scripts/run_e1.py",
+           "--charts", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
+           "--kind", kind,
+           "--routers", *routers.split(","),
+           "--episodes", str(episodes),
+           "--seeds", str(seeds),
+           "--regime", regime,
+           "--library-regimes", *library_regimes.split(","),
+           "--num-samples", str(num_samples),
+           "--iterations", str(iterations),
+           "--horizon", str(horizon),
+           "--num-act-stepped", str(num_act_stepped),
+           "--max-mpc-steps", str(max_mpc_steps),
+           "--out", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+    subprocess.run(cmd, check=True, cwd="/src")
+    atlas_volume.commit()
+
+
+@app.local_entrypoint(name="run_e1")
+def run_e1_entrypoint(kind: str = "ln_act", routers: str = "umf,random,oracle_id",
+                       episodes: int = 20, seeds: int = 1, regime: str = "R2",
+                       library_regimes: str = "R1,R2", num_samples: int = 300,
+                       iterations: int = 30, horizon: int = 6, num_act_stepped: int = 2,
+                       max_mpc_steps: int = 6, charts_subdir: str = "e1_charts_ln_act",
+                       out_subdir: str = "e1_reduced_v2") -> None:
+    run_e1.remote(kind=kind, routers=routers, episodes=episodes, seeds=seeds,
+                   regime=regime, library_regimes=library_regimes,
+                   num_samples=num_samples, iterations=iterations, horizon=horizon,
+                   num_act_stepped=num_act_stepped, max_mpc_steps=max_mpc_steps,
+                   charts_subdir=charts_subdir, out_subdir=out_subdir)

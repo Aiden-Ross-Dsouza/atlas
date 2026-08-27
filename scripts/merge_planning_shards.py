@@ -30,6 +30,10 @@ def main() -> None:
                          help="Directory holding the shard files (same --out-dir every shard used).")
     parser.add_argument("--shards", nargs="+", required=True,
                          help="The --out-suffix values used for each shard, e.g. _shard0 _shard1.")
+    parser.add_argument("--episode-start", type=int, default=0,
+                         help="Expected first episode index of the merged output. FIX_SPEC.md "
+                              "A13: the merged indices must be contiguous from here (no "
+                              "upstream-missing episode passing silently).")
     parser.add_argument("--merged-suffix", type=str, default="",
                          help="--out-suffix of the merged output file (default: no suffix, i.e. "
                               "{kind}_{regime}.jsonl -- the canonical name downstream tools expect).")
@@ -56,6 +60,19 @@ def main() -> None:
             f"silently drop or double-count episodes."
         )
     all_records.sort(key=lambda r: r["episode"])
+
+    # FIX_SPEC.md A13: contiguity. Duplicates are already rejected above; this
+    # catches the opposite failure -- an upstream-missing episode leaving a gap.
+    sorted_eps = [r["episode"] for r in all_records]
+    expected = list(range(args.episode_start, args.episode_start + len(sorted_eps)))
+    if sorted_eps != expected:
+        missing = sorted(set(expected) - set(sorted_eps))
+        raise ValueError(
+            f"Merged episode indices are not contiguous from --episode-start={args.episode_start}: "
+            f"got {sorted_eps[:5]}...{sorted_eps[-5:]} (n={len(sorted_eps)}); "
+            f"missing {missing[:20]}{' ...' if len(missing) > 20 else ''}. "
+            f"A shard is incomplete -- re-run the missing episodes rather than merging a gapped set."
+        )
 
     merged_path = args.out_dir / f"{args.kind}_{args.regime}{args.merged_suffix}.jsonl"
     with open(merged_path, "w") as f:

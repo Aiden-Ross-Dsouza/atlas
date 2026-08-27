@@ -51,6 +51,7 @@ class Expander:
         self._strikes: int = 0
         self._deficit_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
         self._candidate: Chart | None = None
+        self._last_probe_debug: dict = {}
         self._n_probes_fired: int = 0
         self._n_probes_rejected: int = 0
         self._n_committed: int = 0
@@ -128,9 +129,24 @@ class Expander:
             return "rejected_full"
 
         # ── Fit candidate on deficit chunks ───────────────────────────────────
-        best_chart = library[_argmin_umf(library, world_model,
-                                         next_encoder_output, next_actions, motion_gate,
-                                         next_proprio_ctxt)]
+        # Incumbent = argmin UMF over the DEFICIT chunks (FIX_SPEC.md A2),
+        # matching this module's docstring ("beats ... the current best chart")
+        # and proposal Sec2. The earlier code took the argmin over the held-out
+        # verification chunk, then required the candidate to beat it on that
+        # same chunk -- a look-ahead advantage for the incumbent. The
+        # verification comparison itself stays on the held-out chunk below.
+        incumbent_idx = _argmin_umf_over_chunks(library, world_model,
+                                                self._deficit_chunks, motion_gate)
+        best_chart = library[incumbent_idx]
+        # Old-style incumbent (argmin over the held-out chunk) kept purely for
+        # audit logging so A2's "how many decisions changed" is recomputable.
+        old_incumbent_idx = _argmin_umf(library, world_model, next_encoder_output,
+                                        next_actions, motion_gate, next_proprio_ctxt)
+        self._last_probe_debug = {
+            "incumbent_idx": incumbent_idx,
+            "old_incumbent_idx": old_incumbent_idx,
+            "incumbent_changed": incumbent_idx != old_incumbent_idx,
+        }
         candidate = library.clone_from(library._charts.index(best_chart))
         _fit_candidate(candidate, world_model, self._deficit_chunks,
                        self.cfg.n_probe, self.cfg.lr)
@@ -228,6 +244,29 @@ def _fit_candidate(
     # Pull updated weights back into the chart, then restore predictor.
     candidate.update_from_predictor_(predictor)
     candidate.restore_(predictor)  # no-op net after update_from_predictor_
+
+
+def _argmin_umf_over_chunks(
+    library: Library,
+    world_model,
+    deficit_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+    motion_gate: float | None,
+) -> int:
+    """Index of the library chart with the lowest summed UMF over the deficit
+    chunks (FIX_SPEC.md A2). Chunks that gate out (UMF None) contribute nothing;
+    a chart scoring None on every chunk is skipped. Falls back to 0."""
+    best_idx, best_total = 0, float("inf")
+    for i, chart in enumerate(library):
+        total, seen = 0.0, False
+        for enc_out, actions, proprio_ctxt in deficit_chunks:
+            s = compute_umf(chart, world_model, enc_out, actions, motion_gate,
+                            proprio_ctxt=proprio_ctxt)
+            if s is not None:
+                total += s
+                seen = True
+        if seen and total < best_total:
+            best_total, best_idx = total, i
+    return best_idx
 
 
 def _argmin_umf(

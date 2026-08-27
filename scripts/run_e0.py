@@ -487,10 +487,18 @@ def main() -> None:
                               "--num-train-trajs bump above, this is sized for Modal's 24GB L4, "
                               "not local. See code-review.md Bug #6e.")
     parser.add_argument("--num-val-trajs", type=int, default=8,
-                         help="Number of held-out validation trajectories, used both for early "
-                              "stopping during training and (necessarily reusing the same set --  "
-                              "this is not a 3-way train/val/test split) for the final reported "
-                              "eval_loss/eval_umf. Bumped from the original hardcoded 2.")
+                         help="Number of held-out validation trajectories, used for early "
+                              "stopping during training (consulted up to ~80x at --eval-every 25 "
+                              "--patience 5) AND, historically, for the final reported UMF -- a "
+                              "checkpoint-selection bias FIX_SPEC.md A4 fixes by adding a "
+                              "separate --num-test-trajs set. Bumped from the original hardcoded 2.")
+    parser.add_argument("--num-test-trajs", type=int, default=8,
+                         help="Number of held-out TEST trajectories (FIX_SPEC.md A4), drawn at "
+                              "seed_offset=20_000 -- disjoint from both train (offset 0) and val "
+                              "(offset 10_000). eval_umf is reported from THIS set; the val-set "
+                              "number is also reported as val_umf so the checkpoint-selection "
+                              "bias is measurable (test_umf - val_umf) rather than merely "
+                              "asserted. Set to 0 to restore the old val-only behaviour.")
     parser.add_argument("--eval-traj-len", type=int, default=50,
                          help="Steps per EVAL (held-out) trajectory. Runs under torch.no_grad "
                               "so length is cheap here -- needs to be long because 10 was too "
@@ -647,6 +655,13 @@ def main() -> None:
             wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
             seed_offset=10_000, source=args.data_source, data_split=args.data_split,
             **collect_kw)
+        # FIX_SPEC.md A4: disjoint TEST set (seed_offset=20_000) -- the number
+        # actually reported as eval_umf, so early-stopping's repeated use of the
+        # val set does not bias it.
+        test_trajectories = load_regime_trajectories(
+            wrapper, prep, regime, num_trajs=args.num_test_trajs, traj_len=args.eval_traj_len,
+            device=device, seed_offset=20_000, source=args.data_source,
+            data_split=args.data_split, **collect_kw) if args.num_test_trajs > 0 else []
         seed_manifest[regime] = {
             "source": args.data_source,
             "regime_config": dict(REGIME_CONFIGS.get(regime, {})),
@@ -654,6 +669,8 @@ def main() -> None:
                       for t in train_trajectories],
             "eval": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
                      for t in val_trajectories],
+            "test": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
+                     for t in test_trajectories],
         }
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
@@ -700,7 +717,12 @@ def main() -> None:
                 try:
                     chart = Chart.load(chart_file, wm.predictor)
                     n_params = chart.n_params()  # real parameter count, not a tensor count (T12 #9)
-                    eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
+                    n_trainable = chart.n_trainable_params()  # FIX_SPEC.md A11
+                    val_loss, val_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
+                    if test_trajectories:
+                        eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, test_trajectories, motion_gate)
+                    else:
+                        eval_loss, eval_umf = val_loss, val_umf
                 except Exception as e:
                     # Print the real error instead of silently returning NaN --
                     # a swallowed exception here previously masked a real bug
@@ -714,12 +736,17 @@ def main() -> None:
                           f"{type(e).__name__}: {e}", flush=True)
                     wm.predictor.load_state_dict(pristine_predictor_state)
                     n_params = 0
+                    n_trainable = 0
+                    val_umf = float("nan")
                     eval_loss, eval_umf = float("nan"), float("nan")
                 results[regime][kind] = {
                     "train_loss": final_loss,
                     "eval_loss": eval_loss,
                     "eval_umf": eval_umf,
+                    "val_umf": val_umf,
                     "params": n_params,
+                    "params_stored": n_params,
+                    "params_trainable": n_trainable,
                     "status": "completed (cached)",
                 }
                 print(f"    Done {kind}_{regime} (Cached): Train Loss = {final_loss:.6f} | Eval Loss = {eval_loss:.6f} | Eval UMF = {eval_umf:.4f}", flush=True)
@@ -764,8 +791,14 @@ def main() -> None:
                 patience=args.patience,
             )
 
-            # Held-out Evaluation on Validation Trajectories
-            eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
+            # Held-out Evaluation. val_* drives nothing here (early stopping
+            # already used it); test_* (disjoint seed_offset=20_000) is the
+            # reported eval_umf per FIX_SPEC.md A4.
+            val_loss, val_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
+            if test_trajectories:
+                eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, test_trajectories, motion_gate)
+            else:
+                eval_loss, eval_umf = val_loss, val_umf
 
             if args.wandb:
                 try:
@@ -782,8 +815,11 @@ def main() -> None:
             results[regime][kind] = {
                 "train_loss": final_loss,
                 "eval_loss": eval_loss,
-                "eval_umf": eval_umf,
-                "params": chart.n_params(),  # real parameter count, not a tensor count (T12 #9)
+                "eval_umf": eval_umf,          # from the disjoint TEST set (A4)
+                "val_umf": val_umf,            # early-stopping set; bias = eval_umf - val_umf
+                "params": chart.n_params(),
+                "params_stored": chart.n_params(),           # FIX_SPEC.md A11
+                "params_trainable": chart.n_trainable_params(),
                 "status": "completed",
             }
             # [Debug print statement] Print fine-tuning & eval completed

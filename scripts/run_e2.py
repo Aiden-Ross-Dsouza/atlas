@@ -326,6 +326,7 @@ def main() -> None:
                                             current_idx=0, motion_gate=motion_gate,
                                             proprio_ctxt=proprio_ctxt)
                     expander.record(_best_umf(umf_info), enc, acts, proprio_ctxt=proprio_ctxt)
+                    outcome = "not_ready"
                     if ep + 1 < len(trajs):
                         nxt = trajs[ep + 1]
                         outcome = expander.maybe_expand(
@@ -337,6 +338,21 @@ def main() -> None:
                         # an object with a .committed attribute.
                         if outcome == "committed":
                             commits += 1
+                    # FIX_SPEC.md A3: per-chunk expander state, so N9's commit
+                    # count and the K=3 hysteresis binding rate are recomputable
+                    # from raw records alone (closes PAPER_FACT_CHECK D4).
+                    records.append({
+                        "cell": cell, "condition": cond, "seed": seed, "episode": ep,
+                        "regime": regime, "corruption": corruption,
+                        "router": None, "record_type": "expansion",
+                        "strikes": expander._strikes,
+                        "probe_outcome": outcome,
+                        "relative_gap": (umf_info or {}).get("relative_gap"),
+                        "hysteresis_held": bool((umf_info or {}).get("hysteresis_held", False)),
+                        "committed": outcome == "committed",
+                        "incumbent_debug": dict(getattr(expander, "_last_probe_debug", {})),
+                        "library_size": len(probe_library),
+                    })
 
                 # Cross-check against the Expander's own counter: if these
                 # ever disagree the loop above missed a commit, and Cell C would

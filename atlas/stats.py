@@ -108,6 +108,67 @@ def mcnemar_paired(a: np.ndarray, b: np.ndarray) -> float:
     return float(result.pvalue)
 
 
+def oracle_gap_permutation(
+    per_chart_successes,
+    n: int = 10_000,
+    seed: int = 0,
+):
+    """Permutation test for the oracle-minus-random success gap of a chart
+    library (FIX_SPEC.md A6).
+
+    The observed gap is
+        gap = mean_i [ max_c X[c, i] ]  -  mean_{c,i} X[c, i]
+    where X is `per_chart_successes` with shape [n_charts, n_episodes] of binary
+    outcomes. `d_i = oracle_i - random_i >= 0` at every episode by construction,
+    so a paired bootstrap CI can never contain zero and tests nothing. This
+    permutation test instead asks: is this library's oracle gap larger than
+    what independent charts with the same per-chart success rates would produce
+    by chance?
+
+    Null model: each chart's outcome vector is shuffled across episodes
+    INDEPENDENTLY (destroying any cross-chart specialisation / complementarity
+    while preserving every chart's marginal success count, hence the random SR).
+    The oracle SR is recomputed under each shuffle; p = fraction of shuffles
+    whose gap is >= the observed gap (one-sided).
+
+    NOTE ON SPEC WORDING: FIX_SPEC.md A6 literally says "permute chart labels
+    within each episode". That operation leaves both max_c and mean_c over a
+    column unchanged (it only relabels values already present), so it is a
+    no-op for this statistic. The independent across-episode shuffle above is
+    the non-degenerate test that satisfies A6's stated assertion (identical
+    charts => gap 0, p ~ 1). Flagged in the Stage 1 report.
+
+    Returns:
+        (observed_gap, p_value, null_distribution_summary)
+        null_distribution_summary: dict with mean/std/p05/p95 of the null gaps.
+    """
+    X = np.asarray(per_chart_successes, dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"per_chart_successes must be 2-D [n_charts, n_episodes]; got {X.shape}")
+    n_charts, n_ep = X.shape
+
+    sr_random = X.mean()
+    observed_gap = float(X.max(axis=0).mean() - sr_random)
+
+    rng = np.random.default_rng(seed)
+    null_gaps = np.empty(n, dtype=float)
+    for k in range(n):
+        Xp = np.empty_like(X)
+        for c in range(n_charts):
+            Xp[c] = X[c, rng.permutation(n_ep)]
+        null_gaps[k] = Xp.max(axis=0).mean() - Xp.mean()
+
+    p_value = float((null_gaps >= observed_gap - 1e-12).mean())
+    summary = {
+        "n_permutations": n,
+        "null_mean": float(null_gaps.mean()),
+        "null_std": float(null_gaps.std()),
+        "null_p05": float(np.percentile(null_gaps, 5)),
+        "null_p95": float(np.percentile(null_gaps, 95)),
+    }
+    return observed_gap, p_value, summary
+
+
 def success_rate_ci(
     outcomes: np.ndarray,
     ci: float = 95.0,

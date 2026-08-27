@@ -169,6 +169,20 @@ class Chart:
     def n_params(self) -> int:
         return sum(v.numel() for v in self._params.values())
 
+    def n_trainable_params(self) -> int:
+        """Count of parameters that actually receive gradients during
+        refinement (FIX_SPEC.md A11). For ``lora4`` this is only the injected
+        ``.lora_A`` / ``.lora_B`` tensors -- ``n_params()`` additionally sums
+        the 12 frozen full base weight matrices (~10.3M) that are present in
+        ``_params`` at construction but are never optimised, which is the
+        discredited count recorded in some older results.json artifacts. For
+        ``ln_act`` / ``full`` every stored parameter is trained, so this equals
+        ``n_params()``."""
+        if self.kind == "lora4":
+            return sum(v.numel() for k, v in self._params.items()
+                       if k.endswith(".lora_A") or k.endswith(".lora_B"))
+        return self.n_params()
+
     def update_from_predictor_(self, predictor: nn.Module) -> None:
         """Pull current predictor weights back into the chart (after refinement)."""
         state = dict(predictor.named_parameters())

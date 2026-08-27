@@ -36,6 +36,7 @@ import pandas as pd
 from scipy.stats import kendalltau
 
 import atlas
+from atlas.stats import paired_bootstrap, mcnemar_paired
 
 
 def load_episodes(path: Path) -> pd.DataFrame:
@@ -58,13 +59,28 @@ def knock_away_progress(df: pd.DataFrame) -> dict:
     }
 
 
-def sr_by_bucket(df: pd.DataFrame, edges=(0, 80, 120, 300)) -> pd.DataFrame:
-    labels = [f"{edges[i]}-{edges[i+1]}px" for i in range(len(edges) - 1)]
+def sr_by_bucket(df: pd.DataFrame, edges=(0, 80, 120)) -> pd.DataFrame:
+    """FIX_SPEC.md A8: open-ended top bucket so episodes above the last finite
+    edge are NOT silently sent to NaN and dropped by groupby (which broke the
+    invariant that per-bucket n sums to the episode count). Asserts the sum.
+
+    `edges` is the list of FINITE lower edges; an implicit +inf top edge is
+    appended. Default (0, 80, 120) -> buckets 0-80 / 80-120 / 120+px.
+    """
+    finite_edges = list(edges) + [np.inf]
+    labels = ([f"{finite_edges[i]}-{finite_edges[i+1]}px" for i in range(len(finite_edges) - 2)]
+              + [f"{finite_edges[-2]}+px"])
     df = df.copy()
-    df["bucket"] = pd.cut(df["init_block_pos_diff"], bins=edges, labels=labels, include_lowest=True)
+    df["bucket"] = pd.cut(df["init_block_pos_diff"], bins=finite_edges, labels=labels,
+                          include_lowest=True)
     out = df.groupby("bucket", observed=True).agg(
         n=("success", "size"), sr=("success", "mean")
     ).reset_index()
+    total = int(out["n"].sum())
+    assert total == len(df), (
+        f"sr_by_bucket dropped episodes: per-bucket n sums to {total} but df has {len(df)} "
+        f"({df['init_block_pos_diff'].isna().sum()} NaN init_block_pos_diff; "
+        f"min={df['init_block_pos_diff'].min()}, max={df['init_block_pos_diff'].max()})")
     return out
 
 
@@ -81,9 +97,26 @@ def partial_kendall(df: pd.DataFrame, x_col: str = "umf_mean", y_col: str = "suc
     sub = df.dropna(subset=[x_col, y_col, *controls]).copy()
     X = sm.add_constant(sub[list(controls)].astype(float))
 
-    x_resid = sm.OLS(sub[x_col].astype(float), X).fit().resid
-    y_resid = sm.OLS(sub[y_col].astype(float), X).fit().resid
-    partial_tau, partial_p = kendalltau(x_resid, y_resid)
+    x_resid = np.asarray(sm.OLS(sub[x_col].astype(float), X).fit().resid)
+    y_resid = np.asarray(sm.OLS(sub[y_col].astype(float), X).fit().resid)
+    partial_tau, partial_p_analytic = kendalltau(x_resid, y_resid)
+
+    # FIX_SPEC.md A7: Kendall's analytic null ignores the estimated OLS
+    # coefficients, so partial_p_analytic is anticonservative. Replace it with a
+    # permutation test on the residuals -- permute y_resid, recompute tau,
+    # p = P(|tau_perm| >= |tau_obs|). The point estimate (partial_tau) is kept
+    # and still reported. The permutation p is >= the analytic p by construction
+    # of the fix's intent (it accounts for variance the analytic form omits).
+    _rng = np.random.default_rng(0)
+    n_perm = 10_000
+    abs_obs = abs(partial_tau)
+    ge = 0
+    for _ in range(n_perm):
+        tau_p, _ = kendalltau(x_resid, _rng.permutation(y_resid))
+        if abs(tau_p) >= abs_obs - 1e-12:
+            ge += 1
+    partial_p = (ge + 1) / (n_perm + 1)
+    partial_p_permutation = partial_p
 
     # Stratified: tercile bins of the primary control (init_block_pos_diff).
     sub["stratum"] = pd.qcut(sub[controls[0]], q=3, duplicates="drop")
@@ -99,8 +132,47 @@ def partial_kendall(df: pd.DataFrame, x_col: str = "umf_mean", y_col: str = "suc
     return {
         "n": len(sub),
         "unconditional_tau": float(unconditional_tau), "unconditional_p": float(unconditional_p),
-        "partial_tau": float(partial_tau), "partial_p": float(partial_p),
+        "partial_tau": float(partial_tau),
+        "partial_p": float(partial_p),  # permutation (A7) -- the one to cite
+        "partial_p_permutation": float(partial_p_permutation),
+        "partial_p_analytic": float(partial_p_analytic),  # retained for comparison; anticonservative
         "stratified": strat_rows,
+    }
+
+
+def paired_success_stats(baseline_df: pd.DataFrame, chart_df: pd.DataFrame) -> dict:
+    """FIX_SPEC.md A5: N1's paired CI and McNemar p, recomputed from the raw
+    episode logs via atlas.stats' own (unmodified) functions, so
+    analysis_n100.json actually contains the numbers N1 cites it for.
+
+    Pairs strictly on episode index (run_e0_planning.py: seed == episode index),
+    intersecting the two arms so a partial shard can never misalign them."""
+    a = baseline_df.set_index("episode")["success"].astype(float)
+    b = chart_df.set_index("episode")["success"].astype(float)
+    common = sorted(a.index.intersection(b.index))
+    base = a.loc[common].to_numpy()
+    chart = b.loc[common].to_numpy()
+    # Report chart - baseline (positive = chart better), in the same
+    # percentage-point units the paper uses.
+    mean_diff, (lo, hi) = paired_bootstrap(chart, base, n=10_000, seed=0)
+    try:
+        p = mcnemar_paired(chart.astype(bool), base.astype(bool))
+    except ImportError as e:
+        p = None
+        p_note = f"statsmodels missing: {e}"
+    else:
+        p_note = None
+    return {
+        "n_paired": len(common),
+        "sr_baseline": float(base.mean()),
+        "sr_chart": float(chart.mean()),
+        "delta_chart_minus_baseline": float(mean_diff),
+        "delta_ci95_pp": [round(lo * 100, 1), round(hi * 100, 1)],
+        "delta_ci95_frac": [lo, hi],
+        "mcnemar_p": (round(p, 3) if p is not None else None),
+        "mcnemar_p_note": p_note,
+        "discordant_b1_c0": int(((base == 1) & (chart == 0)).sum()),
+        "discordant_b0_c1": int(((base == 0) & (chart == 1)).sum()),
     }
 
 
@@ -194,6 +266,9 @@ def main() -> None:
         "baseline": knock_away_progress(baseline_df),
         "ln_act": knock_away_progress(chart_df),
     }
+
+    # A.5 (FIX_SPEC.md) -- N1's paired CI + McNemar p, reproducible from raw logs
+    report["A5_paired_success_stats"] = paired_success_stats(baseline_df, chart_df)
 
     # A.2
     report["A2_sr_by_bucket"] = {

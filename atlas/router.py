@@ -82,23 +82,30 @@ def route(
 
     best_idx = min(valid, key=valid.__getitem__)
     best_score = valid[best_idx]
+    relative_gap: float | None = None
+    hysteresis_held = False
 
-    # Hysteresis: only switch if improvement exceeds margin, normalised by
-    # this replan's own score spread (T12 #5) -- the raw margin (m=0.05,
-    # fixed per CLAUDE.md Sec1.7, never changed) is meaningless applied to
-    # absolute scores on wildly different scales across routers (umf ~O(1),
-    # e1 ~1e4 so m is a no-op, sdyn in [-1,1] so m dominates and can block a
-    # correct switch). Normalising makes m mean "switch only if the
-    # improvement is at least 5% of this replan's own chart-to-chart spread",
-    # scale-invariant across routers without changing m's value.
+    # Hysteresis: only switch if improvement exceeds margin, normalised by the
+    # INCUMBENT'S OWN score (FIX_SPEC.md A1) -- the earlier spread normaliser
+    # (spread = max(valid) - min(valid)) is inert at K=2: with exactly two
+    # charts an incumbent that is not the argmin *is* the max, so
+    # relative_gap = (max-min)/(max-min) = 1.0, always > m=0.05, and the router
+    # is pure argmin. Normalising by current_score keeps the scale-invariance
+    # the spread version was reaching for (umf ~O(1), e1 ~1e4, sdyn in [-1,1])
+    # without being degenerate at K=2: m=0.05 now means "switch only if the
+    # improvement is at least 5% of the incumbent's own score". m's value
+    # (0.05, a CLAUDE.md Sec1.7 non-negotiable) is unchanged -- only the
+    # normaliser.
     current_score = valid.get(current_idx)
     if current_score is not None:
-        spread = max(valid.values()) - min(valid.values())
-        relative_gap = (current_score - best_score) / spread if spread > 0 else 0.0
+        relative_gap = (current_score - best_score) / current_score if current_score > 0 else 0.0
         if relative_gap < hysteresis:
-            return current_idx, {"scores": scores, "gated": False}
+            hysteresis_held = True
+            return current_idx, {"scores": scores, "gated": False,
+                                 "relative_gap": relative_gap, "hysteresis_held": True}
 
-    return best_idx, {"scores": scores, "gated": False}
+    return best_idx, {"scores": scores, "gated": False,
+                      "relative_gap": relative_gap, "hysteresis_held": hysteresis_held}
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

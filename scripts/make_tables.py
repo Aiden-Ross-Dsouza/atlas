@@ -153,6 +153,65 @@ def make_t2(e4_log: Path, out_dir: Path, baseline_arm: str = "frozen") -> None:
     _print_markdown_table(rows, out_dir / "T2.md", "T2 — E4 Ablation Ladder + Recall")
 
 
+def make_t5(e0_dir: Path, out_dir: Path) -> None:
+    """T5 — E0 adapter capacity: Adapter x {Params, KB, Eval UMF, dUMF, Success,
+    % of full}.
+
+    Reads {e0_dir}/results.json (regime -> kind -> metrics). dUMF is
+    (frozen c0 UMF - chart UMF) when a c0 / baseline row is present in the same
+    regime; Success is read from {e0_dir}/{kind}_{regime}_summary.json or
+    {e0_dir}/planning_{kind}_{regime}.json if present. Columns whose inputs are
+    absent render as "-" rather than silently vanishing. Raises if results.json
+    itself is missing (FIX_SPEC.md A12: no silent no-op).
+    """
+    results_path = e0_dir / "results.json"
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"T5 needs E0 capacity results: {results_path} not found. "
+            f"Run scripts/run_e0.py (or point --e0-dir at a directory that has results.json)."
+        )
+    results = json.loads(results_path.read_text())
+
+    def _success(kind: str, regime: str):
+        for cand in (e0_dir / f"{kind}_{regime}_summary.json",
+                     e0_dir / f"planning_{kind}_{regime}.json",
+                     e0_dir / f"{kind}_{regime}.json"):
+            if cand.exists():
+                d = json.loads(cand.read_text())
+                for key in ("success_rate", "sr", "planning_success"):
+                    if key in d:
+                        return float(d[key])
+        return None
+
+    rows = []
+    for regime, kinds in results.items():
+        baseline_umf = None
+        for bkey in ("c0", "baseline", "frozen", "identity"):
+            if bkey in kinds and kinds[bkey].get("eval_umf") is not None:
+                baseline_umf = float(kinds[bkey]["eval_umf"])
+        full_gain = None
+        if "full" in kinds and baseline_umf is not None and kinds["full"].get("eval_umf") is not None:
+            full_gain = baseline_umf - float(kinds["full"]["eval_umf"])
+        for kind, m in kinds.items():
+            params = m.get("params_trainable", m.get("params"))
+            umf = m.get("eval_umf")
+            d_umf = (baseline_umf - float(umf)) if (baseline_umf is not None and umf is not None) else None
+            pct_full = (100.0 * d_umf / full_gain) if (d_umf is not None and full_gain not in (None, 0)) else None
+            sr = _success(kind, regime)
+            rows.append({
+                "Regime": regime,
+                "Adapter": kind,
+                "Params": f"{params:,}" if isinstance(params, int) else "—",
+                "KB": f"{params * 4 / 1024:.1f}" if isinstance(params, int) else "—",
+                "Eval UMF": f"{umf:.4f}" if umf is not None else "—",
+                "ΔUMF": f"{d_umf:+.4f}" if d_umf is not None else "—",
+                "Success": f"{sr:.3f}" if sr is not None else "—",
+                "% of full": f"{pct_full:.0f}%" if pct_full is not None else "—",
+            })
+
+    _print_markdown_table(rows, out_dir / "T5.md", "T5 — E0 Adapter Capacity")
+
+
 def _print_markdown_table(rows: list[dict], out_path: Path, title: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -177,6 +236,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Regenerate paper tables from logs.")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--table", choices=["T1", "T2", "T5"])
+    parser.add_argument("--e0-dir", type=Path, default=atlas.OUT_DIR / "e0",
+                        help="Directory with E0 results.json for T5.")
     args = parser.parse_args()
 
     if not args.all and args.table is None:
@@ -187,6 +248,8 @@ def main() -> None:
         make_t1(atlas.OUT_DIR / "e1" / "episodes.jsonl", atlas.OUT_DIR / "e1")
     if args.all or args.table == "T2":
         make_t2(atlas.OUT_DIR / "e4" / "episodes.jsonl", atlas.OUT_DIR / "e4")
+    if args.all or args.table == "T5":
+        make_t5(args.e0_dir, args.e0_dir)
 
 
 if __name__ == "__main__":
