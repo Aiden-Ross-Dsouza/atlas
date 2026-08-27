@@ -112,7 +112,7 @@ AdaJEPA's closing sentence names our opening: *"A natural next step is to combin
 | Dynamic TMoE | arXiv 2605.20678, 2026 | memory router | MMD drift detection |
 | ShiftEx | arXiv 2506.18789, 2025 | expert matching | MMD covariate-shift detection |
 | CN-DPM | ICLR 2020 | generative likelihood | DP prior; *"expert selection … the main bottleneck"* |
-| MBCD | ICML 2021 | **prediction likelihood** | MCUSUM change detection |
+| MBCD | AAMAS 2021 | **prediction likelihood** | MCUSUM change detection |
 | DEN | ICLR 2018 | — | selective retraining, then **training-loss** threshold |
 | **ATLAS** | — | **measured rollout fitness** | **verified fixability on unseen data** |
 
@@ -120,7 +120,7 @@ Most route on similarity to inputs — **MBCD is the notable exception and uses 
 
 ### 3.5 Precedents cited defensively
 
-Narendra et al. (1992–2003) multiple-model adaptive control — model bank, switching on recent prediction error, fixed models retained alongside adaptive ones; assumes low-dimensional plants with physically meaningful residuals. MBCD (ICML 2021) — MCUSUM on prediction likelihood, more principled than our strike counter, but needs a likelihood a deterministic JEPA predictor lacks. Herbster & Warmuth (1998) Fixed-Share — the switching-regret theory; named as the principled extension.
+Narendra et al. (1992–2003) multiple-model adaptive control — model bank, switching on recent prediction error, fixed models retained alongside adaptive ones; assumes low-dimensional plants with physically meaningful residuals. MBCD (AAMAS 2021) — MCUSUM on prediction likelihood, more principled than our strike counter, but needs a likelihood a deterministic JEPA predictor lacks. Herbster & Warmuth (1998) Fixed-Share — the switching-regret theory; named as the principled extension.
 
 ### 3.6 Relationship to AdaJEPA and JEPA-WM: complementary, not contradictory
 
@@ -316,6 +316,6 @@ S-obs router · non-prequential ablation · capacity-matched AdaJEPA · one smal
 
 **Module libraries.** Zhang et al., *DPCore*, ICML 2025 · Römer, Zhang, Schoellig, *CLARE*, arXiv:2601.09512, 2026 · Yoo et al., *WorMI*, 2025 · *Dynamic TMoE*, arXiv:2605.20678, 2026 · *ShiftEx*, arXiv:2506.18789, 2025 · Lee et al., *CN-DPM*, ICLR 2020 · Yoon et al., *DEN*, ICLR 2018 · Wang et al., *Tent*, ICLR 2021 · Wang et al., *CoTTA*, CVPR 2022.
 
-**Prediction-error model banks.** Narendra & Balakrishnan, IEEE TAC 1997 · Narendra et al., IJACSP 2003 · Alegre et al., *MBCD*, ICML 2021 · *Infinite Mixture of GPs*, arXiv:2006.11441, 2020.
+**Prediction-error model banks.** Narendra & Balakrishnan, IEEE TAC 1997 · Narendra et al., IJACSP 2003 · Alegre et al., *MBCD*, AAMAS 2021 · *Infinite Mixture of GPs*, arXiv:2006.11441, 2020.
 
 **Methodology.** Herbster & Warmuth, *Tracking the Best Expert*, ML 32:151–178, 1998 · Kirkpatrick et al., *EWC*, PNAS 2017 · Dawid, JRSS-A 1984 *(prequential)* · McNemar, Psychometrika 1947.

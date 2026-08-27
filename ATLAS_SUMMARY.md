@@ -11,6 +11,16 @@ of its source doc.*
 
 ---
 
+> **AUDIT CORRECTION BANNER — 2026-08-27 (FIX_SPEC.md A14, A15).**
+> Two statements below have been corrected in place:
+> - **§4.3 converged-CEM spread.** Previously "std ... is 3.8–8.3px — a tight
+>   cluster". The real range over all six seed/kind cells is **3.77–27.15px**
+>   (`ln_act` seeds 1 and 2 are 17.9 and 27.2). "Tight cluster" is removed.
+>   `E0_RESULTS.md` hedged this correctly; the summary had dropped the hedge.
+> - **§4.5 Cell B "+55.6pp → +26.3pp" before/after.** The "pre-fix +55.6pp"
+>   figure has **no surviving raw records**, so the before/after framing is
+>   dropped; only the current number is reported.
+
 ## 1. What ATLAS is
 
 Modern robots and agents increasingly use a **world model** — a neural network
@@ -102,6 +112,73 @@ success) in every arm tested this session: baseline τ=−0.406 (p<0.0001,
 n=92), chart τ=−0.449 (p<0.0001, n=94). **This is the core dissociation**:
 UMF predicts success within an arm, but doesn't predict which arm is better.
 
+**This correlation survives controlling for episode difficulty (2026-08-27
+update).** A standing objection: episode difficulty (`init_block_pos_diff`)
+could drive both UMF and success independently, making the within-arm τ a
+difficulty artifact rather than a model-quality signal. Partial correlation
+(OLS-residualized on difficulty + contact count, then Kendall τ on
+residuals) shows the effect **survives, attenuated but still highly
+significant**: baseline −0.406 → **−0.358** (p=4.4×10⁻⁷), chart −0.449 →
+**−0.374** (p=9.6×10⁻⁸). A stratified check corroborates this within every
+difficulty tercile except the baseline's hardest bucket, where a floor
+effect (8.3% SR) plausibly washes the signal out. **Conclusion: UMF tracks
+model quality within an episode, not merely episode difficulty** — the
+dissociation claim above is on firm ground. Full detail: `E0_RESULTS.md`'s
+2026-08-27 section.
+
+**Three more zero-cost checks on the same N=100 data (2026-08-27), closing
+out every remaining pre-registered/"verify, don't assume" item:**
+
+- **Knock-aways + mean progress replicate qualitatively at N=100.** The N=20
+  mechanism test (5/20→2/20 knock-aways) holds up, more modestly: baseline
+  24/100 (24.0%) vs. `ln_act` 22/100 (22.0%) knock-aways, and mean progress
+  actually favors the chart (+25.1px baseline vs. **+32.4px chart**) even
+  though SR is flat — a second, mechanism-specific dissociation instance:
+  knock-aways down, progress up, SR unmoved.
+- **SR by init-displacement bucket shows no hidden win.** 0–80px: 64.2% both
+  arms (identical). 80–120px: 34.8% baseline vs. 30.4% chart (chart worse).
+  120–300px: 8.3% both (floor effect). The aggregate null isn't masking a
+  stratum where the chart helps — it's uniform across difficulty.
+- **The "bridge" check confirms the cost-ranking diagnostic and the N=100
+  planning run share the identical seed construction** (`init_block_pos_diff`
+  matches to machine precision for seeds/episodes 0–9). Cross-referencing:
+  all 4 planning **successes** have negative cost-ranking ρ; the 6
+  **failures** have mixed-sign ρ — the opposite of what a naive
+  "inverted-ranking-causes-failure" story predicts. n=10, not a significance
+  claim, flagged as a curiosity, not a finding.
+- **Training-size sweep pairing re-verified exactly** (max mismatch 0.0px,
+  not just "6 decimal places") across the N=100 run and both the 60- and
+  100-trajectory sweep re-evals — the sweep's pairing was never actually
+  broken.
+
+Full detail and raw output: `E0_RESULTS.md`'s 2026-08-27 section,
+`scripts/analyze_n100.py`, `atlas_out/analysis_n100.json`.
+
+### 4.1b Does the same null hold under the OTHER physics regime? — New 2026-08-27
+
+Every planning-success comparison above uses the damping-shift regime (R2).
+The friction-shift regime (R1) had never had this comparison run at any real
+sample size — only a 1-episode smoke test and a 15-episode baseline-only
+calibration check existed. Ran it for real: baseline vs. `ln_act` chart,
+N=40 paired episodes, same real (start, goal) pairs per seed for both arms:
+
+| Arm | Success rate | Δ vs. baseline | 95% CI | Statistical test |
+|---|---:|---|---|---|
+| baseline | 70.0% (28/40) | — | — | — |
+| chart | 60.0% (24/40) | **−10.0pp** | **[−27.5, +7.5]** | McNemar p=0.388, 12/40 discordant |
+
+Not statistically significant (the CI touches zero), but the point estimate
+is now **negative** under R1, unlike R2 where it hovered near flat
+(−1.0pp to +2.5pp across the training-data sweep in §4.2). Two things worth
+holding onto: (1) the "no reliable planning benefit" conclusion **generalizes
+across both tested regimes** — in neither regime does the chart produce a
+significant improvement; (2) the *direction* of the (non-significant) point
+estimate is not consistent between regimes, which argues against reading
+even the R2 near-zero result as "the chart is neutral" in any strong sense —
+it may simply not reliably do anything positive or negative, regime-
+dependent noise being the more parsimonious explanation than a stable null
+effect. Raw data: `atlas_out/e1_baseline_vs_chart_R1/{baseline,ln_act}_R1.jsonl`.
+
 ### 4.2 Does more training data help? — UMF improves; planning success stays flat
 
 The chart above was trained on 20 real trajectories — a number never varied
@@ -153,6 +230,83 @@ This is a real, mechanistic reason for §4.1's null: the chart improves
 prediction error while the planner's actual action-ranking — the thing that
 determines what gets executed — was never touched by that training.
 
+**Update (2026-08-27) — the near-zero ranking result is regime-specific, not
+universal.** The R2 (damping) diagnostic above had never been run as a
+control against R0 (no regime shift at all) — closing that gap was Opus's
+single most-repeated "non-negotiable" request. Result: **R0's baseline
+cost-ranking is strongly *positive*, not near-zero** — mean per-seed ρ =
+0.501, 95% CI [0.277, 0.726] (n=10 seeds, 300 candidates/seed), vs. R2's
+−0.072. **The planner's cost function ranks candidates reasonably well under
+default physics; it only degenerates under the R2 damping shift specifically
+— it is not a general property of this frozen model's CEM search.** This
+revises the framing above: "whatever determines ranking quality is a
+property of the specific task instance, not something the chart changes" is
+still true *within* R2 (baseline and chart track each other closely there),
+but it is not true *across* regimes — R0 vs. R2 is exactly the kind of
+regime-level difference that mattered.
+
+**Regret quantifies the R0-vs-R2 gap directly, not just as a correlation.**
+`diagnose_cem_costs.py` was extended to persist raw per-candidate data
+(previously summary-only), enabling: regret = true_dist of the
+cost-argmin candidate minus the batch's actual best true_dist, and the
+cost-ranked top-10's mean true_dist vs. the full batch's mean.
+
+| | Mean regret (trusting the planner's pick vs. best available) | Top-10-by-cost vs. batch mean |
+|---|---:|---:|
+| R0, baseline | **8.5px** | **+28.2px (top-10 better)** |
+| R2, baseline | **88.1px** (~10×) | **−15.7px (top-10 WORSE)** |
+| R2, `ln_act` | **92.3px** | **−8.5px (top-10 worse)** |
+
+Under R0, trusting the planner's cost ranking is cheap and directionally
+correct. Under R2, it is an order of magnitude more costly, and the
+cost-ranked top-10 candidates are actually *worse* on average than an
+unranked batch — trusting the ranking under R2 is actively
+counterproductive, not just uninformative. Contact fraction (~80% across
+all three rows, identical because iteration-0's CEM draw is
+model/regime-independent by construction) rules out the alternative
+explanation that ρ≈0 just reflects most candidates never touching the
+block. Full detail, all with 95% CIs: `E0_RESULTS.md`'s 2026-08-27 top
+section, and the companion partial-Kendall-τ checks in the section below it.
+
+**Is the R0-to-R2 collapse a sudden break or a gradual slide? New 2026-08-27
+— it's gradual.** The R0/R2 comparison above is two points: no shift and
+full shift. Ran three intermediate damping strengths (0.125, 0.25, 0.375,
+between R0's implicit 0 and R2's 0.5), n=20 seeds each, same protocol:
+
+| Damping | 0.0 (R0) | 0.125 | 0.25 | 0.375 | 0.5 (R2) |
+|---|---:|---:|---:|---:|---:|
+| Mean rho | 0.532 | 0.295 | 0.169 | 0.078 | 0.001 |
+| 95% CI | [0.39,0.68] | [0.17,0.42] | [0.04,0.30] | [−0.06,0.21] | [−0.13,0.13] |
+
+The decline is **smooth and monotonic**, not a threshold that suddenly
+breaks — the planner's ranking quality degrades roughly proportionally to
+the physics mismatch, all the way down to chance level at full shift. This
+is a stronger, more specific claim than "off vs. on": it argues the
+underlying cause is a continuous mismatch between the frozen model's
+implicit physics assumptions and the true dynamics, not a discrete failure
+mode that only trips past some critical shift magnitude. Raw data:
+`atlas_out/cost_ranking_dose_{0125,025,0375}/`.
+
+**CEM doesn't just rank poorly under R2 — it confidently converges to a
+knock-away (2026-08-27).** All of the above uses CEM's iteration-0 (raw,
+untrained) candidate draw. A converged-search check — capture the FINAL
+iteration's population instead (3 seeds, full 300×30 search) — answers
+"does a real search do better than a random draw?" **No: it's worse.**
+Verified as genuine convergence (std of the 300 final candidates' true
+outcome ranges 3.77–27.15px across the six seed/kind cells — `ln_act` seeds 1
+and 2 are the high end at 17.9 and 27.2px; it is a converged search, not
+noise, but not a uniformly tight cluster), baseline's converged
+plan lands *farther* from goal than the episode started, in **all 3 seeds
+tested, every time**: e.g. seed 2 starts 158.2px from goal, converges to a
+confident plan that lands at 200.8px (median). This is the same knock-away
+failure already measured at 24% of N=100 episodes, but shows it isn't
+occasional bad luck — CEM is **certain and wrong**, not uncertain, because
+its internal model has no representation of R2's damping. `ln_act` doesn't
+reliably fix this (helps in 2/3 seeds, is outright worse in the third).
+Ranking quality at convergence is no better than at iteration-0 — pooled ρ
+is now significantly *negative* for baseline (−0.179, p≈7×10⁻⁸). Full
+detail: `E0_RESULTS.md`'s 2026-08-27 "CONVERGED-CEM COST RANKING" section.
+
 ### 4.4 Does more reactive (closed-loop) planning change the picture? — Directionally, not conclusively
 
 Every result above uses one open-loop plan per 30-step episode. A cheaper
@@ -190,6 +344,15 @@ regardless of the true physics situation, essentially guessing. UMF's
 accuracy held up when the library was expanded from 2 charts (an earlier,
 smaller test) to 3 — it didn't erode, and S-dyn didn't improve either.
 
+**2-chart decisive cell (`ln_act`×R2), current numbers: UMF 0.833 vs. S-dyn
+0.570.** UMF routes correctly more often than the appearance-based baseline;
+S-dyn's residual accuracy is naive stickiness that sometimes coincides with
+the right answer (correctly persisting post-switch). *(Audit note, FIX_SPEC.md
+A15: an earlier version of this paragraph reported a "pre-fix +55.6pp →
+post-fix +26.3pp" before/after. The "+55.6pp" figure has no surviving raw
+records, so the before/after framing has been dropped and only the current
+number is stated.)* Full detail: `E2_RESULTS.md`'s 2026-08-27 section.
+
 **This is orthogonal to §4.1's negative result** — it validates that the
 *selection mechanism* works, not that the charts it selects between actually
 help planning. Correct routing here still routes to a chart that doesn't
@@ -198,12 +361,28 @@ improve success.
 ### 4.6 Two smaller results that answer specific objections
 
 - **Does the routing signal actually give you anything, if you had a
-  perfect oracle that always picked the best chart?** Computed directly
-  from real paired episodes: a perfect oracle beats random chart selection
-  by only 2.5–3.3 percentage points — below the 10pp threshold this
-  project's own statistics require before reporting a routing-quality number
-  at all. No routing algorithm, however good, can manufacture benefit the
-  chart library doesn't contain.
+  perfect oracle that always picked the best chart?** **Updated
+  2026-08-27 — the original answer here was wrong and has been corrected.**
+  A prior version of this section reported a 2.5–3.3pp oracle-vs-random
+  spread and concluded no routing algorithm could manufacture benefit the
+  library doesn't contain. That number rested on a 3-chart comparison where
+  the third chart (`chart_R1`, evaluated on R2 episodes) was never actually
+  run — the baseline's own results were duplicated and presented as if they
+  were `chart_R1`'s, undisclosed. **That missing evaluation has now been run
+  for real** (`atlas_out/e0_chart_r1_on_r2/ln_act_R2.jsonl`, 20 episodes,
+  `chart_ln_act_R1.pt` applied to R2 planning episodes, same seeds as the
+  existing baseline/`chart_R2` rows): baseline 45.0% (9/20), `chart_R2` 50.0%
+  (10/20), `chart_R1` 45.0% (9/20). **Real oracle SR = 60.0%, random SR =
+  46.7%, spread = 13.3pp, bootstrap 95% CI [3.3, 25.0]** — this CI does not
+  touch zero and clears the project's own 10pp reporting threshold, the
+  opposite of what the fabricated data showed. `chart_R1` is the unique
+  winner (baseline and `chart_R2` both fail) on 2 of the 20 episodes. **A
+  real denominator for chart routing does exist** — the conclusion that no
+  routing algorithm could show a meaningful benefit was based on fabricated
+  data and does not hold. Caveat: `chart_R1` and `chart_R2` come from two
+  different training runs (`e0_v6_R1` vs `e0_v3_dataset`), not a perfectly
+  matched triple, and n=20 is still a small sample. Full derivation:
+  `research_audit/CLAIMS_MATRIX.md` row N8, `research_audit/RESULTS_AUDIT.md`.
 - **Does the "commit a new chart only if it's verified to help" mechanism
   actually work, or is it just unexercised code?** Tested directly: 3 charts
   were actually committed through the real verification path when a genuine

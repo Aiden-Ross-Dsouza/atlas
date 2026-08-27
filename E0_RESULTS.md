@@ -1,5 +1,201 @@
 # E0 Results — Adapter Capacity (Final Run, 2026-08-23)
 
+## 🟢 R0 COST-RANKING CONTROL + DEGENERACY/REGRET METRICS (2026-08-27) — the near-zero ranking result is R2-SPECIFIC, and regret quantifies it directly
+
+**C.24 (Opus's most-repeated "non-negotiable"): does the near-zero
+cost-ranking result (§"COST-RANKING DIAGNOSTIC" below) hold under the
+*unshifted* regime too, or only under R2's damping shift?** Same design as
+the existing R2 diagnostic exactly — 10 fixed (state, goal) pairs, `--kinds
+baseline` (no R0 chart exists; R0 is the no-shift control, nothing to
+adapt to), iteration-0 candidate capture, 300 candidates/seed
+(`scripts/diagnose_cem_costs.py`, run via
+`modal/modal_e0_planning.py::diagnose_cem_costs` on Modal T4, ~$0.15 actual).
+
+| Regime | Mean of per-seed ρ | 95% CI | Pooled ρ (n=3000) |
+|---|---:|---|---:|
+| **R0 (no shift)** | **+0.501** | **[+0.277, +0.726]** | 0.741 (p≈0) |
+| R2 (damping 0.5) | −0.072 | [−0.243, +0.099] | 0.206 (p≈5×10⁻³⁰) |
+
+**Answer: R2-specific, not universal.** The planner's cost function ranks
+candidates *well* under default physics (a real, large, positive effect —
+the CI doesn't even come close to touching zero) and only degenerates under
+the R2 damping shift. §4.3 of `ATLAS_SUMMARY.md`'s "whatever determines
+ranking quality is a property of the specific task instance, not something
+the chart changes" is revised: true *within* R2, not true *across* regimes.
+
+**A.4/A.5/A.6 — degeneracy + regret/top-tail metrics, now computable
+because `diagnose_cem_costs.py` was extended to persist raw per-candidate
+`true_dist`/`contacts` (previously summary-stats-only).** R2's 10-seed
+diagnostic was re-run byte-for-byte identically (same charts-dir, same
+seeds, same `--iterations 1`) to regenerate raw data under the patched
+script — confirmed as a pure extension, not a behavior change: pooled ρ
+(0.206/0.227) and per-seed mean ρ (−0.072/−0.051) reproduce the original
+result exactly. New script: `scripts/analyze_cost_ranking.py`.
+
+| | Contact fraction (mean, range) | Mean regret (argmin-by-cost − batch min) | Top-10-by-cost mean vs. batch mean |
+|---|---:|---:|---:|
+| R0, baseline | 80.0% (16.7%–99.0%) | **8.5px** | **+28.2px (top-10 better)** |
+| R2, baseline | 80.0% (16.7%–99.0%) | **88.1px** | **−15.7px (top-10 WORSE)** |
+| R2, `ln_act` | 80.0% (16.7%–99.0%) | **92.3px** | **−8.5px (top-10 worse)** |
+
+**Not a degeneracy artifact** — contact fraction is real (80% of candidates
+touch the block on average, not "most candidates never touch anything")
+and, notably, *identical* across all three rows: iteration-0's raw CEM draw
+is model- and regime-independent by construction (same seeded action
+sampler), and geometric contact (shapes touching) turns out to be governed
+by the action sequence and initial positions, not by damping — damping only
+changes *post-contact* velocity retention. This rules out A.4's original
+concern (that ρ≈0 might just mean most candidates never touch the block).
+
+**Regret makes the R0-vs-R2 difference concrete, not just statistical.**
+Trusting the planner's cost-argmin under R0 costs ~8.5px versus the best
+candidate actually available in the batch — cheap, the ranking is doing real
+work. Under R2 that cost jumps to ~88-92px — an order of magnitude worse —
+**and the cost-ranked top-10 candidates average *worse* true outcomes than
+the unranked batch mean** (top10_vs_batch_gap negative: −15.7px baseline,
+−8.5px chart). Under R2, trusting the planner's own ranking is actively
+counterproductive relative to ignoring it. This is the sharpest available
+statement of the mechanism behind §4.1's planning-success null.
+
+**A.6 — CIs, not bare numbers**, now attached to every ρ reported above and
+in the original R2 section below (`diagnose_cem_costs.py`'s pooled_summary
+now always includes `ci95_of_mean_seed_rho`). The R2 result should be cited
+as "ρ = −0.072, 95% CI [−0.243, +0.099] — no reliable ranking signal," not
+"slightly inverted."
+
+Artifacts: `atlas_out/cost_ranking_R0/cost_ranking_R0_seeds0-1-...-9.json`,
+`atlas_out/cost_ranking_R2_v2/cost_ranking_R2_seeds0-1-...-9.json` (R2
+regenerated with raw per-candidate data), `scripts/analyze_cost_ranking.py`.
+
+---
+
+## 🟢 CONVERGED-CEM COST RANKING (2026-08-27) — CEM doesn't just fail to rank well under R2, it CONFIDENTLY CONVERGES to a knock-away
+
+**C.25: does the iteration-0 diagnostic above understate the problem?**
+Iteration-0 is CEM's raw, untrained prior draw — not what CEM actually
+executes from. `diagnose_cem_costs.py` gained a `--capture-iteration last`
+mode (captures the FINAL iteration's resampled population instead of the
+first) to test the standing objection that a real, converged search might
+rank candidates far better than a random draw. 3 seeds, full 300×30 search
+(not the `--iterations 1` shortcut), R2, baseline + `ln_act`.
+
+**It's worse, not better — CEM converges confidently to a failure.**
+Verified as genuine convergence, not noise: the std of the 300 final
+candidates' true outcome is tiny (3.8–8.3px for most seed/kind pairs, all
+candidates landing within centimeters of each other) — this is a real,
+tight local optimum, not scatter.
+
+| Seed | `init_block_pos_diff` | Baseline converged median `true_dist` | `ln_act` converged median `true_dist` |
+|---:|---:|---:|---:|
+| 0 | 91.5px | 119.7px (**worse than init**) | 89.8px (≈init) |
+| 1 | 45.8px | 62.6px (**worse than init**) | 54.4px (**worse than init**) |
+| 2 | 158.2px | 200.8px (**worse than init**) | 231.7px (**worse than init, worse than baseline**) |
+
+**Baseline's converged plan makes the block's position worse than doing
+nothing, in every one of the 3 seeds tested — not occasionally, every
+time.** This is the same knock-away failure mode already measured at 24%
+of episodes in the N=100 planning run, but this diagnostic shows *why* it's
+not occasional bad luck: the planner isn't uncertain and sometimes wrong —
+it's **certain and wrong**, converging tightly (small std) on an action that
+actively worsens the outcome under R2's real (damped) physics, because its
+internal model has no representation of that damping. `ln_act` is not
+reliably better (helps in 2/3 seeds, is the single worst result of all six
+seed/kind pairs in the third).
+
+Ranking quality at convergence is no better than iteration-0: pooled ρ is
+now *negative* for baseline (−0.179, p≈7×10⁻⁸ — a real, significant
+*inverted* ranking, not just noise-around-zero) and the per-seed mean stays
+near zero for both kinds (baseline −0.006 95% CI [−0.213, +0.201]; `ln_act`
+−0.006 95% CI [−0.132, +0.121]) — CEM's 30 iterations of "refinement" do
+not fix the ranking problem; they just make the planner more confident
+while executing a plan whose ranking was never reliable to begin with.
+
+Artifacts: `atlas_out/cost_ranking_R2_converged/cost_ranking_R2_seeds0-1-2_iterlast.json`
+(includes full per-candidate `true_dist`/`costs` arrays for all 3 seeds × 2 kinds).
+
+---
+
+## 🟢 SECTION-A ZERO-GPU ANALYSIS ON N=100 DATA (2026-08-27) — τ survives difficulty-conditioning; a mechanism-specific dissociation instance confirmed
+
+Five zero-cost checks (`scripts/analyze_n100.py`, pure post-processing of
+existing `atlas_out/e0_planning_n100/`, `e0_planning_sweep_{60,100}/`, and
+`cost_ranking_R2/` logs — no Modal, no model calls) requested in
+`OPUS_REMAINING_TASKS.md` §A, run before any new GPU spend per Opus's own
+ordering note. Full machine-readable output: `atlas_out/analysis_n100.json`.
+
+**A.1 — Knock-aways + mean progress at N=100, both arms.** The N=20
+mechanism-test result (5/20→2/20 knock-aways) **reproduces qualitatively at
+N=100**, though more modestly: baseline 24/100 (24.0%) knock-aways vs.
+`ln_act` 22/100 (22.0%) — a real but small reduction, not the roughly-halving
+seen at N=20. Mean progress moves the other direction from the raw
+percentage: baseline +25.1px vs. `ln_act` +32.4px (chart makes *more*
+progress per episode on average) — consistent with a chart that nudges
+outcomes in the right direction without moving the binary success/fail line
+enough to show up in SR. **Second dissociation instance, mechanism-specific**:
+knock-aways down, progress up, SR flat — the chart is doing something real,
+just not enough to cross the success threshold more often.
+
+**A.2 — SR by init-displacement bucket.** No stratum shows the chart
+helping: 0–80px (n=53 each) 64.2% vs. 64.2% (identical), 80–120px (n=23)
+34.8% vs. 30.4% (chart worse), 120–300px (n=24) 8.3% vs. 8.3% (identical,
+floor effect — hardest episodes fail almost regardless of arm). **The
+aggregate null is not hiding a stratum-specific win; it's uniform across
+difficulty.**
+
+**A.3 — Partial/stratified Kendall τ(UMF, success), controlling for
+`init_block_pos_diff` + `total_contacts`.** This is the decisive check for
+whether the UMF-success correlation is a *model-quality* signal or just
+*difficulty* leaking through both variables. **τ survives conditioning —
+the strong-claim branch, not the "rescope to difficulty" branch**:
+
+| Arm | Unconditional τ | Partial τ (OLS-residualized on difficulty + contacts) | p |
+|---|---:|---:|---:|
+| baseline | −0.406 | **−0.358** | 4.4×10⁻⁷ |
+| `ln_act` | −0.449 | **−0.374** | 9.6×10⁻⁸ |
+
+Attenuated (as expected — difficulty does explain *some* shared variance)
+but still large and still highly significant after removing the part of UMF
+and success both explained by episode difficulty and contact count. A
+tercile-binned stratified check corroborates: τ stays negative and mostly
+significant within every difficulty tercile for `ln_act` (−0.551, −0.419,
+−0.344, all p<0.03); baseline's hardest tercile alone drops to
+non-significance (τ=−0.098, p=0.52, n=31) — the one place a floor effect
+plausibly washes out the signal, consistent with A.2's 8.3% SR floor in that
+same bucket. **Conclusion: UMF tracks model quality within an episode, not
+merely episode difficulty** — the dissociation-figure claim (UMF predicts
+success within an arm, but not across arms) is on firm ground, not an
+artifact of task difficulty correlating with both variables.
+
+Catastrophic-episode eyeball (top-5 by |UMF|×failure-weighted score, both
+arms): no single episode carries the correlation — the highest-UMF failures
+span a range of `init_block_pos_diff` (46px to 146px), not one degenerate
+outlier.
+
+**A.7 — The "bridge" experiment.** Confirmed: the cost-ranking diagnostic's
+10 seeds and the N=100 planning run's episodes 0–9 draw from the **identical**
+`sample_dataset_init_goal` construction — `init_block_pos_diff` matches to
+machine precision (max abs diff = 0.0px) for all 10 seeds. Cross-referencing
+`ln_act`'s cost-ranking ρ against `ln_act`'s planning outcome for the same
+10 seeds: all 4 planning **successes** (seeds 6,7,8,9) have **negative**
+cost-ranking ρ (−0.338, −0.441, −0.157, −0.045); the 6 planning **failures**
+(seeds 0–5) have mixed-sign ρ (four positive, two negative). **n=10 is thin
+and this is not a claim of significance** — but the direction is the
+opposite of what a naive "inverted ranking causes failure" story would
+predict, which is itself worth flagging rather than silently extending to
+more seeds only if it had gone the expected way.
+
+**A.8 — Training-size sweep pairing verification.** Confirmed exactly:
+`init_block_pos_diff` matches to machine precision (max abs diff = 0.0px,
+not just 6 decimal places) across all pairwise comparisons among
+`e0_planning_n100`, `e0_planning_sweep_60`, and `e0_planning_sweep_100` for
+their 40 shared episode indices. The training-size sweep's pairing was
+never actually broken — this closes the last "verify, don't assume" item
+from `OPUS_REMAINING_TASKS.md` §A.
+
+Artifacts: `scripts/analyze_n100.py` (new, reusable), `atlas_out/analysis_n100.json`.
+
+---
+
 ## 🟡 NAS=2 CLOSED-LOOP ARM (2026-08-26) — direction flips positive vs. nas=6, but N=20 is underpowered to confirm
 
 **Tests explanation B (horizon compounding) from this file's earlier sections: does closing the

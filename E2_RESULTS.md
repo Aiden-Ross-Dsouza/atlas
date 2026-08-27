@@ -3,6 +3,49 @@
 *Ran 2026-08-26. Four runs, all on Modal L4, ~6 min each. Figure: `atlas_out/e2_R2/F2a.pdf`,
 regenerable from logs alone via `scripts/make_e2_figure.py`.*
 
+## 🟢 UPDATE (2026-08-27): original 2×2 cells re-run under the hysteresis fix — Limitation #2 now FULLY closed with real numbers, not just superseded by the 3-chart matrix
+
+The 2026-08-26 update above closed Limitation #2's *mechanism* (sequential
+hysteresis fixed) via the 3-chart confusion matrix, but explicitly left the
+*original* 2×2 cell numbers below (Cell B's "0.880 vs. 0.324" headline)
+un-re-run under the fix — flagged then as "cheap to re-run if those exact
+numbers are cited externally." Re-run locally (no GPU/CEM planner needed,
+~$0.10 total per `run_e2.py`'s own cost estimate), same protocol as the
+original three runs, `--corruption dark` (matching the original methodology,
+not the script's own `colour_change` default):
+
+| Config | Cell | UMF acc. (pre-fix → post-fix) | S-dyn acc. (pre-fix → post-fix) |
+|---|---|---:|---:|
+| `ln_act`×R1 | B | 0.512 → **0.642** | 0.381 → **0.543** |
+| `lora4`×R1 | B | 0.619 → **0.642** | 0.494 → **0.494** |
+| `ln_act`×R2 (decisive) | B | 0.880 → **0.833** | 0.324 → **0.570** |
+
+**The headline direction survives — UMF still clearly beats S-dyn on the
+decisive R2 Cell B — but the margin shrank substantially: +55.6pp → +26.3pp.**
+S-dyn's accuracy rose the most (0.324→0.570): with hysteresis now correctly
+carrying the router's own prior selection forward (rather than always
+resetting to `current_idx=0`, which had been silently inflating "always
+defaults to `c0`"-biased S-dyn's apparent correctness whenever `c0` happened
+to be the right answer at that point in a sequence), S-dyn's naive
+stickiness now sometimes coincides with the correct answer for the right
+reason (post-switch persistence) rather than the wrong one (never having
+switched at all). **`lora4`×R1's Cell B is now tied with `ln_act`×R1's UMF
+accuracy (0.642 each)** — the R1/R2 separability story (§"The mechanism"
+below) is otherwise unchanged: R1 chart pairs still route near chance,
+R2 still routes decisively above it.
+
+Cell C (over-expansion) still commits 0 charts in every one of the three
+configs, confirming the fix didn't disturb that result. Full corruption
+check confirms `dark`, not `colour_change`, was used this time (100% of
+pixels changed, matching the original methodology — the very first attempt
+at this re-run mistakenly used the script's own `colour_change` default and
+was discarded before being recorded anywhere).
+
+Artifacts: `atlas_out/e2_R1_posthysteresis/`, `atlas_out/e2_R1_lora4_posthysteresis/`,
+`atlas_out/e2_R2_posthysteresis/` (each: `e2_episodes.jsonl`, `e2_summary.json`, `F2a.pdf`).
+
+---
+
 ## 🟢 UPDATE (2026-08-26): 3-chart confusion matrix + sequential hysteresis — Limitations #2 and #4 below closed
 
 Two of this file's own "read before citing" caveats are now addressed, both cheap (ran locally,
@@ -150,12 +193,12 @@ dynamics, S-dyn tracks nothing regime-dependent — is what Cell B was designed 
 1. **False positives on unchanged dynamics.** UMF keeps `c0` only 70–77% of the time under R0,
    i.e. a **23–30% false-switch rate**, despite the mean gap correctly favouring `c0`. This is
    per-chunk variance, not bias. A quarter-of-the-time wrong switch is a real weakness.
-2. ~~**`current_idx=0` on every decision.**~~ **FIXED (2026-08-26), see the UPDATE section at the
-   top of this file.** `route()` now carries each router's own previously-selected chart forward.
-   Not yet re-run for the original 2×2 cells specifically (the fix landed via the 3-chart
-   confusion-matrix run, which supersedes this concern for that data but the 2×2 numbers below are
-   still the pre-fix `current_idx=0` ones) — re-running Cells A–D under the fix would be a cheap
-   follow-up if those exact numbers are cited externally.
+2. ~~**`current_idx=0` on every decision.**~~ **FIXED (2026-08-26), and the original 2×2 cells
+   themselves re-run under the fix (2026-08-27) — see the top-of-file UPDATE section.** `route()`
+   now carries each router's own previously-selected chart forward. The 2×2 numbers below are
+   the PRE-FIX ones, kept for the historical record — cite the 2026-08-27 UPDATE section's numbers
+   instead (Cell B: `ln_act`×R2 UMF 0.833 vs S-dyn 0.570, down from the pre-fix 0.880 vs 0.324 —
+   the direction survives, the margin does not).
 3. **27–30% of decisions were gated out** by the min-motion gate (`motion_gate` 312.34, 10th pct
    of R0 training displacement). Expected behaviour per G6, but each condition is ~80 decisions,
    not 120.
