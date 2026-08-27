@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 import atlas
 from atlas.chart import Chart
@@ -45,7 +47,16 @@ from atlas.stats import normalised_recovery, paired_bootstrap, success_rate_ci
 from atlas.streams import paired_seed
 
 REPO_ROOT = Path(__file__).parent.parent
-HUB_PATH = str(REPO_ROOT / "hub" / "hub" / "facebookresearch_jepa-wms_main")
+# Raw ATLAS_HOME env var, NOT atlas.ATLAS_HOME: that's .resolve()'d, which on
+# Modal follows the volume mount (/atlas_root) down to its internal storage
+# path -- a path that isn't itself mounted anywhere, so torch.hub's file
+# access on the resolved path 404s even though the file is really there
+# under /atlas_root. REPO_ROOT alone is wrong on Modal: the hub cache lives
+# on the mounted volume, not in the uploaded code checkout (deliberately
+# excluded from the image's add_local_dir, see modal_e0_planning.py).
+# Matches run_e0_planning.py's identical fix.
+_atlas_home = os.environ.get("ATLAS_HOME", str(REPO_ROOT))
+HUB_PATH = str(Path(_atlas_home) / "hub" / "hub" / "facebookresearch_jepa-wms_main")
 if HUB_PATH not in sys.path:
     sys.path.insert(0, HUB_PATH)
 
@@ -301,44 +312,70 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     # harness.log_episode() opens in append mode by design (accumulates
-    # records across this run's episode loop) -- so a stale file from a
-    # PREVIOUS run must be cleared here, once, before the loop starts, or
-    # re-running silently concatenates old and new runs into one file
-    # (E0_IMPLEMENTATION_PLAN.md T12 #8).
+    # records across this run's episode loop). RESUME SUPPORT (added
+    # 2026-08-27, matching run_e0_planning.py's pattern): rather than
+    # unconditionally deleting episodes.jsonl -- which discarded any partial
+    # progress from an interrupted run (e.g. a dropped local connection under
+    # --detach on Modal, or a mid-run credit/quota cutoff) -- read whatever
+    # episode_ids are already present and skip only those. Point --out at a
+    # NEW directory for a genuinely fresh run with different routers/episodes/
+    # seeds; reusing the same --out with the same config now resumes instead
+    # of silently concatenating unrelated runs (the original T12 #8 concern),
+    # because completed episode_ids are looked up by exact key, not by count.
     episodes_jsonl = args.out / "episodes.jsonl"
-    if episodes_jsonl.exists():
-        episodes_jsonl.unlink()
+    already_done: set[str] = set()
     all_records = []
-    for router in args.routers:
-        for seed_run in range(args.seeds):
-            for ep_idx in range(args.episodes):
-                seed = paired_seed(0, ep_idx + seed_run * 10_000)
-                record = run_e1_episode(
-                    library=library,
-                    agent=agent,
-                    world_model=model,
-                    base_env=base_env,
-                    regime=regime_wrapper,
-                    goal_utils=goal_utils,
-                    router=router,
-                    episode_seed=seed,
-                    n_warmup_replans=N_WARMUP_REPLANS,
-                    n_replans_target=n_replans_target,
-                    frameskip=FRAMESKIP,
-                    num_act_stepped=args.num_act_stepped,
-                    motion_gate=motion_gate,
-                    hysteresis=HYSTERESIS,
-                    out_dir=args.out,
-                    episode_id=f"{router}_{seed_run}_{ep_idx}",
-                    regime_label=REGIME_LABELS[args.regime],
-                    label_to_chart=label_to_chart,
-                )
-                record["seed_run"] = seed_run
-                record["ep_idx"] = ep_idx
-                all_records.append(record)
-                print(f"  [{router}] seed={seed_run} ep={ep_idx}: "
-                      f"success={record['success']} replans={record['n_replans']} "
-                      f"steps={record['elapsed_raw_steps']}")
+    if episodes_jsonl.exists():
+        with open(episodes_jsonl) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                already_done.add(rec["episode_id"])
+                all_records.append(rec)
+        if already_done:
+            print(f"Resuming: {len(already_done)} episode(s) already done in {episodes_jsonl}")
+
+    all_episode_ids = [
+        (router, seed_run, ep_idx)
+        for router in args.routers
+        for seed_run in range(args.seeds)
+        for ep_idx in range(args.episodes)
+    ]
+    remaining = [
+        (router, seed_run, ep_idx) for router, seed_run, ep_idx in all_episode_ids
+        if f"{router}_{seed_run}_{ep_idx}" not in already_done
+    ]
+    pbar = tqdm(remaining, desc="E1 episodes", unit="ep")
+    for router, seed_run, ep_idx in pbar:
+        seed = paired_seed(0, ep_idx + seed_run * 10_000)
+        record = run_e1_episode(
+            library=library,
+            agent=agent,
+            world_model=model,
+            base_env=base_env,
+            regime=regime_wrapper,
+            goal_utils=goal_utils,
+            router=router,
+            episode_seed=seed,
+            n_warmup_replans=N_WARMUP_REPLANS,
+            n_replans_target=n_replans_target,
+            frameskip=FRAMESKIP,
+            num_act_stepped=args.num_act_stepped,
+            motion_gate=motion_gate,
+            hysteresis=HYSTERESIS,
+            out_dir=args.out,
+            episode_id=f"{router}_{seed_run}_{ep_idx}",
+            regime_label=REGIME_LABELS[args.regime],
+            label_to_chart=label_to_chart,
+        )
+        record["seed_run"] = seed_run
+        record["ep_idx"] = ep_idx
+        all_records.append(record)
+        pbar.set_postfix(router=router, seed=seed_run, ep=ep_idx,
+                          success=record["success"], replans=record["n_replans"],
+                          steps=record["elapsed_raw_steps"])
 
     t1_md = compute_t1(all_records, args.routers)
     (args.out / "T1.md").write_text(t1_md)

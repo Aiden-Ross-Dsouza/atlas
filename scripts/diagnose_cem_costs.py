@@ -42,10 +42,11 @@ import numpy as np
 import torch
 from einops import rearrange
 from scipy.stats import spearmanr
+from tqdm import tqdm
 
 import atlas
 from atlas.chart import Chart
-from atlas.regimes import PhysicsRegime
+from atlas.regimes import PhysicsRegime, set_regime_config
 
 from run_e0_planning import (  # noqa: E402
     FRAMESKIP, HUB_PATH, block_success, build_cfg, load_dataset_states,
@@ -58,20 +59,37 @@ from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv  # noqa: E
 from evals.simu_env_planning.planning.gc_agent import GC_Agent  # noqa: E402
 
 
-def instrument_cost_function(planner, capture: list) -> None:
-    """Captures the FULL iteration-0 candidate batch (actions + costs) -- same
-    candidates for every kind by construction (CEM's first draw doesn't depend
-    on the model), so later iterations are irrelevant to this diagnostic and
-    are not captured."""
+def instrument_cost_function(planner, capture: list, capture_iteration: str = "first") -> None:
+    """Captures ONE CEM candidate batch (actions + costs).
+
+    capture_iteration="first" (default, original behaviour): captures
+    iteration-0 only -- the raw prior draw, same candidates for every kind by
+    construction (CEM's first draw doesn't depend on the model), so later
+    iterations are irrelevant and not captured.
+
+    capture_iteration="last": keeps overwriting `capture` on every call, so
+    once the CEM loop finishes it holds the FINAL iteration's population
+    (the converged/elite-refined candidates CEM actually executes from) --
+    answers the standing objection that iteration-0 is an untrained random
+    draw, not what CEM actually uses (OPUS_REMAINING_TASKS.md C.25). Note
+    this candidate batch is NOT shared across kinds the way iteration-0 is
+    (each kind's own model shapes which candidates survive to the final
+    iteration), so the cross-kind "same input" assumption/warning in main()
+    only applies in "first" mode.
+    """
     original = planner.cost_function
     call_count = [0]
 
     def wrapped(actions, z_init):
         cost = original(actions, z_init)
         call_count[0] += 1
-        if call_count[0] == 1:
+        if capture_iteration == "first" and call_count[0] == 1:
             capture.append(actions.detach().cpu().clone())  # [horizon, num_samples, A]
             capture.append(cost.detach().cpu().clone().flatten())  # [num_samples]
+        elif capture_iteration == "last":
+            capture.clear()
+            capture.append(actions.detach().cpu().clone())
+            capture.append(cost.detach().cpu().clone().flatten())
         return cost
 
     planner.cost_function = wrapped
@@ -79,25 +97,31 @@ def instrument_cost_function(planner, capture: list) -> None:
 
 def rollout_true_outcomes(base_env, regime, seed: int, init_state: np.ndarray,
                            goal_state: np.ndarray, model_actions: torch.Tensor,
-                           agent: GC_Agent) -> np.ndarray:
+                           agent: GC_Agent) -> tuple[np.ndarray, np.ndarray]:
     """model_actions: [horizon, num_samples, action_dim] (model-chunk,
     normalized -- CEM's own units). Resets to the identical init_state before
     EVERY candidate so each rollout is independent, then executes that
-    candidate's raw actions for real. Returns per-candidate true final
-    block_pos_diff (px, lower = better), shape [num_samples]."""
+    candidate's raw actions for real. Returns (true final block_pos_diff [px,
+    lower=better], total_contacts) per candidate, both shape [num_samples] --
+    contacts added for OPUS_REMAINING_TASKS.md A.4's degeneracy check (do
+    most iteration-0 candidates ever touch the block at all?)."""
     num_samples = model_actions.shape[1]
     distances = np.empty(num_samples, dtype=np.float64)
+    contacts = np.empty(num_samples, dtype=np.int64)
     for i in range(num_samples):
         cand = model_actions[:, i, :]  # [horizon, A]
         raw = rearrange(cand, "t (f d) -> (t f) d", d=2)
         raw = agent.preprocessor.denormalize_actions(raw).numpy()
         prepare_with_visual(base_env, regime, seed, init_state)  # reset -- same start every candidate
         final_state = None
+        total_contacts = 0
         for a in raw:
             _, _, _, info = base_env.step(a)
             final_state = info["state"]
+            total_contacts += info["n_contacts"]
         distances[i] = block_success(goal_state, final_state)["block_pos_diff"]
-    return distances
+        contacts[i] = total_contacts
+    return distances, contacts
 
 
 def main() -> None:
@@ -106,6 +130,13 @@ def main() -> None:
     parser.add_argument("--kinds", nargs="+", required=True,
                          choices=["baseline", "ln_act", "lora4", "full"])
     parser.add_argument("--regime", required=True, choices=["R0", "R1", "R2"])
+    parser.add_argument("--regime-config", type=str, default=None,
+                         help="JSON dict overriding this regime's default physics params, e.g. "
+                              "'{\"damping\": 0.25}' for an intermediate severity between R0's "
+                              "implicit 0 and R2's default 0.5. Applied via "
+                              "atlas.regimes.set_regime_config, same mechanism as "
+                              "run_e0_planning.py's identical flag. Omit to use REGIME_CONFIGS' "
+                              "existing default for --regime.")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0],
                          help="One (state,goal) pair per seed -- loops all kinds x all seeds, "
                               "reusing the loaded model (only the predictor weights get swapped "
@@ -114,6 +145,13 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--num-act-stepped", type=int, default=6)
+    parser.add_argument("--capture-iteration", choices=["first", "last"], default="first",
+                         help="'first' (default): iteration-0's raw prior draw, same candidates "
+                              "across kinds by construction (the original design). 'last': the "
+                              "FINAL iteration's converged/elite-refined population -- what CEM "
+                              "actually executes from (OPUS_REMAINING_TASKS.md C.25). NOT shared "
+                              "across kinds in 'last' mode -- the cross-kind same-input warning "
+                              "below only fires meaningfully in 'first' mode.")
     parser.add_argument("--charts-dir", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--out-dir", type=Path, default=atlas.OUT_DIR / "cost_ranking")
     args = parser.parse_args()
@@ -137,6 +175,8 @@ def main() -> None:
     # kinds; see HANDOFF.md's chart.restore_() gotcha).
     pristine_predictor_state = {k: v.clone() for k, v in wm.predictor.state_dict().items()}
 
+    if args.regime_config is not None:
+        set_regime_config(args.regime, json.loads(args.regime_config))
     base_env = PushTEnv(render_size=224, with_velocity=True)
     regime = PhysicsRegime(base_env, args.regime)  # wraps base_env directly (T6) -- NOT PushTWrapper
     states, seq_lengths = load_dataset_states()
@@ -146,7 +186,8 @@ def main() -> None:
     pooled_costs: dict[str, list[float]] = {k: [] for k in args.kinds}
     pooled_dist: dict[str, list[float]] = {k: [] for k in args.kinds}
 
-    for seed in args.seeds:
+    seed_pbar = tqdm(args.seeds, desc=f"cost_ranking_{args.regime}", unit="seed")
+    for seed in seed_pbar:
         rs = np.random.RandomState(seed)
         init_state, goal_state = sample_dataset_init_goal(states, seq_lengths, rs)
         print(f"\n== seed={seed} regime={args.regime} "
@@ -154,7 +195,7 @@ def main() -> None:
 
         results: dict = {}
         shared_actions: torch.Tensor | None = None
-        for kind in args.kinds:
+        for kind in tqdm(args.kinds, desc="  kinds", unit="kind", leave=False):
             wm.predictor.load_state_dict(pristine_predictor_state)
             if kind != "baseline":
                 chart_path = args.charts_dir / f"chart_{kind}_{args.regime}.pt"
@@ -165,7 +206,7 @@ def main() -> None:
             agent.device = device
 
             capture: list = []
-            instrument_cost_function(agent.planner, capture)
+            instrument_cost_function(agent.planner, capture, capture_iteration=args.capture_iteration)
 
             goal_obs, _ = prepare_with_visual(base_env, regime, seed, goal_state)
             agent.set_goal(make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
@@ -176,19 +217,27 @@ def main() -> None:
             agent.act(obs_td, steps_left=args.num_act_stepped)
 
             actions, costs = capture  # [horizon, num_samples, A], [num_samples]
-            if shared_actions is None:
-                shared_actions = actions
-            else:
-                max_diff = (actions - shared_actions).abs().max().item()
-                if max_diff > 1e-5:
-                    print(f"  [WARN] seed={seed} kind={kind}'s iteration-0 candidates differ from "
-                          f"the first kind's by {max_diff:.6g} -- the same-input guarantee this "
-                          f"diagnostic relies on doesn't hold here for this seed.")
+            if args.capture_iteration == "first":
+                if shared_actions is None:
+                    shared_actions = actions
+                else:
+                    max_diff = (actions - shared_actions).abs().max().item()
+                    if max_diff > 1e-5:
+                        print(f"  [WARN] seed={seed} kind={kind}'s iteration-0 candidates differ "
+                              f"from the first kind's by {max_diff:.6g} -- the same-input guarantee "
+                              f"this diagnostic relies on doesn't hold here for this seed.")
 
-            true_dist = rollout_true_outcomes(base_env, regime, seed, init_state, goal_state,
-                                               actions, agent)
+            true_dist, contacts = rollout_true_outcomes(base_env, regime, seed, init_state,
+                                                          goal_state, actions, agent)
             rho, pval = spearmanr(costs.numpy(), true_dist)
+            contact_mask = contacts > 0
+            contact_frac = float(contact_mask.mean())
+            if contact_mask.sum() >= 3:
+                rho_contact, pval_contact = spearmanr(costs.numpy()[contact_mask], true_dist[contact_mask])
+            else:
+                rho_contact, pval_contact = float("nan"), float("nan")
             print(f"  kind={kind}: rho={rho:.3f} (p={pval:.4g}), n={len(true_dist)}, "
+                  f"contact_frac={contact_frac:.3f}, rho|contact={rho_contact:.3f}, "
                   f"mean_true_dist={true_dist.mean():.1f}px, "
                   f"best_by_cost_true_dist={true_dist[int(costs.argmin())]:.1f}px")
             results[kind] = {
@@ -196,6 +245,18 @@ def main() -> None:
                 "n_candidates": int(len(true_dist)),
                 "mean_true_dist": float(true_dist.mean()),
                 "best_by_cost_true_dist": float(true_dist[int(costs.argmin())]),
+                # A.4/A.5 (OPUS_REMAINING_TASKS.md): degeneracy + regret/top-tail metrics
+                # need per-candidate data, not just summary stats -- persisted below.
+                "contact_fraction": contact_frac,
+                "min_true_dist": float(true_dist.min()),
+                "median_true_dist": float(np.median(true_dist)),
+                "max_true_dist": float(true_dist.max()),
+                "spearman_rho_contact_subset": float(rho_contact),
+                "spearman_p_contact_subset": float(pval_contact),
+                "n_contact_subset": int(contact_mask.sum()),
+                "costs": costs.numpy().tolist(),
+                "true_dist": true_dist.tolist(),
+                "contacts": contacts.tolist(),
             }
             pooled_costs[kind].extend(costs.numpy().tolist())
             pooled_dist[kind].extend(true_dist.tolist())
@@ -204,26 +265,44 @@ def main() -> None:
             "seed": seed, "init_state": init_state.tolist(), "goal_state": goal_state.tolist(),
             "results": results,
         })
+        seed_pbar.set_postfix({k: f"{results[k]['spearman_rho']:.3f}" for k in args.kinds})
 
     print(f"\n== Pooled across {len(args.seeds)} seed(s), "
           f"{args.num_samples} candidates/seed ==")
     pooled_summary: dict = {}
     for kind in args.kinds:
         rho, pval = spearmanr(pooled_costs[kind], pooled_dist[kind])
-        mean_of_seed_rhos = float(np.mean([s["results"][kind]["spearman_rho"] for s in per_seed]))
+        seed_rhos = [s["results"][kind]["spearman_rho"] for s in per_seed]
+        mean_of_seed_rhos = float(np.mean(seed_rhos))
+        # A.6 (OPUS_REMAINING_TASKS.md): report the per-seed mean as a proper
+        # CI, not a bare number -- SD/sqrt(n) across seeds, 95% via normal
+        # approx (n=10 is thin for a t-based CI to matter much either way).
+        sd_of_seed_rhos = float(np.std(seed_rhos, ddof=1)) if len(seed_rhos) > 1 else float("nan")
+        se_of_mean = sd_of_seed_rhos / np.sqrt(len(seed_rhos)) if len(seed_rhos) > 1 else float("nan")
+        ci95 = (mean_of_seed_rhos - 1.96 * se_of_mean, mean_of_seed_rhos + 1.96 * se_of_mean) \
+            if len(seed_rhos) > 1 else (float("nan"), float("nan"))
         print(f"  kind={kind}: pooled rho={rho:.3f} (p={pval:.4g}, n={len(pooled_dist[kind])}) | "
-              f"mean of per-seed rhos={mean_of_seed_rhos:.3f}")
+              f"mean of per-seed rhos={mean_of_seed_rhos:.3f}, "
+              f"95% CI [{ci95[0]:.3f}, {ci95[1]:.3f}] (n_seeds={len(seed_rhos)})")
         pooled_summary[kind] = {
             "pooled_spearman_rho": float(rho), "pooled_spearman_p": float(pval),
             "pooled_n": len(pooled_dist[kind]),
             "mean_of_per_seed_rhos": mean_of_seed_rhos,
+            "sd_of_per_seed_rhos": sd_of_seed_rhos,
+            "se_of_mean_seed_rho": se_of_mean,
+            "ci95_of_mean_seed_rho": list(ci95),
         }
 
     seeds_str = "-".join(str(s) for s in args.seeds)
-    out_path = args.out_dir / f"cost_ranking_{args.regime}_seeds{seeds_str}.json"
+    suffix = "" if args.capture_iteration == "first" else f"_iter{args.capture_iteration}"
+    out_path = args.out_dir / f"cost_ranking_{args.regime}_seeds{seeds_str}{suffix}.json"
     out_path.write_text(json.dumps({
         "regime": args.regime, "seeds": args.seeds, "kinds": args.kinds,
         "num_samples": args.num_samples, "iterations": args.iterations,
+        "capture_iteration": args.capture_iteration,
+        "charts_dir": str(args.charts_dir),  # provenance -- see the atlas_out/e0 (pre-fix,
+                                              # invalidated) vs atlas_out/e0_v3_dataset (canonical)
+                                              # gap this metadata field is meant to prevent.
         "per_seed": per_seed, "pooled": pooled_summary,
     }, indent=2))
     print(f"\nSaved: {out_path}")
