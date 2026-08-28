@@ -83,7 +83,22 @@ def stream_s2(
         episodes: list[EpisodeSpec] = []
         for seg_idx, regime in enumerate(seq):
             for ep_idx in range(episodes_per_segment):
-                seed = paired_seed(seg_idx + stream_seed_offset * 1000,
+                # FIX_SPEC.md B5: was `seg_idx + stream_seed_offset*1000` --
+                # keying on the ABSOLUTE segment index means segment 0
+                # (first A-visit) and segment 2 (second A-visit) got
+                # DIFFERENT seeds for the same episode_idx, so their
+                # init/goal states differed and RQ4's paired
+                # first-visit-vs-revisit comparison had no shared episode
+                # to pair against (recall would be measured against a
+                # different Push-T instance each visit, not the same one
+                # revisited). Key on `seg_idx % 2` instead -- the
+                # REGIME-VISIT SLOT (0 = every A-visit: segments 0,2,4;
+                # 1 = every B-visit: segments 1,3,5), so episode i of every
+                # visit to the same regime shares the identical seed (=
+                # identical init state + goal), and only the accumulated
+                # library/adapter state differs across visits -- exactly
+                # what a recall/forgetting comparison needs to hold fixed.
+                seed = paired_seed((seg_idx % 2) + stream_seed_offset * 1000,
                                    ep_idx + seed_run * 10_000)
                 episodes.append(EpisodeSpec(
                     segment_idx=seg_idx,

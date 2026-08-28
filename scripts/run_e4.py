@@ -83,9 +83,10 @@ HYSTERESIS = 0.05
 REGIME_LABELS = {"R0": 0, "R1": 1, "R2": 2}
 
 
-def build_planner_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: int) -> OmegaConf:
+def build_planner_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: int,
+                       local_seed: int = 0) -> OmegaConf:
     return OmegaConf.create({
-        "local_seed": 0,
+        "local_seed": local_seed,
         "task_specification": {"obs": "rgb_state"},
         "planner": {
             "planner_name": "cem",
@@ -124,6 +125,22 @@ def main() -> None:
     parser.add_argument("--arms", nargs="+", default=ALL_ARMS, choices=ALL_ARMS)
     parser.add_argument("--episodes", type=int, default=20, help="Episodes PER SEGMENT.")
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--seed-run-offset", type=int, default=0,
+                        help="FIX_SPEC.md B12: base seed_run index for THIS process. "
+                             "modal_e4.py always requests --seeds 1 (one seed_run per "
+                             "container) but previously always ran local seed_run=0 "
+                             "regardless of which seed_run the container was launched "
+                             "for -- get_stream(...) was built with seeds=1, so "
+                             "streams[0] (the seed_run=0 episode/init/goal set) was the "
+                             "only stream ever generated, and modal_e4.py's post-hoc "
+                             "rec['seed_run']=seed_run relabelling made 'different "
+                             "seeds' silently mean 'bit-identical episodes under "
+                             "different labels'. With --seed-run-offset=K, this process "
+                             "generates and runs streams[K:K+seeds] (the REAL seed_run "
+                             "K..K+seeds-1 episode sets) and seeds the CEM planner's own "
+                             "local_seed from K too, so distinct containers launched at "
+                             "distinct offsets genuinely diverge in both init/goal "
+                             "sampling and planner sampling.")
     parser.add_argument("--segment-regimes", nargs=2, default=["R0", "R2"],
                         metavar=("REGIME_A", "REGIME_B"),
                         help="Alternating S2 regime pair (A,B). Default R0/R2 -- see "
@@ -151,7 +168,23 @@ def main() -> None:
                              "GPU-h for the full grid, then exit without running anything else.")
     args = parser.parse_args()
 
-    n_replans_target = max(args.max_mpc_steps // args.num_act_stepped, 1)
+    # FIX_SPEC.md B10: was `max_mpc_steps // num_act_stepped` -- a raw-step
+    # budget (max_mpc_steps) divided by a MODEL-step count
+    # (num_act_stepped), a unit mismatch (num_act_stepped counts model
+    # chunks, each frameskip=5 raw steps long). At nas=1 this computed
+    # n_replans_target=30 instead of the correct 6 -- numerically INERT for
+    # episode length only because harness_e4.py's replan loop separately
+    # breaks once `elapsed >= max_raw_steps`, so real episodes still ran 6
+    # replans regardless. But n_replans_target also feeds
+    # `steps_left_model = (n_replans_target - replan_idx) * num_act_stepped`
+    # (harness_e4.py), which tells the CEM planner how many MODEL steps
+    # remain so it can shorten its plan/horizon near the end of the
+    # episode -- with the wrong (30 instead of 6) n_replans_target,
+    # steps_left_model was always far larger than the horizon (6), so that
+    # shortening logic never actually engaged. Divide by RAW steps per
+    # replan (num_act_stepped * FRAMESKIP), matching max_mpc_steps' own
+    # raw-step units.
+    n_replans_target = max(args.max_mpc_steps // (args.num_act_stepped * FRAMESKIP), 1)
     regime_a, regime_b = args.segment_regimes
 
     print("Loading dino_wm_pusht from local hub...")
@@ -179,17 +212,42 @@ def main() -> None:
     # for the whole stream (plan §3 -- a per-regime gate would shift the
     # informative-chunk definition underneath the strike counter, exactly
     # what G6 exists to prevent).
-    print(f"Computing motion_gate from a fresh {regime_a} trajectory sample...")
+    #
+    # FIX_SPEC.md B3 (SUBMISSION_PLAN.md Part B2 B3, confirmed empirically by
+    # the Phase 3 Step 0 measurement -- research_audit/FIXLOG.md): the OLD
+    # calibration took the 10th percentile of WHOLE-"traj_len=10" (== 2
+    # model-step, since frameskip=5) displacement from only 3 trajectories,
+    # then applied that threshold to SINGLE-model-step (nas=1) chunks at
+    # runtime -- a quantity that is structurally larger than what it gates.
+    # Measured: old gate=317.77 vs. real nas=1 chunk displacement max
+    # 278.55 (R0) / 331.57 (R2) -- 100.00% / 99.44% of real nas=1 chunks
+    # gated to None. Recalibrated here at the EXACT chunk granularity
+    # scored at runtime (frameskip * num_act_stepped raw steps -> ONE
+    # model-step chunk when num_act_stepped=1, matching harness_e4.py's
+    # own per-replan re-encoding window), over >=30 trajectories (was 3).
+    gate_traj_len = FRAMESKIP * args.num_act_stepped
+    gate_num_trajs = 30
+    print(f"Computing motion_gate from {gate_num_trajs} fresh {regime_a} trajectories "
+          f"at the runtime-scored chunk size (traj_len={gate_traj_len} = "
+          f"frameskip*num_act_stepped)...")
     gate_trajectories = load_regime_trajectories(
-        model, prep, regime_a, num_trajs=3, traj_len=10, device=device, seed_offset=20_000)
+        model, prep, regime_a, num_trajs=gate_num_trajs, traj_len=gate_traj_len,
+        device=device, seed_offset=20_000)
     gate_displacements = torch.tensor([
         (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
         for t in gate_trajectories
     ])
     motion_gate = compute_motion_gate(gate_displacements)
-    print(f"  motion_gate = {motion_gate:.4f}")
+    print(f"  motion_gate = {motion_gate:.4f}  "
+          f"(from {len(gate_displacements)} single-chunk displacements, "
+          f"range [{gate_displacements.min():.2f}, {gate_displacements.max():.2f}])")
 
-    cfg = build_planner_cfg(args.num_samples, args.iterations, args.horizon, args.num_act_stepped)
+    # FIX_SPEC.md B12: local_seed now varies with --seed-run-offset so the
+    # CEM planner's own internal sampling genuinely differs across
+    # containers launched at distinct offsets, not just the init/goal draw
+    # below.
+    cfg = build_planner_cfg(args.num_samples, args.iterations, args.horizon,
+                            args.num_act_stepped, local_seed=args.seed_run_offset)
     agent = GC_Agent(cfg, model, dset=None, preprocessor=prep)
     agent.device = device
 
@@ -210,8 +268,18 @@ def main() -> None:
         args.arms = ["atlas"]
         print(f"\n[PROFILE MODE] arm=atlas, segment 0 only, {args.episodes} episode(s)")
 
-    streams = get_stream(args.stream, args.episodes, args.seeds, regimes=(regime_a, regime_b))
-    print(f"\nStream {args.stream}: {len(streams)} seed(s) x "
+    # FIX_SPEC.md B12: request enough streams to cover
+    # [seed_run_offset, seed_run_offset + seeds), not just [0, seeds) --
+    # get_stream/stream_s2 always generate sequentially from seed_run=0, so
+    # to genuinely produce the seed_run=K..K+seeds-1 episode sets this
+    # process must ask for seed_run_offset+seeds streams total and use the
+    # tail slice. (Cheap: stream_s2 is pure seed arithmetic, no GPU/env
+    # cost per extra stream.)
+    streams_all = get_stream(args.stream, args.episodes, args.seed_run_offset + args.seeds,
+                              regimes=(regime_a, regime_b))
+    streams = streams_all[args.seed_run_offset:args.seed_run_offset + args.seeds]
+    print(f"\nStream {args.stream}: {len(streams)} seed(s) (seed_run "
+          f"{args.seed_run_offset}..{args.seed_run_offset + args.seeds - 1}) x "
           f"{len(streams[0])} episodes each (regimes={regime_a}/{regime_b})")
     print(f"Arms: {args.arms}")
     print(f"Output: {args.out}")
@@ -232,15 +300,20 @@ def main() -> None:
 
     profile_seeds = 1 if args.profile else args.seeds
     for arm in args.arms:
-        for seed_run in range(profile_seeds):
+        # FIX_SPEC.md B12: seed_run is now the REAL global seed_run index
+        # (offset-shifted); `streams` was already sliced to
+        # [seed_run_offset, seed_run_offset+seeds), so index into it with
+        # the LOCAL position `local_i`, not the global `seed_run`.
+        for local_i in range(profile_seeds):
+            seed_run = args.seed_run_offset + local_i
             wm.predictor.load_state_dict(pristine_predictor_state)
             state = build_arm_state(
                 arm=arm, predictor=wm.predictor, world_model=model, kind=args.kind,
                 chart_b_path=chart_b_path, cfg=atlas_cfg,
                 expansion_start_library=args.expansion_start_library,
             )
-            specs = streams[seed_run] if not args.profile else \
-                [s for s in streams[seed_run] if s.segment_idx == 0][:args.episodes]
+            specs = streams[local_i] if not args.profile else \
+                [s for s in streams[local_i] if s.segment_idx == 0][:args.episodes]
 
             for spec in specs:
                 key = (arm, seed_run, spec.global_episode_idx)

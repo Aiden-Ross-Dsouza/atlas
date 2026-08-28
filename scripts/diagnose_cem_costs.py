@@ -186,6 +186,19 @@ def main() -> None:
     pooled_costs: dict[str, list[float]] = {k: [] for k in args.kinds}
     pooled_dist: dict[str, list[float]] = {k: [] for k in args.kinds}
 
+    # FIX_SPEC.md C7: this script used to write ONLY at the very end (the
+    # documented cause of two lost dose-response runs -- a crash/timeout
+    # anywhere in the seeds x kinds loop below lost every already-computed
+    # seed's data). Compute the output path up front and append each
+    # completed seed's record to a sibling .jsonl file immediately, so a
+    # crash mid-sweep loses at most the seed in progress, not the whole run.
+    seeds_str = "-".join(str(s) for s in args.seeds)
+    suffix = "" if args.capture_iteration == "first" else f"_iter{args.capture_iteration}"
+    out_path = args.out_dir / f"cost_ranking_{args.regime}_seeds{seeds_str}{suffix}.json"
+    incremental_path = out_path.with_suffix(".jsonl")
+    if incremental_path.exists():
+        incremental_path.unlink()  # fresh run -- do not append to a stale file from a prior attempt
+
     seed_pbar = tqdm(args.seeds, desc=f"cost_ranking_{args.regime}", unit="seed")
     for seed in seed_pbar:
         rs = np.random.RandomState(seed)
@@ -261,10 +274,14 @@ def main() -> None:
             pooled_costs[kind].extend(costs.numpy().tolist())
             pooled_dist[kind].extend(true_dist.tolist())
 
-        per_seed.append({
+        seed_record = {
             "seed": seed, "init_state": init_state.tolist(), "goal_state": goal_state.tolist(),
             "results": results,
-        })
+        }
+        per_seed.append(seed_record)
+        # FIX_SPEC.md C7: append immediately, don't wait for the sweep to finish.
+        with open(incremental_path, "a") as f:
+            f.write(json.dumps(seed_record) + "\n")
         seed_pbar.set_postfix({k: f"{results[k]['spearman_rho']:.3f}" for k in args.kinds})
 
     print(f"\n== Pooled across {len(args.seeds)} seed(s), "
@@ -293,9 +310,6 @@ def main() -> None:
             "ci95_of_mean_seed_rho": list(ci95),
         }
 
-    seeds_str = "-".join(str(s) for s in args.seeds)
-    suffix = "" if args.capture_iteration == "first" else f"_iter{args.capture_iteration}"
-    out_path = args.out_dir / f"cost_ranking_{args.regime}_seeds{seeds_str}{suffix}.json"
     out_path.write_text(json.dumps({
         "regime": args.regime, "seeds": args.seeds, "kinds": args.kinds,
         "num_samples": args.num_samples, "iterations": args.iterations,

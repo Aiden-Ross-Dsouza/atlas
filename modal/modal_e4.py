@@ -107,6 +107,17 @@ def run_e4(
     cmd = [sys.executable, "scripts/run_e4.py",
            "--arms", arm,
            "--seeds", "1",   # this container runs exactly ONE seed_run
+           # FIX_SPEC.md B12: previously run_e4.py always ran LOCAL
+           # seed_run=0 regardless of which seed_run this container was
+           # launched for (get_stream(..., seeds=1) only ever generated the
+           # seed_run=0 episode/init/goal stream), and the seed_run field
+           # was only relabelled AFTER THE FACT below -- a "3-seed" sweep
+           # produced bit-identical episode data under 3 different labels.
+           # --seed-run-offset makes run_e4.py generate and run the REAL
+           # seed_run's stream (and seed the CEM planner's own local_seed
+           # from it too), so the relabelling below is now confirmatory,
+           # not load-bearing.
+           "--seed-run-offset", str(seed_run),
            "--episodes", str(episodes),
            "--num-samples", str(num_samples),
            "--iterations", str(iterations),
