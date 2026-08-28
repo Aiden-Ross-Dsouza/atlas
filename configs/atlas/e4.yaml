@@ -1,4 +1,17 @@
 # E4 — Continual stream + E3 expansion ablation config
+#
+# NOTHING LOADS THIS FILE (FIX_SPEC.md C9, see configs/atlas/default.yaml's
+# header). TWO REAL DISAGREEMENTS with scripts/run_e4.py's actual code
+# defaults, found 2026-08-28 -- this file documents the Phase 5 INTENDED
+# cut-ladder values, but the script's own hardcoded defaults were never
+# updated to match, so both must be passed explicitly on the CLI or the run
+# silently uses the un-cut, ~9x-more-expensive settings:
+#   - iterations: 10 here vs `CEM_ITERATIONS = 30` (run_e4.py:72) --
+#     the comment there literally says "cut to 10 per Phase 0.2's ladder,
+#     after profiling", i.e. the cut was decided but never applied in code.
+#   - seeds: 1 here vs `--seeds` default=3 (run_e4.py:126).
+# episodes_per_segment=10, num_act_stepped=1, num_samples=300, horizon=6,
+# segment_regimes=[R0,R2] all match the script's real defaults.
 defaults:
   - default
 

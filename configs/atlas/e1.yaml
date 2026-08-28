@@ -1,4 +1,12 @@
 # E1 — Fitness routing experiment config
+#
+# NOTHING LOADS THIS FILE (FIX_SPEC.md C9, see configs/atlas/default.yaml's
+# header). Verified against scripts/run_e1.py's real argparse defaults
+# 2026-08-28: routers/episodes=60/seeds=3/n_warmup_replans=2/regime=R1 all
+# match exactly. No disagreement found in this file. NOTE (unrelated to
+# C9): CLAUDE.md's AUDIT NOTE records that E1 was retired analytically
+# (HANDOFF.md section 7.1) rather than ever run at this 60x3 spec -- this
+# file documents the never-executed original plan, not a completed run.
 defaults:
   - default
 

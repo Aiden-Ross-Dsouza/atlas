@@ -1,4 +1,9 @@
 # E0 — Adapter capacity experiment config
+#
+# NOTHING LOADS THIS FILE (FIX_SPEC.md C9, see configs/atlas/default.yaml's
+# header). Verified against scripts/run_e0.py's real argparse defaults
+# 2026-08-28: n_steps=2000/lr=5e-4 match --steps/--lr exactly. No
+# disagreement found in this file.
 defaults:
   - default
 

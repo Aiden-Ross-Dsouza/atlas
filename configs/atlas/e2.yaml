@@ -1,4 +1,9 @@
 # E2 — Appearance vs dynamics (2×2) config
+#
+# NOTHING LOADS THIS FILE (FIX_SPEC.md C9, see configs/atlas/default.yaml's
+# header). Verified against scripts/run_e2.py's real argparse defaults
+# 2026-08-28: routers=[umf,sdyn]/episodes=40/seeds=3 all match exactly. No
+# disagreement found in this file.
 defaults:
   - default
 

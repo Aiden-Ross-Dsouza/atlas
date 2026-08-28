@@ -183,6 +183,54 @@ class Chart:
                        if k.endswith(".lora_A") or k.endswith(".lora_B"))
         return self.n_params()
 
+    def restore_pretrained_(self, predictor: nn.Module,
+                             pretrained_state: dict[str, torch.Tensor]) -> None:
+        """Restore this chart's touched parameters to their PRETRAINED
+        values, not to this chart's own (possibly refined) values.
+
+        FIX_SPEC.md C4: restore_() for kind in {"ln_act", "full"} is
+        actually a RE-APPLY of this chart's own current _params -- it does
+        NOT put the predictor back to pretrained weights, despite the
+        method name and CLAUDE.md 1.6's "restore" language. That falsifies
+        claim P-1's literal wording and can leave the predictor permanently
+        dirty if callers assumed restore_() meant "back to pretrained".
+        restore_() is NOT renamed here -- 10 production call sites
+        (atlas/loop.py, atlas/expand.py, scripts/run_e0.py, ...) depend on
+        its current re-apply behaviour and a rename was explicitly ruled
+        out of scope for this fix (see FIXLOG.md C4). This is a NEW,
+        additive method for callers that need genuine pretrained restore
+        (for example: releasing the predictor back to a clean baseline
+        between unrelated charts, or a diagnostic that must prove a chart
+        made zero difference).
+
+        Args:
+            predictor:        The live predictor (chart's kind must match
+                               what was applied to it).
+            pretrained_state: dict[name -> tensor], captured from
+                               predictor.state_dict() (or
+                               named_parameters()) BEFORE any chart was
+                               ever applied to this predictor instance.
+        """
+        if self.kind == "lora4":
+            # apply_()'s LoRA parametrization is ADDITIVE over the original
+            # base weight, which restore_()'s parametrize.remove_parametrizations
+            # (leave_parametrized=False) already discards without touching --
+            # so restore_() already recovers pretrained weights exactly for
+            # lora4. Route through it rather than duplicating that logic.
+            self.restore_(predictor)
+            return
+        state = dict(predictor.named_parameters())
+        for name in self._param_names:
+            if name not in pretrained_state:
+                raise KeyError(
+                    f"restore_pretrained_: pretrained_state is missing "
+                    f"{name!r} -- was it captured from THIS predictor "
+                    "before any chart was ever applied to it?"
+                )
+            if name not in state:
+                raise KeyError(f"Chart parameter {name!r} not found in predictor.")
+            state[name].data.copy_(pretrained_state[name])
+
     def update_from_predictor_(self, predictor: nn.Module) -> None:
         """Pull current predictor weights back into the chart (after refinement)."""
         state = dict(predictor.named_parameters())

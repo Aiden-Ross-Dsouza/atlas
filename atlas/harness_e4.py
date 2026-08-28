@@ -25,6 +25,7 @@ optimizer state all carry over from one episode to the next.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -37,7 +38,7 @@ from atlas.adajepa import AdaJEPA
 from atlas.chart import Chart
 from atlas.expand import Expander, ExpansionConfig
 from atlas.library import Library
-from atlas.loop import ATLASConfig, atlas_step, atlas_refine
+from atlas.loop import ATLASConfig, atlas_step, atlas_refine_buffered
 from atlas.streams import EpisodeSpec
 from atlas.harness import log_episode
 
@@ -60,6 +61,22 @@ class ArmState:
     optimizers: dict[int, torch.optim.Adam] = field(default_factory=dict)
     charts_committed_cumulative: int = 0
     probes_rejected_cumulative: int = 0
+    # FIX_SPEC.md B8 (design decision, recorded in FIXLOG.md): a persistent
+    # CLONE of c0, lazily created the first time routing selects index 0,
+    # for arms 4/5/6 only. c0 ITSELF (library[0]) is NEVER refined --
+    # CLAUDE.md §1 non-negotiable #4 (identity initialisation) and Gate G1
+    # both depend on c0 staying pristine, and routing/UMF SCORE always
+    # evaluates the real library (unaffected by this field). This clone
+    # exists purely so EXECUTE+REFINE can adapt continuously once c0 is
+    # selected, the same way AdaJEPA (arms 2/3) adapts from the first
+    # replan regardless of any "selection" -- see the REFINE section below.
+    c0_adapted_chart: Chart | None = None
+    # FIX_SPEC.md B9: one 5-chunk sliding buffer per chart index (+ the
+    # "c0_clone" key for c0's adapted clone), matching AdaJEPA's
+    # BUFFER_SIZE=5 so arms 4/5/6 refine over the same amount of recent
+    # data per step as arms 2/3 (plan §7.6). Keyed the same way as
+    # `optimizers` (int chart index, or the literal string "c0_clone").
+    refine_buffers: dict = field(default_factory=dict)
 
 
 def build_arm_state(
@@ -166,8 +183,30 @@ def run_e4_episode(
     )
 
     device = agent.device
+    # FIX_SPEC.md B11: agent.local_gpu_generator (shared BY REFERENCE with
+    # agent.planner's own CEMPlanner.local_generator -- gc_agent.py:63,
+    # the generator CEMPlanner.plan() actually draws candidate actions
+    # from, planner.py:290-291) is seeded ONCE at GC_Agent construction
+    # from cfg.local_seed and never reseeded per episode. So CEM's
+    # candidate sampling for episode N depends on how many prior draws
+    # happened earlier in THIS PROCESS, not on spec.seed -- a resumed
+    # run's generator state at episode N differs from an uninterrupted
+    # run's state at the same episode (different draw history), so resume
+    # is not reproducible even though every other input (env seed, chart
+    # state) is. Reseed from spec.seed at the start of every episode so
+    # resumed and uninterrupted runs draw identically. Only touches this
+    # file (atlas/harness_e4.py) -- calls a public method on an object
+    # already passed in, does not modify the upstream gc_agent.py/
+    # planner.py files (CLAUDE.md §1.3's "one upstream hook only").
+    if hasattr(agent, "local_gpu_generator"):
+        agent.local_gpu_generator.manual_seed(spec.seed)
+    if hasattr(agent, "local_generator"):
+        agent.local_generator.manual_seed(spec.seed)
+
     predictor = world_model.model.predictor
     regime = regimes[spec.regime]
+    from atlas.regimes import assert_no_bypassed_corruption
+    assert_no_bypassed_corruption(regime)  # FIX_SPEC.md C5 -- see docstring
     router_rng = None
     if router_rng_seed is not None:
         import random as _random
@@ -185,6 +224,21 @@ def run_e4_episode(
 
     regime_label = 0 if spec.regime == "R0" else 1  # R0=0, stream's shifted regime (B)=1
 
+    # FIX_SPEC.md B2: AdaJEPA.reset() had no production caller anywhere --
+    # in production, plain "adajepa" never re-initialised, making it
+    # behaviourally identical to "adajepa_persist" (the persistence rung
+    # this ladder exists to isolate would measure zero by construction).
+    # reset() is a no-op for variant="persistent" (see adajepa.py's own
+    # docstring), so this is safe to call unconditionally for both arms 2
+    # and 3 -- but only arm 2 ("adajepa") actually resets, restoring
+    # pretrained predictor weights and clearing its 5-transition buffer at
+    # the START of every episode. Key-namespace concern pre-cleared
+    # (SUBMISSION_PLAN.md A-xi): for ln_act, pretrained_state/param_names
+    # come from the same plain nn.Module with no parametrization, so
+    # load_state_dict(strict=False) genuinely restores.
+    if state.arm in ("adajepa", "adajepa_persist"):
+        state.adapter.reset()
+
     elapsed = 0
     success = False
     total_contacts = 0
@@ -195,11 +249,38 @@ def run_e4_episode(
     refine_loss: float | None = None
     final_check = {"block_pos_diff": init_block_pos_diff, "block_angle_diff": init_block_angle_diff}
 
-    # Two-deep chunk buffer: chunk k is deficit data for the ATLAS strike
-    # counter, chunk k+1 is the NEXT unseen chunk maybe_expand() verifies on
-    # (E3_E4_IMPLEMENTATION_PLAN.md §2c: "the one-replan delay is structural,
-    # not a bug").
+    # Single-chunk buffer for arms that don't need a held-out verification
+    # chunk (atlas_fixed/atlas_detect/oracle_id/adajepa*): unchanged from
+    # before.
     prev_chunk: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
+
+    # FIX_SPEC.md B1: two-deep chunk buffer, ATLAS ARM ONLY
+    # (expansion_mode='atlas', full verification). Previously atlas_step()
+    # was called with next_encoder_output=next_actions=None
+    # UNCONDITIONALLY (harness_e4.py:216-217 pre-fix), so
+    # atlas/loop.py:140-150's guard (`next_encoder_output is not None and
+    # ... strikes >= q`) was structurally unsatisfiable -- the 'atlas' arm
+    # could never reach maybe_expand() at all, so it could never commit.
+    # 'atlas_fixed' (expansion_mode='fixed') and 'atlas_detect'
+    # (expansion_mode='detect_only') never read next_encoder_output in the
+    # first place (atlas/loop.py's 'fixed'/'detect_only' branches don't
+    # touch it), so they are UNAFFECTED by this and keep using prev_chunk
+    # directly, undelayed.
+    #
+    # For 'atlas' specifically: hold a sliding 2-chunk window
+    # [chunk_{i-1}, chunk_i]. chunk_{i-1} (older) is the deficit-candidate
+    # passed as encoder_output/actions (record()'d as usual); chunk_i (one
+    # replan FRESHER) is passed as next_encoder_output/next_actions -- the
+    # "next unseen chunk" maybe_expand() verifies a just-armed probe on.
+    # Copies scripts/run_e2.py:296-339's peek-one-ahead pattern (verified
+    # leakage-free, CODE_AUDIT.md §9.3), adapted to an ONLINE rollout where
+    # the "next" chunk does not exist until the FOLLOWING replan produces
+    # it. E3_E4_IMPLEMENTATION_PLAN.md §2c: "the one-replan delay is
+    # structural, not a bug" -- SELECT for arm='atlas' is therefore based
+    # on the one-replan-STALER of the two buffered chunks, at the cost of
+    # one extra warmup replan before its first real routing decision
+    # (needs 2 chunks buffered, not 1), vs. atlas_fixed/atlas_detect.
+    atlas_verify_buffer: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
 
     t_start = time.time()
     for replan_idx in range(n_replans_target):
@@ -207,9 +288,29 @@ def run_e4_episode(
             break
 
         # ── SCORE + SELECT + EXPAND (arms 4/5/6/7 only, once a chunk exists) ──
-        if prev_chunk is not None:
+        if state.arm == "atlas":
+            if len(atlas_verify_buffer) == 2:
+                (d_enc, d_acts, d_proprio), (v_enc, v_acts, v_proprio) = atlas_verify_buffer
+                step_info = atlas_step(
+                    library=state.library, expander=state.expander, world_model=world_model,
+                    encoder_output=d_enc, actions=d_acts, current_idx=state.current_idx,
+                    cfg=state.cfg, regime_label=regime_label,
+                    next_encoder_output=v_enc, next_actions=v_acts,
+                    proprio_ctxt=d_proprio, next_proprio_ctxt=v_proprio, rng=router_rng,
+                )
+                state.current_idx = step_info.selected_idx
+                umf_trace.append(step_info.scores)
+                if step_info.probe_outcome != "not_ready":
+                    probe_outcome = step_info.probe_outcome
+                    if probe_outcome == "committed":
+                        state.charts_committed_cumulative += 1
+                    elif probe_outcome.startswith("rejected"):
+                        state.probes_rejected_cumulative += 1
+            else:
+                umf_trace.append([None] * (len(state.library) if state.library is not None else 1))
+        elif prev_chunk is not None:
             enc_out, acts, proprio_ctxt = prev_chunk
-            if state.arm in ("atlas_fixed", "atlas_detect", "atlas"):
+            if state.arm in ("atlas_fixed", "atlas_detect"):
                 step_info = atlas_step(
                     library=state.library, expander=state.expander, world_model=world_model,
                     encoder_output=enc_out, actions=acts, current_idx=state.current_idx,
@@ -240,7 +341,18 @@ def run_e4_episode(
         selected_trace.append(state.current_idx)
 
         # ── EXECUTE ──────────────────────────────────────────────────────────
-        chart = state.library[state.current_idx] if state.library is not None else None
+        # FIX_SPEC.md B8: once a c0-adapted clone exists for this arm (see
+        # ArmState.c0_adapted_chart), USE IT instead of pristine c0 whenever
+        # routing selects index 0 -- planning/execution should reflect
+        # whatever adaptation has accumulated, exactly as it would for any
+        # other library chart. c0 itself is never substituted for routing/
+        # SCORE (atlas_step() above always reads the real library).
+        if state.library is not None and state.current_idx == 0 and state.c0_adapted_chart is not None:
+            chart = state.c0_adapted_chart
+        elif state.library is not None:
+            chart = state.library[state.current_idx]
+        else:
+            chart = None
         if chart is not None:
             chart.apply_(predictor)
         try:
@@ -278,12 +390,21 @@ def run_e4_episode(
         n_raw = (len(step_actions) // frameskip) * frameskip
         if n_raw == 0:
             prev_chunk = None if not success else prev_chunk
+            # atlas_verify_buffer intentionally left as-is: no new chunk was
+            # produced this replan (e.g. success mid-chunk before a full
+            # frameskip block), so there is nothing to slide in.
         else:
             keep_idx = list(range(0, n_raw + 1, frameskip))
             imgs_sub = np.stack([imgs[i] for i in keep_idx], axis=0)
             proprios_sub = np.stack([proprios[i] for i in keep_idx], axis=0)
             visual_t = torch.from_numpy(imgs_sub.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
             proprio_t = torch.from_numpy(proprios_sub.astype(np.float32)).unsqueeze(0).to(device)
+            # FIX_SPEC.md D10 (SUBMISSION_PLAN.md Part A-vi) -- see
+            # atlas/harness.py's identical assertion for the full rationale.
+            assert visual_t.shape[0] == 1 and proprio_t.shape[0] == 1, (
+                f"D10: expected a single-episode batch (dim0=1), got "
+                f"visual={visual_t.shape}, proprio={proprio_t.shape}."
+            )
             with torch.no_grad():
                 enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
                 enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)
@@ -297,21 +418,61 @@ def run_e4_episode(
 
             new_chunk = (enc_out, act_model, proprio_enc[:, 0:1])
 
+            # FIX_SPEC.md B1: slide the 2-chunk ATLAS-arm verification
+            # window -- drop the oldest, append the newest. No-op (an
+            # empty list append) for every other arm, kept unconditional
+            # for simplicity since it costs nothing when unused.
+            atlas_verify_buffer.append(new_chunk)
+            if len(atlas_verify_buffer) > 2:
+                atlas_verify_buffer.pop(0)
+
             # ── REFINE — last, always (never before scoring: strict
             # prequential order, CLAUDE.md §1.6) ────────────────────────────
             if state.arm in ("adajepa", "adajepa_persist"):
                 state.adapter.push(enc_out, act_model, proprio_enc[:, 0:1])
                 refine_loss = state.adapter.refine()
-            elif state.arm in ("atlas_fixed", "atlas_detect", "atlas") and state.current_idx != 0:
-                opt = state.optimizers.get(state.current_idx)
+            elif state.arm in ("atlas_fixed", "atlas_detect", "atlas"):
+                # FIX_SPEC.md B8 (design decision -- see FIXLOG.md B8 for
+                # the full rationale): previously this branch was gated
+                # `and state.current_idx != 0`, so selecting c0 meant NO
+                # refinement happened at all -- unlike arms 2/3 (AdaJEPA),
+                # which adapt every single replan regardless of any
+                # "selection" concept. That made the 3->4 ladder rung
+                # differ by TWO mechanisms at once (adapts vs. doesn't,
+                # AND library-routing vs. not), confounding what the rung
+                # is supposed to isolate. Now: when index 0 is selected,
+                # refine a persistent CLONE of c0 (never c0 itself -- see
+                # ArmState.c0_adapted_chart's docstring for why) instead of
+                # skipping, so "adapts every replan" is held constant
+                # across arms 2-6 and the rung differs by exactly
+                # "routes/expands" as intended.
+                if state.current_idx == 0:
+                    if state.c0_adapted_chart is None:
+                        state.c0_adapted_chart = state.library[0].clone()  # identity init (non-negotiable #4)
+                    refine_target = state.c0_adapted_chart
+                    opt_key = "c0_clone"
+                    refine_param_names = refine_target._param_names
+                else:
+                    refine_target = state.library[state.current_idx]
+                    opt_key = state.current_idx
+                    refine_param_names = refine_target._param_names
+                opt = state.optimizers.get(opt_key)
                 if opt is None:
                     params = [p for n, p in predictor.named_parameters()
-                              if n in state.library[state.current_idx]._param_names]
+                              if n in refine_param_names]
                     opt = torch.optim.Adam(params, lr=state.cfg.lr)
-                    state.optimizers[state.current_idx] = opt
-                refine_loss = atlas_refine(
-                    state.library[state.current_idx], world_model, enc_out, act_model,
-                    lr=state.cfg.lr, proprio_ctxt=proprio_enc[:, 0:1], optimizer=opt,
+                    state.optimizers[opt_key] = opt
+                # FIX_SPEC.md B9: push into this chart's own 5-chunk
+                # sliding buffer (same BUFFER_SIZE as
+                # atlas.adajepa.AdaJEPA), then refine over the WHOLE
+                # buffer via atlas_refine_buffered (not atlas_refine's
+                # single-chunk path), so arms 4/5/6 see the same amount of
+                # recent data per refinement step as arms 2/3.
+                buf = state.refine_buffers.setdefault(opt_key, deque(maxlen=5))
+                buf.append((enc_out, act_model, proprio_enc[:, 0:1]))
+                refine_loss = atlas_refine_buffered(
+                    refine_target, world_model, list(buf),
+                    lr=state.cfg.lr, optimizer=opt,
                 )
             # arms frozen / oracle_id: no refinement.
 
@@ -327,6 +488,17 @@ def run_e4_episode(
         "global_episode_idx": spec.global_episode_idx,
         "probe_outcome": probe_outcome,
         "library_size": len(state.library) if state.library is not None else 1,
+        # FIX_SPEC.md B14: Library has no evict() -- add() raises when
+        # full, and both production callers (loop.py's 'atlas'/
+        # 'detect_only' branches) pre-check is_full() before ever calling
+        # add(), so growth simply HALTS at k_max and nothing already
+        # committed is ever retired/replaced. There is no code fix for
+        # "no eviction policy" beyond documenting it (out of scope for
+        # this pass -- a paper-level statement, per FIX_SPEC.md); this
+        # field makes cap-hits VISIBLE in the per-episode record instead
+        # of only inferable by comparing library_size against k_max
+        # externally.
+        "library_full": bool(state.library.is_full()) if state.library is not None else False,
         "charts_committed_cumulative": state.charts_committed_cumulative,
         "probes_rejected_cumulative": state.probes_rejected_cumulative,
         "seed_run": seed_run,

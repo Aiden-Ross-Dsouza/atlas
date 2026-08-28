@@ -318,6 +318,9 @@ def run_e1_episode(
     Regime is FIXED for the whole episode (set via `regime` before this is
     called) — E1 does not switch regimes mid-episode; that's E3/E4's stream.
     """
+    from atlas.regimes import assert_no_bypassed_corruption
+    assert_no_bypassed_corruption(regime)  # FIX_SPEC.md C5 -- see docstring
+
     device = agent.device
     predictor = world_model.model.predictor
     # Seeds the "random" router for this episode -- was the unseeded global
@@ -409,6 +412,16 @@ def run_e1_episode(
             proprios_sub = np.stack([proprios[i] for i in keep_idx], axis=0)  # [T_model+1, P]
             visual_t = torch.from_numpy(imgs_sub.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
             proprio_t = torch.from_numpy(proprios_sub.astype(np.float32)).unsqueeze(0).to(device)
+            # FIX_SPEC.md D10 (SUBMISSION_PLAN.md Part A-vi): .squeeze(0) below
+            # removes the batch dim and is only safe because this call site
+            # never batches multiple episodes -- assert the invariant rather
+            # than rely on it silently. A batch size > 1 here would make
+            # .squeeze(0) a silent no-op instead of removing the intended
+            # axis, corrupting enc_out's shape without raising.
+            assert visual_t.shape[0] == 1 and proprio_t.shape[0] == 1, (
+                f"D10: expected a single-episode batch (dim0=1), got "
+                f"visual={visual_t.shape}, proprio={proprio_t.shape}."
+            )
             with torch.no_grad():
                 enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
                 enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)   # [T_model+1, N, D]

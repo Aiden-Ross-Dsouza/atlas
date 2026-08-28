@@ -214,7 +214,21 @@ def _fit_candidate(
 
     predictor = world_model.model.predictor
     candidate.apply_(predictor)
-    params = [p for n, p in predictor.named_parameters() if n in candidate._param_names]
+    # FIX_SPEC.md C6 (same defect as atlas/loop.py::atlas_refine): for
+    # kind="lora4", apply_() replaces named_parameters()'s entry for the
+    # base weight with a parametrization, so "n in candidate._param_names"
+    # selects zero params and optim.Adam([]) raises. Select by lora suffix.
+    if candidate.kind == "lora4":
+        params = [p for n, p in predictor.named_parameters()
+                   if "lora_A" in n or "lora_B" in n]
+    else:
+        params = [p for n, p in predictor.named_parameters() if n in candidate._param_names]
+    # FIX_SPEC.md B4 (same defect/fix as atlas/loop.py::atlas_refine; see
+    # its comment for the full empirical finding). Re-enable requires_grad
+    # on this candidate's own selected parameter surface before optimizing
+    # it, else ln_act/full candidates silently never move.
+    for p in params:
+        p.requires_grad_(True)
     optimizer = optim.Adam(params, lr=lr)
 
     for step in range(n_steps):

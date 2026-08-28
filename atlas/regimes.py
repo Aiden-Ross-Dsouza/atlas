@@ -253,6 +253,44 @@ def _corrupt(img: np.ndarray, kind: CorruptionKind, severity: float,
     return img
 
 
+def assert_no_bypassed_corruption(regime_or_env: gym.Env) -> None:
+    """FIX_SPEC.md C5: several call sites (atlas/harness.py, atlas/
+    harness_e4.py, scripts/run_e0_planning.py, scripts/profile_episode.py,
+    scripts/diagnose_cem_costs.py) step `base_env` directly rather than the
+    (possibly wrapped) `env`/`regime` object, for planner-loop reasons
+    unrelated to this fix. That is harmless for PhysicsRegime (a
+    non-observation-mutating gym.Wrapper -- it only touches physics
+    parameters in reset(), never observations, so bypassing it in step()
+    changes nothing observable) but FATAL AND SILENT for VisualCorruption:
+    its corruption only ever applies inside VisualCorruption.observation(),
+    which base_env.step() never reaches, so a corrupted planning run driven
+    that way would silently score/execute against the CLEAN observation
+    while believing it corrupted -- exactly this project's E2 Cell C/D
+    appearance-only-shift design.
+
+    Call this once, at episode-loop entry, on whatever `regime`/`env`
+    object the caller was ABOUT to bypass by stepping `base_env` directly.
+    Raises loudly instead of silently no-op-ing the corruption.
+    """
+    obj = regime_or_env
+    seen = 0
+    while isinstance(obj, gym.Wrapper):
+        if isinstance(obj, VisualCorruption) and obj.kind != "none":
+            raise RuntimeError(
+                "assert_no_bypassed_corruption: a VisualCorruption wrapper "
+                f"(kind={obj.kind!r}) wraps this episode's env, but this "
+                "call site steps base_env directly, which skips "
+                "VisualCorruption.observation() entirely -- the corruption "
+                "would never be applied. Step the wrapper chain (call "
+                ".step() on the outermost wrapper), not base_env, for any "
+                "episode that uses a visual corruption."
+            )
+        obj = obj.env
+        seen += 1
+        if seen > 10:
+            break  # defensive: malformed wrapper chain, not this function's job
+
+
 def build_env(
     base_env: gym.Env,
     regime: RegimeName = "R0",

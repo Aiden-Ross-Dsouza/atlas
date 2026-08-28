@@ -21,7 +21,9 @@ Gates:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
 import torch
 import atlas
@@ -29,6 +31,14 @@ from atlas.chart import Chart
 from atlas.library import Library
 from atlas.score import umf as compute_umf
 from atlas.expand import Expander, ExpansionConfig
+
+# Same vendored-checkout sys.path setup as run_e0_planning.py:74-82 -- needed
+# by gate_g5's real PushTEnv construction (FIX_SPEC C2). Raw ATLAS_HOME (not
+# atlas.ATLAS_HOME, which .resolve()'s and breaks under Modal volume mounts).
+_atlas_home = os.environ.get("ATLAS_HOME", str(atlas.ATLAS_HOME))
+_HUB_PATH = str(Path(_atlas_home) / "hub" / "hub" / "facebookresearch_jepa-wms_main")
+if _HUB_PATH not in sys.path:
+    sys.path.insert(0, _HUB_PATH)
 
 
 def _make_synthetic_proprio_ctxt(wm, grid: int, device) -> torch.Tensor | None:
@@ -97,7 +107,7 @@ def gate_g1(wm, wrapper) -> None:
 
     out_frozen = _forward()
 
-    for kind in ("ln_act", "lora4"):
+    for kind in ("ln_act", "lora4", "full"):
         c0 = Chart(predictor, kind=kind)
         c0.apply_(predictor)
         out_c0 = _forward()
@@ -129,91 +139,201 @@ def gate_g1(wm, wrapper) -> None:
                 "restore_() despite an identical state_dict."
             )
 
+        # ── FIX_SPEC.md C3: extend past identity-only charts ────────────────
+        # The block above only ever tested a chart that had NEVER been
+        # refined, where restore_() and apply_() are trivially identical
+        # (restore_() just re-applies the same untouched _params -- see
+        # FIX_SPEC.md C4). Genuinely exercise a REFINED chart: fit it for
+        # real via _open_loop_rollout (the production mechanism, same as
+        # gate_g2/atlas/expand.py::_fit_candidate), confirm it actually
+        # moved the predictor's output away from frozen (sanity that
+        # refinement did something), then confirm the NEW
+        # Chart.restore_pretrained_() (C4) puts the predictor back to
+        # EXACT pretrained weights and output -- what plain restore_()
+        # cannot do for ln_act/full (see chart.py's restore_pretrained_
+        # docstring).
+        from atlas.score import _open_loop_rollout, _make_z_ctxt
+        import torch.optim as optim
+        T = 3
+        act_dim = wm.action_dim
+        proprio_ctxt = _make_synthetic_proprio_ctxt(wm, grid, device)
+        torch.manual_seed(7)
+        enc = torch.randn(T + 1, N, D, device=device)
+        actions = torch.randn(T, act_dim, device=device)
+
+        cr = Chart(predictor, kind=kind)
+        cr.apply_(predictor)
+        if kind == "lora4":
+            params = [p for n, p in predictor.named_parameters()
+                       if "lora_A" in n or "lora_B" in n]
+        else:
+            params = [p for n, p in predictor.named_parameters() if n in cr._param_names]
+        opt = optim.Adam(params, lr=1e-2)
+        z_ctxt = _make_z_ctxt(wrapper, enc[0], proprio_ctxt)
+        for _ in range(20):
+            opt.zero_grad()
+            z_hat = _open_loop_rollout(wrapper, z_ctxt, actions)
+            loss = (z_hat - enc[1:]).pow(2).mean()
+            loss.backward()
+            opt.step()
+        cr.update_from_predictor_(predictor)
+
+        out_refined = _forward()
+        if torch.equal(out_frozen, out_refined):
+            raise AssertionError(
+                f"G1 FAILED: kind={kind} chart refined for 20 real gradient "
+                "steps produced a bit-identical predictor output to frozen "
+                "-- refinement did not do anything measurable, so the "
+                "restore_pretrained_() check below would be vacuous."
+            )
+
+        cr.restore_pretrained_(predictor, pristine)
+        after_refined_restore = predictor.state_dict()
+        for k, v0 in pristine.items():
+            if not torch.equal(v0, after_refined_restore[k]):
+                raise AssertionError(
+                    f"G1 FAILED: kind={kind} restore_pretrained_() did not "
+                    f"return REFINED predictor tensor {k!r} to its "
+                    "pretrained value."
+                )
+        out_after_pretrained_restore = _forward()
+        if not torch.equal(out_frozen, out_after_pretrained_restore):
+            raise AssertionError(
+                f"G1 FAILED: kind={kind} predictor output differs from "
+                "frozen after restore_pretrained_() on a REFINED chart, "
+                "despite an identical state_dict."
+            )
+
     print("PASSED")
 
 
-def gate_g2(wm, wrapper) -> None:
-    """G2: Over-refine chart X on W; score all on W' -> X must not auto-win.
+def _g2_make_regime_chunk(wm, wrapper, c0, regime, predictor, grid, D, N, T,
+                           act_dim, device):
+    """One structured, learnable chunk (same construction as gate_g3a's
+    make_regime_chunk): roll out under a fixed perturbation of the
+    predictor's own weights, then restore c0 (baseline) before returning, so
+    the predictor is always left in a known state between calls."""
+    regime.apply_(predictor)
+    z0 = torch.randn(N, D, device=device)
+    actions = torch.randn(T, act_dim, device=device)
+    z = z0
+    frames = [z0]
+    for t in range(T):
+        z = _predict_one_step(wm, z, actions[t])
+        frames.append(z)
+    c0.apply_(predictor)
+    return torch.stack(frames, dim=0), actions
 
-    Uses VideoWM.forward_pred() as the rollout entry point for the manual
-    over-refine training loop below — the correct API for the dino_wm
-    architecture (ViTPredictor.forward() takes a single pre-assembled
-    [vis || proprio || action] tensor; calling it with separate (z, action)
-    args is not valid). compute_umf() itself now needs the EncPredWM WRAPPER
-    (torch.hub.load's return value, not .model) -- see
-    E0_IMPLEMENTATION_PLAN.md T1/T2.
+
+def gate_g2(wm, wrapper) -> None:
+    """G2: over-refine chart X on window W; the score that decides whether X
+    "wins" must come from the NEXT, genuinely held-out window W' -- never
+    from W itself. Catches scoring/refinement leakage (CLAUDE.md Sec1.6).
+
+    Rewritten (the previous version built W/W' from i.i.d. torch.randn --
+    structureless, nothing to over-refine on -- over-refined via a
+    hand-rolled forward_pred loop that bypassed _open_loop_rollout entirely,
+    computed both UMFs, and asserted nothing: `if ... is not None and ... is
+    not None: pass`. It printed PASSED unconditionally.)
+
+    This version:
+      1. Builds W and W' from two INDEPENDENT structured "regimes" (small,
+         learnable perturbations of the predictor's own weights, same
+         mechanism as gate_g3a) -- so W' is a genuinely different, unrelated
+         distribution from W, not just a second i.i.d. draw.
+      2. Over-refines cx on W ONLY, for real, via _open_loop_rollout (the
+         production rollout, atlas/expand.py::_fit_candidate's exact
+         mechanism) run to convergence (300 Adam steps on one small chunk --
+         enough to memorize W's specific instance).
+      3. Computes THREE numbers: cx's UMF on its own training window W
+         (`umf_cx_W` -- what a LEAKED scorer would report), cx's UMF on the
+         genuinely held-out, differently-regimed W' (`umf_cx_Wprime` --
+         what the correct prequential scorer reports), and baseline c0's UMF
+         on W' for reference.
+      4. Asserts the property a leaked scorer would violate: the genuinely
+         held-out score must not be reported as at least as good as the
+         leaked training-window score. After 300 steps of overfitting a
+         high-capacity ("full") chart to one small chunk, umf_cx_W is driven
+         near zero; a chart that trained only on W cannot legitimately have
+         an equally-good or better score on the disjoint, differently-
+         regimed W' -- if it does, whatever produced that W'-score is not
+         actually looking at held-out data.
     """
     print("G2: prequential ordering check...", end=" ")
-    from einops import rearrange
     predictor = wm.predictor
-    # Create two charts and dummy data.
-    c0 = Chart(predictor, "ln_act")
+    c0 = Chart(predictor, kind="full")
     cx = c0.clone()
-    library = Library(c0, max_size=5)
-    library.add(cx)
 
-    # Dummy latent chunks — shaped as VideoWM expects: [B, tau, V, H, W, D].
-    grid = wm.grid_size   # e.g. 16 for ViT-S/14 @ 224
-    D = 384
+    grid = wm.grid_size
+    D, T = 384, 5
     N = grid * grid
-    T = 5
-    act_dim = wm.action_dim   # model action dim = raw_dim * frameskip (e.g. 2*5=10 for pusht)
+    act_dim = wm.action_dim
     device = next(predictor.parameters()).device
-    # Raw visual features [T+1, N, D] as if already encoded by DINOv2.
-    W = {"encoder_output": torch.randn(T + 1, N, D, device=device),
-         "actions": torch.randn(T, act_dim, device=device)}
-    W_prime = {"encoder_output": torch.randn(T + 1, N, D, device=device),
-               "actions": torch.randn(T, act_dim, device=device)}
+    proprio_ctxt = _make_synthetic_proprio_ctxt(wm, grid, device)
 
-    def _one_step_loss(wm, z_cur_flat, a_t_raw):
-        """Run forward_pred for one step and return prediction of visual tokens."""
-        # z_cur_flat: [N, D] -> reshape to [B=1, tau=1, V=1, H, W, D]
-        z_cur = z_cur_flat.reshape(1, 1, 1, grid, grid, D)
-        # Encode one raw action [1, 1, action_dim] -> act_feats [1, 1, ...]
-        act_feats = wm.encode_act(a_t_raw.reshape(1, 1, -1))
-        
-        # Add dummy proprioception if needed
-        prop_feats = None
-        if getattr(wm, "proprio_encoder", None) is not None:
-            prop_dim = wm.proprio_encoder.embed_dim
-            prop_feat = torch.zeros(1, 1, 1, prop_dim, device=z_cur.device)
-            if getattr(wm, "proprio_encoding", None) == "feature":
-                prop_feat = prop_feat.repeat(1, 1, grid * grid, 1)
-            prop_feats = prop_feat
+    # Two INDEPENDENT structured regimes -> W and W' are genuinely different
+    # distributions (same mechanism as gate_g3a's REL_SCALE perturbation,
+    # drawn twice, independently, so W' is not just fresh noise from the same
+    # regime W was fit on).
+    REL_SCALE = 0.3
+    regime_W = c0.clone()
+    for name, value in regime_W._params.items():
+        regime_W._params[name] = value + torch.randn_like(value) * value.std() * REL_SCALE
+    regime_Wp = c0.clone()
+    for name, value in regime_Wp._params.items():
+        regime_Wp._params[name] = value + torch.randn_like(value) * value.std() * REL_SCALE
 
-        pred_vis, _, _ = wm.forward_pred(z_cur, act_feats, prop_feats)
-        # pred_vis: [1, 1, 1, H, W, D] -> flatten to [N, D]
-        return pred_vis.reshape(N, D)
+    torch.manual_seed(2)
+    W_enc, W_act = _g2_make_regime_chunk(wm, wrapper, c0, regime_W, predictor,
+                                          grid, D, N, T, act_dim, device)
+    Wp_enc, Wp_act = _g2_make_regime_chunk(wm, wrapper, c0, regime_Wp, predictor,
+                                            grid, D, N, T, act_dim, device)
 
-    # Over-refine cx on W (50 steps).
+    # Over-refine cx on W ONLY, via the production rollout mechanism
+    # (_open_loop_rollout / _make_z_ctxt -- exactly atlas/expand.py::
+    # _fit_candidate's code path), run to convergence on a single chunk.
+    from atlas.score import _open_loop_rollout, _make_z_ctxt
     import torch.optim as optim
     cx.apply_(predictor)
     params = [p for n, p in predictor.named_parameters() if n in cx._param_names]
-    opt = optim.Adam(params, lr=5e-4)
-    for t in range(min(T, 50)):
+    opt = optim.Adam(params, lr=5e-3)
+    z_ctxt = _make_z_ctxt(wrapper, W_enc[0], proprio_ctxt)
+    for _ in range(300):
         opt.zero_grad()
-        z = W["encoder_output"]
-        z_hat = _one_step_loss(wm, z[t], W["actions"][t])
-        loss = (z_hat - z[t + 1]).pow(2).mean()
+        z_hat = _open_loop_rollout(wrapper, z_ctxt, W_act)
+        loss = (z_hat - W_enc[1:]).pow(2).mean()
         loss.backward()
         opt.step()
     cx.update_from_predictor_(predictor)
     cx.restore_(predictor)
 
-    # Score both charts on W' using the updated umf() API (needs the wrapper
-    # and a shape-correct proprio_ctxt -- see _make_synthetic_proprio_ctxt).
-    proprio_ctxt = _make_synthetic_proprio_ctxt(wm, grid, device)
-    umf_c0 = compute_umf(c0, wrapper, W_prime["encoder_output"], W_prime["actions"],
-                          proprio_ctxt=proprio_ctxt)
-    umf_cx = compute_umf(cx, wrapper, W_prime["encoder_output"], W_prime["actions"],
-                          proprio_ctxt=proprio_ctxt)
+    umf_c0_Wp = compute_umf(c0, wrapper, Wp_enc, Wp_act, proprio_ctxt=proprio_ctxt)
+    umf_cx_Wp = compute_umf(cx, wrapper, Wp_enc, Wp_act, proprio_ctxt=proprio_ctxt)
+    # Reference-only value: what a scorer that (bug) reused the training
+    # window W instead of the held-out W' would report. Never fed into a
+    # decision here -- computed purely so the assertion below can detect the
+    # leak signature (a suspiciously good "held-out" score).
+    umf_cx_W = compute_umf(cx, wrapper, W_enc, W_act, proprio_ctxt=proprio_ctxt)
 
-    # For random data, just verify scores are computed without error.
-    if umf_cx is not None and umf_c0 is not None:
-        pass
-    c0_str = f"{umf_c0:.3f}" if umf_c0 is not None else "None"
-    cx_str = f"{umf_cx:.3f}" if umf_cx is not None else "None"
-    print(f"PASSED  (UMF c0={c0_str}, UMF cx={cx_str} on held-out W')")
+    if umf_cx_Wp is None or umf_cx_W is None or umf_c0_Wp is None:
+        raise AssertionError("G2 FAILED: compute_umf returned None on a "
+                              "genuinely moving synthetic chunk -- motion "
+                              "gate or denominator guard misfiring.")
+
+    if umf_cx_Wp <= umf_cx_W:
+        raise AssertionError(
+            f"G2 FAILED (leakage signature): the over-refined chart's score "
+            f"on the genuinely held-out window W' ({umf_cx_Wp:.4f}) is <= "
+            f"its score on its OWN training window W ({umf_cx_W:.4f}). A "
+            "chart driven to near-zero loss on one small chunk cannot "
+            "legitimately score at least as well on a disjoint, "
+            "differently-regimed window -- whatever produced the W' number "
+            "is not looking at held-out data. This is exactly the "
+            "scoring/refinement leakage G2 exists to catch."
+        )
+    print(f"PASSED  (umf_cx on training W={umf_cx_W:.4f} [leaked, "
+          f"reference-only], umf_cx on held-out W'={umf_cx_Wp:.4f}, "
+          f"umf_c0 on held-out W'={umf_c0_Wp:.4f})")
 
 
 def _predict_one_step(wm, z_t: torch.Tensor, a_t_raw: torch.Tensor) -> torch.Tensor:
@@ -415,22 +535,65 @@ def gate_g4(env_factory, regimes: list[str]) -> None:
         print("PASSED  (single regime, no comparison)")
 
 
+def _g5_build_and_reset(seed: int):
+    """Construct a real PushTEnv, seed it, reset it, and return the raw init
+    state vector + goal_pose. Used both by gate_g5 (same-seed case, must
+    match) and by scratchpad/g2_g5_demo.py (mismatched-seed case, must NOT
+    match) -- see FIX_SPEC C2."""
+    from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
+    env = PushTEnv(render_size=224, with_velocity=True)
+    env.seed(seed)
+    obs, state = env.reset()
+    goal = env.goal_pose.copy()
+    env.close()
+    return obs["visual"].copy(), state.copy(), goal
+
+
 def gate_g5() -> None:
-    """G5: Two arms with same seeds produce identical episode seeds."""
-    print("G5: paired seeding check...", end=" ")
+    """G5: Two arms, same seed -> genuinely identical initial env state + goal.
+
+    Rewritten (the previous version only checked that paired_seed() ignores
+    its `arm` argument -- true by inspection, since `arm` is never
+    referenced in the function body; it built no env and sampled nothing).
+    This version constructs two REAL PushTEnv instances at the seed
+    paired_seed() produces, resets both, and asserts the raw init state
+    vector, the rendered visual observation, and the goal_pose are all
+    bit-identical -- what "same seed -> identical initial states/goals"
+    (CLAUDE.md G5 definition) actually means for the real env, not just for
+    an integer.
+    """
+    print("G5: paired seeding check (real env)...", end=" ")
+    import numpy as np
     from atlas.streams import paired_seed
 
-    for seg in range(6):
-        for ep in range(20):
-            s1 = paired_seed(seg, ep, arm="atlas")
-            s2 = paired_seed(seg, ep, arm="frozen")
-            if s1 != s2:
-                raise AssertionError(
-                    f"G5 FAILED: segment {seg}, episode {ep}: "
-                    f"arm 'atlas' seed {s1} ≠ arm 'frozen' seed {s2}. "
-                    "paired_seed() must NOT depend on the arm argument."
-                )
-    print("PASSED")
+    s1 = paired_seed(0, 0, arm="atlas")
+    s2 = paired_seed(0, 0, arm="frozen")
+    if s1 != s2:
+        raise AssertionError(
+            f"G5 FAILED: paired_seed() depends on the 'arm' argument "
+            f"(atlas={s1}, frozen={s2})."
+        )
+
+    vis_a, state_a, goal_a = _g5_build_and_reset(s1)
+    vis_b, state_b, goal_b = _g5_build_and_reset(s2)
+
+    if not np.array_equal(state_a, state_b):
+        raise AssertionError(
+            f"G5 FAILED: same seed {s1} produced different init states "
+            f"({state_a} vs {state_b}) across two independently constructed "
+            "envs -- two arms would not be paired."
+        )
+    if not np.array_equal(vis_a, vis_b):
+        raise AssertionError(
+            "G5 FAILED: same seed produced different initial visual "
+            "observations across two independently constructed envs."
+        )
+    if not np.array_equal(goal_a, goal_b):
+        raise AssertionError(
+            f"G5 FAILED: same seed produced different goals ({goal_a} vs "
+            f"{goal_b})."
+        )
+    print(f"PASSED  (seed={s1}, init_state={state_a}, goal={goal_a})")
 
 
 def gate_g6(wm, wrapper) -> None:
@@ -491,8 +654,15 @@ def main() -> None:
     if run_all or run in ("G1", "G2", "G3a", "G3b", "G6"):
         import torch
         print("Loading dino_wm_pusht...")
+        # FIX_SPEC.md C8: this used to omit source="local", so torch.hub
+        # resolved "facebookresearch/jepa-wms" against the REMOTE repo spec
+        # (github.com/facebookresearch/jepa-wms) rather than the patched
+        # local checkout at HUB_PATH (this file's own top-of-file sys.path
+        # insertion, same as run_e0_planning.py/diagnose_cem_costs.py) --
+        # production never uses the remote copy, so these gates could pass
+        # or fail against code nothing else in this project runs.
         model, prep = torch.hub.load(
-            "facebookresearch/jepa-wms", "dino_wm_pusht",
+            _HUB_PATH, "dino_wm_pusht", source="local",
             force_reload=False, trust_repo=True,
         )
         # torch.hub returns the EncPredWM wrapper; underlying VideoWM is at

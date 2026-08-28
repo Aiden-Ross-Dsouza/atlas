@@ -1,5 +1,13 @@
 # ATLAS default hyperparameters (implementation plan §7.7)
 # All values are fixed; only the sensitivity run sweeps τ and q.
+#
+# NOTHING LOADS THIS FILE (FIX_SPEC.md C9) -- no script in this repo reads
+# configs/atlas/*.yaml; every script (run_e0.py, run_e1.py, run_e2.py,
+# run_e4.py) hardcodes its own argparse defaults, which is the actual live
+# source of truth. This file (and e0.yaml/e1.yaml/e2.yaml/e4.yaml) is
+# documentation only, kept in sync by hand -- verified against the real
+# script defaults 2026-08-27/28 (see e4.yaml's header for the two places
+# that had drifted). Same convention as configs/regimes/pusht.yaml:3-5.
 
 atlas:
   tau: 0.5          # UMF adequacy threshold

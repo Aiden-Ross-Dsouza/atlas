@@ -118,6 +118,8 @@ def prepare_with_visual(base_env: PushTEnv, regime: PhysicsRegime, seed: int, st
     # atlas/harness.py::_prepare_env exactly (E0_IMPLEMENTATION_PLAN.md T6).
     # reset_to_state is set on base_env directly, not the regime wrapper: since
     # gym.Wrapper does not proxy attribute WRITES to the wrapped env.
+    from atlas.regimes import assert_no_bypassed_corruption
+    assert_no_bypassed_corruption(regime)  # FIX_SPEC.md C5 -- see docstring
     base_env.seed(seed)
     base_env.reset_to_state = state
     return regime.reset()
@@ -334,6 +336,12 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                 proprios_sub = np.stack([proprios[i] for i in keep_idx], axis=0)
                 visual_t = torch.from_numpy(imgs_sub.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
                 proprio_t = torch.from_numpy(proprios_sub.astype(np.float32)).unsqueeze(0).to(device)
+                # FIX_SPEC.md D10 (SUBMISSION_PLAN.md Part A-vi) -- see
+                # atlas/harness.py's identical assertion for the full rationale.
+                assert visual_t.shape[0] == 1 and proprio_t.shape[0] == 1, (
+                    f"D10: expected a single-episode batch (dim0=1), got "
+                    f"visual={visual_t.shape}, proprio={proprio_t.shape}."
+                )
                 with torch.no_grad():
                     enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
                     enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)  # [T_model+1, N, D]
