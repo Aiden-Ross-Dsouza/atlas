@@ -3,6 +3,83 @@
 *Ran 2026-08-26. Four runs, all on Modal L4, ~6 min each. Figure: `atlas_out/e2_R2/F2a.pdf`,
 regenerable from logs alone via `scripts/make_e2_figure.py`.*
 
+## 🔴 SUPERSEDED 2026-08-28 (Phase 1 Stage 2, FIX_SPEC.md A1/A2/A3) — the entire "headline" and "2026-08-26 update" sections below are stale
+
+`atlas/router.py`'s hysteresis normaliser was inert at K=2 (`FIXLOG.md` A1:
+`relative_gap = (max−min)/(max−min) = 1.0`, always `> m=0.05` — the router
+was pure argmin, hysteresis never held) and `atlas/expand.py::maybe_expand()`
+selected the incumbent on the verification chunk instead of the deficit
+chunks (`FIXLOG.md` A2). Both fixed 2026-08-27; the entire E2 suite was
+re-run under the fix, plus per-decision logging (`strikes`, `probe_outcome`,
+`relative_gap`, `hysteresis_held`, `committed`, `library_size` — `FIXLOG.md`
+A3) added to the JSONL. **Local, CPU/GPU-light re-run (no Modal needed — E2
+runs no CEM planner), same protocol, `--corruption dark`:**
+
+| Config | Cell | UMF acc. (old → new) | S-dyn acc. (old → new) | Charts committed |
+|---|---|---:|---:|---:|
+| `ln_act`×R1 | B | 0.642 → **0.481** | 0.543 → **0.481** | 0 → 0 |
+| `lora4`×R1 | B | 0.642 → **0.494** | 0.494 → **0.481** | 0 → 0 |
+| **`ln_act`×R2 (was "decisive")** | B | **0.833 → 0.419** | **0.570 → 0.419** | 0 → 0 |
+| 3-chart confusion matrix | all | UMF 0.603, S-dyn 0.365 → **UMF 0.298, S-dyn 0.294** | | n/a |
+| R2 Cell B, q=1 (positive control) | B | n/a | n/a | → **5 committed** (was measuring UMF acc only pre-fix) |
+| R2 Cell C, q=1 (over-expansion) | C | 1.0 (unchanged) | n/a | 0 → 0 |
+
+**The headline reverses, it does not merely shrink.** Post-fix, UMF and
+S-dyn select the SAME chart on almost every decision at every config tested
+— both dominated by "hold the incumbent unless the challenger beats it by
+>=5% of the incumbent's own score", which under the new (correctly
+scale-free) normaliser almost never fires except when UMF's own gap is
+already large. The 3-chart confusion matrix's post-fix `sel=R0` column
+dominates every row (see raw JSONL) exactly the way the *pre-fix* S-dyn
+router did — UMF has converged onto S-dyn's old failure mode, not the other
+way around. **"UMF-based selection discriminates a dynamics shift; S-dyn
+does not" (this file's own headline, below) is no longer supported by any
+number on disk.** Cell C (over-expansion, 0 commits everywhere) is the one
+finding that survives unchanged.
+
+Raw artifacts (all new directories, none overwriting the originals below):
+`atlas_out/e2_R1_phase1stage2_2026-08-28/`, `atlas_out/e2_R1_lora4_phase1stage2_2026-08-28/`,
+`atlas_out/e2_R2_phase1stage2_2026-08-28/`, `atlas_out/e2_R2_cellB_q1_phase1stage2_2026-08-28/`,
+`atlas_out/e2_R2_cellC_q1_phase1stage2_2026-08-28/`, `atlas_out/e2_confusion_matrix_phase1stage2_2026-08-28/`
+(each: `e2_episodes.jsonl` with the new A3 per-decision `record_type="expansion"`
+records, `e2_summary.json`, `F2a.pdf`).
+
+**Addendum, same day:** the three `*_posthysteresis` configs below (a
+separate, EARLIER prior state from the 2026-08-26 sequential-hysteresis fix)
+were also re-run under today's A1/A2/A3 fix, plus a genuinely new, isolated
+q=3 Cell-B measurement closing `PAPER_FACT_CHECK` C2's "q=3 column is
+inferred, not measured" gap:
+
+| Config | Cell B UMF (old posthysteresis → new) | S-dyn (→ new) | Committed B |
+|---|---:|---:|---:|
+| `ln_act`×R1 posthysteresis | 0.6420 → **0.4815** | → **0.4815** | 0 → **0** |
+| `lora4`×R1 posthysteresis | (n/a) → **0.4938** | → **0.4815** | 0 → **0** |
+| `ln_act`×R2 posthysteresis | 0.8333 → **0.4194** | → **0.4194** | (n/a) → **2** |
+| `ln_act`×R2 Cell B, q=3, isolated (new) | n/a | n/a | → **0** |
+
+Routing accuracy is bit-identical between each `*_posthysteresis` re-run and
+its plain-config counterpart above — the collapse is reproducible across
+both the 2026-08-26 code path and its later restatement. **One finding not
+reflected in the accuracy numbers:** `e2_R2_phase1stage2_2026-08-28` (plain) → 0
+committed at Cell B, `e2_R2_posthysteresis_phase1stage2_2026-08-28` (identical
+config, re-run minutes later) → 2 committed, `e2_R2_cellB_q3_phase1stage2_2026-08-28`
+(isolated single-cell form) → 0 committed again — commit COUNT is not
+deterministic run-to-run under nominally identical config (routing accuracy
+is; commits are computed off a real gradient-descent probe fit, likely
+CUDA/cuDNN nondeterminism), flagged in `FIXLOG.md` as discovered-not-fixed,
+out of scope for this pass.
+
+Additional artifacts: `atlas_out/e2_R1_posthysteresis_phase1stage2_2026-08-28/`,
+`atlas_out/e2_R1_lora4_posthysteresis_phase1stage2_2026-08-28/`,
+`atlas_out/e2_R2_posthysteresis_phase1stage2_2026-08-28/`,
+`atlas_out/e2_R2_cellB_q3_phase1stage2_2026-08-28/`.
+
+Everything below this banner (headline, 2026-08-26 update, per-condition
+tables, "the mechanism" section) describes the PRE-A1/A2/A3 state and is
+kept for the historical record — do not cite it as current.
+
+---
+
 ## 🟢 UPDATE (2026-08-27): original 2×2 cells re-run under the hysteresis fix — Limitation #2 now FULLY closed with real numbers, not just superseded by the 3-chart matrix
 
 The 2026-08-26 update above closed Limitation #2's *mechanism* (sequential

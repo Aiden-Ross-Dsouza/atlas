@@ -104,7 +104,11 @@ def make_t2(e4_log: Path, out_dir: Path, baseline_arm: str = "frozen") -> None:
         rows = sorted(by_arm[arm], key=_pair_key)
         return np.array([1.0 if ep["success"] else 0.0 for ep in rows])
 
+    def keyed_outcomes_for(arm: str) -> dict[tuple, float]:
+        return {_pair_key(ep): (1.0 if ep["success"] else 0.0) for ep in by_arm[arm]}
+
     baseline_outcomes = outcomes_for(baseline_arm) if baseline_arm in by_arm else None
+    baseline_keyed = keyed_outcomes_for(baseline_arm) if baseline_arm in by_arm else None
 
     rows = []
     for arm, eps in by_arm.items():
@@ -125,16 +129,40 @@ def make_t2(e4_log: Path, out_dir: Path, baseline_arm: str = "frozen") -> None:
         n_knock_away = len(knock_away)
         mean_damage = float(np.mean(knock_away)) if knock_away else float("nan")
 
-        if baseline_outcomes is not None and arm != baseline_arm and len(outcomes) == len(baseline_outcomes):
-            delta_mean, (delta_lo, delta_hi) = paired_bootstrap(outcomes, baseline_outcomes)
-            delta_str = f"{delta_mean:.3f} [{delta_lo:.3f}, {delta_hi:.3f}]"
-            try:
-                p = mcnemar_paired(outcomes.astype(bool), baseline_outcomes.astype(bool))
-                mcnemar_str = f"{p:.4f}"
-            except ImportError:
-                mcnemar_str = "N/A (statsmodels missing)"
+        # FIX_SPEC.md B7: previously paired by EQUAL LENGTH
+        # (`len(outcomes) == len(baseline_outcomes)`), not equal KEY SET.
+        # With resume (a partial episodes.jsonl restarted and continued),
+        # two arms can reach the same COUNT of completed episodes while
+        # covering DIFFERENT (seed_run, global_episode_idx) keys -- the
+        # sorted-by-key arrays would then silently pair episode i of one
+        # arm against a DIFFERENT episode i of the other (same position,
+        # different underlying episode), corrupting paired_bootstrap/
+        # mcnemar_paired's pairing assumption without any error. Intersect
+        # the actual key sets and pair ONLY on the intersection.
+        if baseline_keyed is not None and arm != baseline_arm:
+            arm_keyed = keyed_outcomes_for(arm)
+            common_keys = sorted(set(arm_keyed) & set(baseline_keyed))
+            n_arm, n_base = len(arm_keyed), len(baseline_keyed)
+            if common_keys:
+                paired_arm = np.array([arm_keyed[k] for k in common_keys])
+                paired_base = np.array([baseline_keyed[k] for k in common_keys])
+                assert len(paired_arm) == len(paired_base) == len(common_keys), (
+                    "B7: intersected pairing arrays desynced -- must never happen."
+                )
+                delta_mean, (delta_lo, delta_hi) = paired_bootstrap(paired_arm, paired_base)
+                delta_str = f"{delta_mean:.3f} [{delta_lo:.3f}, {delta_hi:.3f}]"
+                if len(common_keys) < max(n_arm, n_base):
+                    delta_str += f" (n={len(common_keys)}/{max(n_arm, n_base)} paired)"
+                try:
+                    p = mcnemar_paired(paired_arm.astype(bool), paired_base.astype(bool))
+                    mcnemar_str = f"{p:.4f}"
+                except ImportError:
+                    mcnemar_str = "N/A (statsmodels missing)"
+            else:
+                delta_str = "N/A (zero overlapping (seed_run, global_episode_idx) keys)"
+                mcnemar_str = "N/A"
         else:
-            delta_str = "—" if arm == baseline_arm else "N/A (unpaired lengths)"
+            delta_str = "—" if arm == baseline_arm else "N/A (no baseline data)"
             mcnemar_str = "—" if arm == baseline_arm else "N/A"
 
         rows.append({

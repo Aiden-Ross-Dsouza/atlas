@@ -198,6 +198,24 @@ of the dissociation result: across a 5× range of training budget, more data
 measurably buys a better predictive-fitness score and buys nothing in
 planning success.
 
+> **AUDIT CORRECTION, 2026-08-28 (FIX_SPEC.md A9, Phase 1 Stage 2).** The
+> 20-trajectory row's chart (`e0_v3_dataset`, `ln_act`×R2) was retrained to a
+> new artifact, `atlas_out/e0_a9_retrain_phase1stage2_2026-08-28/`, with a
+> saved seed manifest, specifically to check whether 0.336 reproduces. **It
+> does** — the same quantity (now labelled `val_umf` post-A4) came back
+> 0.3335, within noise of the original 0.3357. The table's 0.336/0.302/0.268
+> trend is not disturbed by this check.
+> **But a second, previously unmeasured number surfaced in the same run and
+> must be disclosed alongside it:** on the genuinely held-out test split A4
+> introduced (seeds disjoint from both train and val), this same chart scores
+> `eval_umf = 0.4125` — substantially worse than the 0.336 ever reported for
+> it. The 0.336 in this table was measured on the set also used for
+> checkpoint selection, and the honest out-of-sample number for this specific
+> chart is ~0.08 worse. The 60- and 100-trajectory rows have not been
+> re-checked against a disjoint test set as of this banner — treat 0.336 as
+> optimistic and the other two rows as unverified in the same way until they
+> are.
+
 ### 4.3 What's actually wrong with the planner's ranking? — A mechanism, not just a null
 
 Given UMF (prediction error) doesn't track planning success, a direct
@@ -327,6 +345,35 @@ scale-up already done for §4.1) before it's a citable finding either way.
 
 ### 4.5 The one positive result: routing between charts works
 
+> 🔴 **SUPERSEDED 2026-08-28 (Phase 1 Stage 2, FIX_SPEC.md A1/A2/A3).** Every
+> number in this section below (60.3%/36.5% 3-chart confusion matrix, 0.833/
+> 0.570 2-chart decisive cell) was produced under a hysteresis normaliser
+> that was inert at K=2 (`atlas/router.py` — `relative_gap` was always
+> `(max−min)/(max−min) = 1.0 > m`, so hysteresis never held; see FIXLOG.md
+> A1) and an incumbent-selection bug in `maybe_expand()` (FIXLOG.md A2). Both
+> are now fixed and the full E2 suite was re-run
+> (`atlas_out/{e2_R1,e2_R1_lora4,e2_R2,e2_R2_cellB_q1,e2_R2_cellC_q1,
+> e2_confusion_matrix}_phase1stage2_2026-08-28/`). **The result reverses, it does
+> not merely shrink:**
+>
+> | Config | Cell B / decisive | UMF acc. (old → new) | S-dyn acc. (old → new) |
+> |---|---|---:|---:|
+> | 3-chart confusion matrix | all regimes | 0.603 → **0.298** | 0.365 → **0.294** |
+> | `ln_act`×R1 | B | 0.642 → **0.481** | 0.543 → **0.481 (identical)** |
+> | `lora4`×R1 | B | 0.642 → **0.494** | 0.494 → **0.481** |
+> | `ln_act`×R2 (was "decisive") | B | 0.833 → **0.419** | 0.570 → **0.419 (identical)** |
+>
+> Under the corrected hysteresis normaliser, UMF and S-dyn now select the
+> **same chart on almost every decision** (both dominated by "stick with the
+> incumbent unless the improvement exceeds 5% of the incumbent's own score") —
+> the confusion matrix collapses to `sel=R0` for nearly every row regardless
+> of true regime (see `E2_RESULTS.md`'s 2026-08-28 update section for the raw
+> matrix). **This section's headline claim — "UMF-based selection
+> discriminates a dynamics shift; S-dyn does not" — is no longer supported by
+> any number on disk.** Cell C (over-expansion) is unaffected: 0 charts
+> committed in every re-run, confirming that part of the result survives.
+> See `E2_RESULTS.md` for the full re-run detail and raw JSONL paths.
+
 A separate question from "does the chart help": if you already have several
 charts, can the same UMF signal correctly pick which chart matches the
 current situation? Tested by deliberately shifting either the *physics*
@@ -336,22 +383,24 @@ scene looks like" baseline router (called S-dyn):
 
 | Router | Accuracy, 3-chart library (chance = 33%) |
 |---|---:|
-| **UMF** | **60.3%** — real, ~2× better than chance |
-| S-dyn (appearance-based baseline) | 36.5% — indistinguishable from chance |
+| **UMF** | ~~**60.3%** — real, ~2× better than chance~~ **29.8% (post-A1/A2 re-run, see banner above)** |
+| S-dyn (appearance-based baseline) | ~~36.5% — indistinguishable from chance~~ **29.4% (post-A1/A2 re-run)** |
 
 The confusion matrix shows *why* S-dyn fails: it defaults to the same chart
 regardless of the true physics situation, essentially guessing. UMF's
 accuracy held up when the library was expanded from 2 charts (an earlier,
 smaller test) to 3 — it didn't erode, and S-dyn didn't improve either.
+*(Pre-A1/A2 framing — see banner above; post-fix, UMF now defaults to the
+same behaviour too.)*
 
-**2-chart decisive cell (`ln_act`×R2), current numbers: UMF 0.833 vs. S-dyn
-0.570.** UMF routes correctly more often than the appearance-based baseline;
-S-dyn's residual accuracy is naive stickiness that sometimes coincides with
-the right answer (correctly persisting post-switch). *(Audit note, FIX_SPEC.md
-A15: an earlier version of this paragraph reported a "pre-fix +55.6pp →
-post-fix +26.3pp" before/after. The "+55.6pp" figure has no surviving raw
-records, so the before/after framing has been dropped and only the current
-number is stated.)* Full detail: `E2_RESULTS.md`'s 2026-08-27 section.
+**2-chart decisive cell (`ln_act`×R2), pre-A1/A2 numbers (superseded): UMF
+0.833 vs. S-dyn 0.570. Post-A1/A2 re-run: UMF 0.419 vs. S-dyn 0.419 —
+identical.** UMF no longer routes correctly more often than the
+appearance-based baseline at this cell. *(Audit note, FIX_SPEC.md A15: an
+earlier version of this paragraph reported a "pre-fix +55.6pp → post-fix
++26.3pp" before/after. The "+55.6pp" figure has no surviving raw records —
+moot now that the +26.3pp itself is superseded per the banner above.)* Full
+detail: `E2_RESULTS.md`'s 2026-08-28 update section.
 
 **This is orthogonal to §4.1's negative result** — it validates that the
 *selection mechanism* works, not that the charts it selects between actually
@@ -401,8 +450,11 @@ improve success.
 - The planner's own cost-ranking is close to zero-correlated with true
   outcomes per-situation, for the frozen model itself, not just the chart
   (§4.3) — a real mechanism for the above.
-- UMF-based chart routing works and clearly beats an appearance-based
-  baseline (§4.5).
+- ~~UMF-based chart routing works and clearly beats an appearance-based
+  baseline (§4.5).~~ **SUPERSEDED 2026-08-28 — see §4.5's banner.** Post-A1/A2
+  hysteresis-fix re-run: UMF and S-dyn are statistically indistinguishable
+  (3-chart confusion matrix 29.8% vs. 29.4%; decisive 2-chart cell 41.9% vs.
+  41.9%, byte-identical). Cell C (over-expansion, 0 commits) still holds.
 - A verification-gated "commit a new chart" mechanism has been demonstrated
   to fire correctly and stay quiet correctly (§4.6).
 

@@ -319,6 +319,17 @@ decision to prioritize the paired N=40 planning re-eval over a fourth training-s
 | 60 (`e0_train_sweep_60`) | 0.107 | 0.298 | **0.3023** | step 325 (best: 200) |
 | 100 (`e0_train_sweep_100`) | 0.101 | 0.264 | **0.2678** | step 550 (best: 425) |
 
+> **AUDIT CORRECTION, 2026-08-28 (FIX_SPEC.md A9, Phase 1 Stage 2).** The 20-row's chart
+> (`e0_v3_dataset`) was retrained to `atlas_out/e0_a9_retrain_phase1stage2_2026-08-28/`, with a saved
+> seed manifest, to check whether **0.3357** reproduces. It does — the same quantity (now called
+> `val_umf` post-A4) came back **0.3335**, within noise. This table's monotonic 20/60/100 trend is
+> unaffected. **But the same run also measured this chart's `eval_umf` on A4's genuinely disjoint
+> test split for the first time: 0.4125** — ~0.08 worse than the 0.3357 this table reports, because
+> 0.3357 was measured on the set also used for checkpoint selection (the exact optimistic-bias
+> mechanism A4 documents elsewhere in E0). The 60- and 100-trajectory rows have **not** been
+> re-checked against a disjoint test set — their reported numbers should be treated as similarly
+> optimistic until they are.
+
 **UMF falls monotonically with more data — no sign of saturation yet at 5×.** Whether this
 converts to planning success is the open question this table cannot answer by itself (the
 established UMF-vs-SR dissociation — this file's N=100 section above, Kendall τ significant
