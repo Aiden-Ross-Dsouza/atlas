@@ -407,6 +407,12 @@ the $19 stream by confirming the routing signal does anything in a planning loop
 
 Each phase = one delegated **sonnet** sub-agent, one spec file, one exit gate I verify.
 
+> **The exact copy-pasteable dispatch prompt for every phase lives in
+> `research_audit/PHASE_PROMPTS.md`.** This section says *what* each phase is;
+> that file says *how to launch it*, and carries the current per-phase status.
+> Start a fresh `claude` session per phase — never `--continue`/`--resume`,
+> which replays a whole prior conversation into context at real cost.
+
 ### Phase 0 — Setup *(me, ~30 min, $0)*
 Copy this plan to repo root as `SUBMISSION_PLAN.md`; pointer from `CLAUDE.md`. Create
 `research_audit/FIXLOG.md`, `EVIDENCE_LEDGER.md`, `FIX_SPEC.md`. Write four new sonnet
