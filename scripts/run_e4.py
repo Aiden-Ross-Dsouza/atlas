@@ -230,9 +230,13 @@ def main() -> None:
     print(f"Computing motion_gate from {gate_num_trajs} fresh {regime_a} trajectories "
           f"at the runtime-scored chunk size (traj_len={gate_traj_len} = "
           f"frameskip*num_act_stepped)...")
+    # P7: `source` was IMPLICIT (signature default "scripted", the retired
+    # goal-free walk). Explicit now; NOT changed to "closed_loop" (a scope
+    # decision needing sign-off — FIXLOG V3-8 / P0G_FIX_PLAN §4.3).
+    GATE_SOURCE = "scripted"
     gate_trajectories = load_regime_trajectories(
         model, prep, regime_a, num_trajs=gate_num_trajs, traj_len=gate_traj_len,
-        device=device, seed_offset=20_000)
+        device=device, seed_offset=20_000, source=GATE_SOURCE)
     gate_displacements = torch.tensor([
         (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
         for t in gate_trajectories
@@ -375,6 +379,7 @@ def main() -> None:
         "max_mpc_steps": args.max_mpc_steps, "hysteresis": HYSTERESIS,
         "expansion_start_library": args.expansion_start_library,
         "motion_gate": motion_gate,
+        "gate_source": GATE_SOURCE,  # P7
         "regime_configs": {r: dict(REGIME_CONFIGS.get(r, {})) for r in segment_regimes_used},
         "chart_kind": args.kind, "charts_dir": str(args.charts),
         "per_arm_success_rate": {

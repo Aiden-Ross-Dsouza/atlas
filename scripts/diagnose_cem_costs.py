@@ -47,6 +47,7 @@ from tqdm import tqdm
 import atlas
 from atlas.chart import Chart
 from atlas.regimes import PhysicsRegime, set_regime_config
+from atlas.score import rollout_umf  # noqa: E402 -- additive import only, score.py itself untouched
 
 from run_e0_planning import (  # noqa: E402
     FRAMESKIP, HUB_PATH, block_success, build_cfg, load_dataset_states,
@@ -124,6 +125,94 @@ def rollout_true_outcomes(base_env, regime, seed: int, init_state: np.ndarray,
     return distances, contacts
 
 
+def rollout_true_outcomes_and_umf(
+    base_env, regime, seed: int, init_state: np.ndarray, goal_state: np.ndarray,
+    model_actions: torch.Tensor, agent: GC_Agent, world_model, device,
+    frameskip: int = FRAMESKIP, motion_gate: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, list]:
+    """SUBMISSION_PLAN.md E-A (`--save-latents`): same real rollout as
+    `rollout_true_outcomes` (identical distances/contacts, computed the same
+    way -- kept as a separate function rather than a flag threaded into the
+    original so the default `--save-latents`-unset path is provably
+    untouched), but ALSO builds the real encoder-output trajectory for each
+    candidate (encode the actual visual/proprio observed at every
+    model-chunk boundary the candidate's real rollout passes through) and
+    scores it against the CURRENTLY-APPLIED chart/predictor for this `kind`
+    via `atlas.score.rollout_umf` -- reusing score.py's own UMF definition
+    and its own `_open_loop_rollout` rather than reimplementing prediction
+    logic (score.py itself is not modified; only imported).
+
+    Uses `rollout_umf`, NOT `umf()`: the caller (main()) already applies the
+    kind's chart to `world_model.model.predictor` once, for the whole
+    per-kind block (matching `rollout_umf`'s contract of "predictor already
+    in the state to be scored" -- see score.py's own docstring comparing the
+    two functions) -- `umf()`'s own apply_/restore_ would be redundant here
+    and would leave the predictor state inconsistent with the rest of the
+    per-kind block (goal encoding, agent.act, etc., which all run under the
+    SAME applied chart).
+
+    This is the "UMF on held-out candidates" readout E-A calls for. It does
+    NOT save the raw per-candidate encoder-output latents themselves (300
+    candidates x 7 frames x 256 x 384 floats per seed per kind is ~800MB and
+    does not fit this script's existing per-seed JSON/incremental-jsonl
+    format) -- per the dispatch spec's explicit "or equivalently the raw
+    prediction error" alternative, only the resulting scalar UMF (score.py's
+    own normalized prediction-error ratio) is persisted per candidate. A
+    downstream fitting step (E-A's "fit ln_act with the existing
+    run_e0_finetune loss") needs the raw transitions themselves and would
+    reuse run_e0.py's own trajectory-collection path, not this function.
+
+    Returns (distances, contacts, umfs) -- umfs[i] is a float, or None if
+    score.py's own informative-chunk gate fired for that candidate (only
+    possible when motion_gate is not None; default None here matches
+    run_e0_planning.py's own post-hoc per-replan UMF logging convention,
+    per run_e0.py's inline comment on the same choice).
+    """
+    num_samples = model_actions.shape[1]
+    distances = np.empty(num_samples, dtype=np.float64)
+    contacts = np.empty(num_samples, dtype=np.int64)
+    umfs: list = [None] * num_samples
+    for i in range(num_samples):
+        cand = model_actions[:, i, :]  # [horizon, A] -- model-chunk, normalized (CEM's own units)
+        raw = rearrange(cand, "t (f d) -> (t f) d", d=2)
+        raw = agent.preprocessor.denormalize_actions(raw).numpy()
+        obs0, _ = prepare_with_visual(base_env, regime, seed, init_state)  # reset -- same start every candidate
+        imgs = [obs0["visual"]]
+        proprios = [obs0["proprio"]]
+        final_state = None
+        total_contacts = 0
+        for step_idx, a in enumerate(raw):
+            obs, _, _, info = base_env.step(a)
+            final_state = info["state"]
+            total_contacts += info["n_contacts"]
+            if (step_idx + 1) % frameskip == 0:
+                # Model-chunk boundary -- capture the real observation here,
+                # matching run_e0.py::load_regime_trajectories' subsampling
+                # convention (keep every `frameskip`-th raw frame).
+                imgs.append(obs["visual"])
+                proprios.append(obs["proprio"])
+        distances[i] = block_success(goal_state, final_state)["block_pos_diff"]
+        contacts[i] = total_contacts
+
+        imgs_np = np.stack(imgs, axis=0)          # [T_model+1, 224, 224, 3]
+        proprios_np = np.stack(proprios, axis=0)  # [T_model+1, proprio_dim]
+        visual_t = torch.from_numpy(imgs_np.copy()).permute(0, 3, 1, 2).float().unsqueeze(0).to(device)
+        proprio_t = torch.from_numpy(proprios_np.astype(np.float32)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            # Same encode() call as run_e0.py::load_regime_trajectories --
+            # raw uint8-range visual + raw proprio, encode() does its own
+            # /255 + preprocessor.transform + normalize_proprios internally.
+            enc = world_model.encode({"visual": visual_t, "proprio": proprio_t})
+            enc_out = enc["visual"].squeeze(0).squeeze(1).flatten(1, 2)  # [T_model+1, N, D]
+            proprio_enc = enc["proprio"].squeeze(0)                     # [T_model+1, P_tok, D_p]
+            proprio_ctxt_i = proprio_enc[0:1].unsqueeze(0)               # [1, 1, P_tok, D_p]
+            umfs[i] = rollout_umf(
+                world_model, enc_out, cand.to(device),
+                proprio_ctxt=proprio_ctxt_i, motion_gate=motion_gate,
+            )
+    return distances, contacts, umfs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cost-ranking diagnostic: Spearman rho(planner cost, true outcome) per kind.")
@@ -154,6 +243,17 @@ def main() -> None:
                               "below only fires meaningfully in 'first' mode.")
     parser.add_argument("--charts-dir", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--out-dir", type=Path, default=atlas.OUT_DIR / "cost_ranking")
+    parser.add_argument("--save-latents", action="store_true",
+                         help="SUBMISSION_PLAN.md E-A. When set, additionally encodes the real "
+                              "observation trajectory each candidate's rollout actually passes "
+                              "through and scores it against the currently-applied chart/predictor "
+                              "via atlas.score.rollout_umf, saving a per-candidate UMF value under "
+                              "results[kind]['umf_per_candidate'] (a new key -- all EXISTING keys "
+                              "and the default flag-unset output are byte-identical to before this "
+                              "flag existed). Costs one extra encode() call per candidate on top of "
+                              "the already-required real env rollout -- see "
+                              "rollout_true_outcomes_and_umf's docstring for what is and is not "
+                              "saved (scalar UMF, not raw latents).")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -240,8 +340,18 @@ def main() -> None:
                               f"from the first kind's by {max_diff:.6g} -- the same-input guarantee "
                               f"this diagnostic relies on doesn't hold here for this seed.")
 
-            true_dist, contacts = rollout_true_outcomes(base_env, regime, seed, init_state,
-                                                          goal_state, actions, agent)
+            umf_per_candidate = None
+            if args.save_latents:
+                # Chart for this kind (if any) is already applied to
+                # wm.predictor above and stays applied for the rest of this
+                # per-kind block -- rollout_umf scores against that
+                # already-applied state (see the function's own docstring).
+                true_dist, contacts, umf_per_candidate = rollout_true_outcomes_and_umf(
+                    base_env, regime, seed, init_state, goal_state, actions, agent,
+                    world_model=model, device=device)
+            else:
+                true_dist, contacts = rollout_true_outcomes(base_env, regime, seed, init_state,
+                                                              goal_state, actions, agent)
             rho, pval = spearmanr(costs.numpy(), true_dist)
             contact_mask = contacts > 0
             contact_frac = float(contact_mask.mean())
@@ -271,6 +381,17 @@ def main() -> None:
                 "true_dist": true_dist.tolist(),
                 "contacts": contacts.tolist(),
             }
+            if umf_per_candidate is not None:
+                # SUBMISSION_PLAN.md E-A (--save-latents): new, clearly-flagged
+                # keys only -- nothing above this block changes when the flag
+                # is unset, and existing parsers reading costs/true_dist/
+                # contacts are unaffected.
+                results[kind]["umf_per_candidate"] = [
+                    (float(u) if u is not None else None) for u in umf_per_candidate
+                ]
+                valid_umf = [u for u in umf_per_candidate if u is not None]
+                results[kind]["umf_mean"] = float(np.mean(valid_umf)) if valid_umf else None
+                results[kind]["umf_n_gated"] = int(len(umf_per_candidate) - len(valid_umf))
             pooled_costs[kind].extend(costs.numpy().tolist())
             pooled_dist[kind].extend(true_dist.tolist())
 

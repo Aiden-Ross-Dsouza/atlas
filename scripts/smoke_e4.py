@@ -103,7 +103,8 @@ def main() -> None:
 
     print(f"Computing motion_gate from a fresh {regime_a} trajectory sample...")
     gate_trajectories = load_regime_trajectories(
-        model, prep, regime_a, num_trajs=2, traj_len=10, device=device, seed_offset=30_000)
+        model, prep, regime_a, num_trajs=2, traj_len=10, device=device,
+        seed_offset=30_000, source="scripted")  # P7: explicit (was the signature default)
     gate_displacements = torch.tensor([
         (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
         for t in gate_trajectories

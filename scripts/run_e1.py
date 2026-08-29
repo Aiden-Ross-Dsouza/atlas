@@ -289,8 +289,15 @@ def main() -> None:
     # alongside this).
     print(f"Computing motion_gate from a fresh {args.regime} trajectory sample...")
     from scripts.run_e0 import load_regime_trajectories
+    # P7: `source` was IMPLICIT here — the signature default is "scripted", the
+    # retired goal-free contact-seeking walk (v3 §5.2). Made explicit so the
+    # mismatch with P0-G's on-policy charts is visible, NOT silently changed:
+    # switching this to "closed_loop" is a scope decision (costs a CEM search per
+    # gate trajectory) and needs human sign-off — see FIXLOG V3-8 / P0G_FIX_PLAN §4.3.
+    GATE_SOURCE = "scripted"
     gate_trajectories = load_regime_trajectories(
-        model, prep, args.regime, num_trajs=3, traj_len=10, device=device, seed_offset=20_000)
+        model, prep, args.regime, num_trajs=3, traj_len=10, device=device,
+        seed_offset=20_000, source=GATE_SOURCE)
     gate_displacements = torch.tensor([
         (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
         for t in gate_trajectories
@@ -379,6 +386,12 @@ def main() -> None:
 
     t1_md = compute_t1(all_records, args.routers)
     (args.out / "T1.md").write_text(t1_md)
+    # P7: record the motion-gate calibration source so a reader does not have to
+    # know load_regime_trajectories' signature default.
+    (args.out / "e1_run_meta.json").write_text(json.dumps({
+        "gate_source": GATE_SOURCE, "motion_gate": float(motion_gate),
+        "regime": args.regime, "n_episodes": len(all_records),
+    }, indent=2))
     print(f"\n{t1_md}")
     print(f"\nEpisodes JSONL: {args.out / 'episodes.jsonl'}")
     print(f"T1 table: {args.out / 'T1.md'}")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -181,16 +182,54 @@ def make_t2(e4_log: Path, out_dir: Path, baseline_arm: str = "frozen") -> None:
     _print_markdown_table(rows, out_dir / "T2.md", "T2 — E4 Ablation Ladder + Recall")
 
 
-def make_t5(e0_dir: Path, out_dir: Path) -> None:
+# Kinds that are the frozen-model reference row, not an adapter under test.
+_T5_BASELINE_KEYS = ("c0", "baseline", "frozen", "identity")
+# Smallest real adapter (ln_act) is ~10.7k trainable params. Anything with a
+# positive trainable-param count below this is not a real chart — it is the
+# pre-A11 / pre-rollout-fix `results.json` (e.g. atlas_out/e0/, which records
+# `params: 26/12/69`). Rendering that as a table is the L2 bug this guard closes.
+_T5_MIN_PLAUSIBLE_PARAMS = 1000
+
+
+def _t5_resolve_baseline_umf(regime: str, kinds: dict, results: dict, e0_dir: Path) -> float | None:
+    """Frozen-model reference UMF for a regime, tried in priority order:
+    regime-level scalar key -> a per-kind baseline row -> {e0_dir}/frozen_baseline.json.
+    E0 / E0' (run_e0.py) writes `results[regime]` as {ln_act, lora4, full} with no
+    baseline entry, so without this the dUMF / "% of full" columns are dead."""
+    for k in ("baseline_umf", "frozen_umf", "c0_umf"):
+        if isinstance(kinds.get(k), (int, float)):
+            return float(kinds[k])
+    for bkey in _T5_BASELINE_KEYS:
+        row = kinds.get(bkey)
+        if isinstance(row, dict) and row.get("eval_umf") is not None:
+            return float(row["eval_umf"])
+    fb = e0_dir / "frozen_baseline.json"
+    if fb.exists():
+        d = json.loads(fb.read_text())
+        for key in (regime, f"{regime}_umf", "umf", "eval_umf"):
+            v = d.get(key) if isinstance(d, dict) else None
+            if isinstance(v, (int, float)):
+                return float(v)
+    return None
+
+
+def make_t5(e0_dir: Path, out_dir: Path, strict: bool = True) -> None:
     """T5 — E0 adapter capacity: Adapter x {Params, KB, Eval UMF, dUMF, Success,
     % of full}.
 
-    Reads {e0_dir}/results.json (regime -> kind -> metrics). dUMF is
-    (frozen c0 UMF - chart UMF) when a c0 / baseline row is present in the same
-    regime; Success is read from {e0_dir}/{kind}_{regime}_summary.json or
-    {e0_dir}/planning_{kind}_{regime}.json if present. Columns whose inputs are
-    absent render as "-" rather than silently vanishing. Raises if results.json
-    itself is missing (FIX_SPEC.md A12: no silent no-op).
+    Reads {e0_dir}/results.json (regime -> kind -> metrics). Params is
+    `params_trainable` (falls back to `params`). dUMF is (frozen-model UMF -
+    chart UMF); the frozen UMF is resolved by _t5_resolve_baseline_umf (regime
+    scalar, a baseline kind row, or {e0_dir}/frozen_baseline.json). Success is
+    read from {e0_dir}/{kind}_{regime}_summary.json etc. if present. Columns
+    whose inputs are absent render as "-" rather than silently vanishing.
+
+    Raises (FIX_SPEC.md A12: no silent no-op / no silent garbage):
+      - FileNotFoundError if results.json is missing;
+      - ValueError if results.json is pre-A11 / superseded data (trainable param
+        counts below a real adapter's size — the atlas_out/e0/ `params: 26` case).
+    With strict=False the ValueError is downgraded to a warning + skip, so
+    `--all` against a stale default dir does not abort the other tables.
     """
     results_path = e0_dir / "results.json"
     if not results_path.exists():
@@ -199,6 +238,30 @@ def make_t5(e0_dir: Path, out_dir: Path) -> None:
             f"Run scripts/run_e0.py (or point --e0-dir at a directory that has results.json)."
         )
     results = json.loads(results_path.read_text())
+
+    # Guard: refuse to render a table from superseded / pre-A11 results.json.
+    suspect = [
+        (regime, kind, m.get("params_trainable", m.get("params")))
+        for regime, kinds in results.items()
+        for kind, m in kinds.items()
+        if isinstance(m, dict) and kind not in _T5_BASELINE_KEYS
+        and isinstance(m.get("params_trainable", m.get("params")), int)
+        and 0 < m.get("params_trainable", m.get("params")) < _T5_MIN_PLAUSIBLE_PARAMS
+    ]
+    if suspect:
+        msg = (
+            f"T5: {results_path} looks like superseded / pre-A11 data — trainable "
+            f"param counts below a real adapter ({_T5_MIN_PLAUSIBLE_PARAMS}): "
+            f"{suspect[:3]}{'...' if len(suspect) > 3 else ''}. "
+            f"Point --e0-dir at the current E0' results directory."
+        )
+        if strict:
+            raise ValueError(msg)
+        print(f"[skip] {msg}")
+        return
+
+    mtime = datetime.fromtimestamp(results_path.stat().st_mtime)
+    provenance = f"_Source: `{results_path}` (mtime {mtime:%Y-%m-%d %H:%M})_"
 
     def _success(kind: str, regime: str):
         for cand in (e0_dir / f"{kind}_{regime}_summary.json",
@@ -213,14 +276,14 @@ def make_t5(e0_dir: Path, out_dir: Path) -> None:
 
     rows = []
     for regime, kinds in results.items():
-        baseline_umf = None
-        for bkey in ("c0", "baseline", "frozen", "identity"):
-            if bkey in kinds and kinds[bkey].get("eval_umf") is not None:
-                baseline_umf = float(kinds[bkey]["eval_umf"])
+        baseline_umf = _t5_resolve_baseline_umf(regime, kinds, results, e0_dir)
         full_gain = None
-        if "full" in kinds and baseline_umf is not None and kinds["full"].get("eval_umf") is not None:
-            full_gain = baseline_umf - float(kinds["full"]["eval_umf"])
+        full_row = kinds.get("full")
+        if isinstance(full_row, dict) and baseline_umf is not None and full_row.get("eval_umf") is not None:
+            full_gain = baseline_umf - float(full_row["eval_umf"])
         for kind, m in kinds.items():
+            if kind in _T5_BASELINE_KEYS or not isinstance(m, dict):
+                continue  # frozen reference row (or a regime-level scalar) — not an adapter
             params = m.get("params_trainable", m.get("params"))
             umf = m.get("eval_umf")
             d_umf = (baseline_umf - float(umf)) if (baseline_umf is not None and umf is not None) else None
@@ -237,16 +300,18 @@ def make_t5(e0_dir: Path, out_dir: Path) -> None:
                 "% of full": f"{pct_full:.0f}%" if pct_full is not None else "—",
             })
 
-    _print_markdown_table(rows, out_dir / "T5.md", "T5 — E0 Adapter Capacity")
+    _print_markdown_table(rows, out_dir / "T5.md", "T5 — E0 Adapter Capacity", note=provenance)
 
 
-def _print_markdown_table(rows: list[dict], out_path: Path, title: str) -> None:
+def _print_markdown_table(rows: list[dict], out_path: Path, title: str, note: str | None = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         print(f"{title}: no data.")
         return
     headers = list(rows[0].keys())
     lines = [f"# {title}", ""]
+    if note:
+        lines += [note, ""]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join(["---"] * len(headers)) + "|")
     for row in rows:
@@ -277,7 +342,9 @@ def main() -> None:
     if args.all or args.table == "T2":
         make_t2(atlas.OUT_DIR / "e4" / "episodes.jsonl", atlas.OUT_DIR / "e4")
     if args.all or args.table == "T5":
-        make_t5(args.e0_dir, args.e0_dir)
+        # `--all` must not abort on a stale default --e0-dir; an explicit
+        # `--table T5` raises so the caller sees the bad input.
+        make_t5(args.e0_dir, args.e0_dir, strict=(args.table == "T5"))
 
 
 if __name__ == "__main__":
