@@ -495,44 +495,230 @@ def gate_g3b(wm, wrapper) -> None:
     print(f"PASSED  (outcome={outcome})")
 
 
-def gate_g4(env_factory, regimes: list[str]) -> None:
-    """G4: 20 random-action rollouts per regime → latents differ statistically."""
-    print(f"G4: regime reality check for {regimes}...", end=" ")
+# ── G4: regimes real ──────────────────────────────────────────────────────────
+# Rewritten per IMPLEMENTATION_PLAN_V3 §9. The old version compared the mean
+# pixel value of the whole flattened frame, averaged over random-action
+# rollouts, with a 1e-6 threshold (CHECK 4.1) -- Push-T frames are ~97% white,
+# so the mean image is near-identical for any regime and the test could neither
+# pass meaningfully nor ever fail (on a real OR a fake regime). It was also
+# hard-skipped in headless mode and had never actually run.
+#
+# New design (system-identification logic: hold the input constant, test if the
+# output distribution differs). Four choices, each pinned rather than left open:
+#   1. Fixed IDENTICAL aimed-walk actions across regimes (persistent random
+#      target near the block + proportional aim), NOT a planner -- a planner
+#      adapts and would compensate the shift away. Contact is REQUIRED, not
+#      hoped for: raw random actions make contact ~15% of the time and the
+#      regimes act only on contact / post-contact dynamics, so a no-contact
+#      rollout carries no signal. G4 aborts if the R0 contact rate < 0.5 and
+#      warns (low power) below 0.8.
+#   2. n = 120 sequences per regime. This gate is CPU-only and free -- there is
+#      no cost reason to run it underpowered.
+#   3. Negative control with REAL sampling variance: R0 seeds [0,n) vs R0 seeds
+#      [NULL_OFFSET, NULL_OFFSET+n) -- two independent R0 samples, different
+#      initial states, SAME physics. Its bootstrap CI on the mean difference
+#      must INCLUDE zero. (Comparing R0 to itself on the same seeds is
+#      deterministic -- d_i == 0 exactly -- and tests nothing.)
+#   4. ONE pre-registered primary statistic: combined block POSE change
+#      sqrt(dx^2 + dy^2 + (G4_RAD_TO_PX * dtheta)^2) from start to end, where
+#      G4_RAD_TO_PX = 30 px/rad ~ the T-block's moment arm (so a rotation and a
+#      translation that move the block's extremity equally count equally).
+#      Friction (R1) changes the rotation/translation split of a push, not
+#      necessarily the translation magnitude, so a translation-only statistic
+#      would be blind to it by construction -- the combined pose covers both.
+#      The (translation, rotation) decomposition and a KS test are reported as
+#      secondary, not decisive.
+#
+# PASS iff: (a) the null CI includes 0 (the procedure does not false-positive on
+# noise), AND (b) for every shifted regime the paired-bootstrap CI on the mean
+# displacement difference vs R0 excludes 0 AND the effect magnitude exceeds the
+# null noise band (max |bound| of the null CI). "Materially large" is thus
+# measured against real noise, not an arbitrary pixel count.
+
+_G4_NULL_OFFSET = 100_000
+_G4_ACTION_GAIN = 0.25  # matches run_e0.py's scripted collector (calibrated to
+                        # the checkpoint's own action_std ~0.20)
+_G4_RAD_TO_PX = 30.0    # T-block moment arm; folds rotation into the pose stat
+
+
+def _g4_rollout(regime: str, seed: int, n_steps: int, track: bool = False) -> tuple[float, float, float, int]:
+    """One aimed-walk rollout in the REAL Push-T sim under `regime`. Returns
+    (combined pose change, translation magnitude, |Δangle| in rad, n_contacts).
+    No world model, no renderer dependency -- reads info['block_pose']."""
     import numpy as np
+    from evals.simu_env_planning.envs.pusht_env.pusht_env import PushTEnv
+    from atlas.regimes import PhysicsRegime
 
-    means = {}
-    for regime in regimes:
-        env = env_factory(regime)
-        all_obs = []
-        for seed in range(20):
-            # PushTEnv is legacy-gym, NOT gymnasium: .seed() then .reset() (no
-            # seed kwarg), 4-tuple .step() (obs, reward, done, info), and obs
-            # is a dict {"visual", "proprio"} -- not a plain array. The
-            # previous version of this function used env.reset(seed=...) and
-            # a 5-tuple step(), matching neither, and had never actually run
-            # against a real env (E0_IMPLEMENTATION_PLAN.md T12 #11).
-            env.seed(seed)
-            obs, _ = env.reset()
-            all_obs.append(obs["visual"].flatten().astype(np.float64))
-            for _ in range(10):
-                obs, reward, done, info = env.step(env.action_space.sample())
-                all_obs.append(obs["visual"].flatten().astype(np.float64))
-                if done:
-                    break
-        means[regime] = np.stack(all_obs).mean(axis=0)
-        env.close()
+    rs = np.random.RandomState(seed)
+    base_env = PushTEnv(render_size=96, with_velocity=True)
+    env = PhysicsRegime(base_env, regime)
+    env.seed(seed)
+    obs, state = env.reset()
 
-    if len(regimes) >= 2:
-        r0, r1 = regimes[0], regimes[1]
-        diff = np.abs(means[r0] - means[r1]).mean()
-        if diff < 1e-6:
-            raise AssertionError(
-                f"G4 FAILED: {r0} and {r1} mean observations are identical "
-                f"(mean |diff| = {diff:.2e}). Physics modification is not taking effect."
-            )
-        print(f"PASSED  (mean |diff| {r0}↔{r1} = {diff:.4f})")
-    else:
-        print("PASSED  (single regime, no comparison)")
+    block_xy0 = np.array([state[2], state[3]], dtype=np.float64)
+    angle0 = float(state[4])
+    agent_xy = np.asarray(obs["proprio"][:2], dtype=np.float64)
+    action_scale = env.action_scale
+
+    # Fixed push direction (seeded) + a fixed target point near the initial
+    # block position. In `track` mode the aim point follows the block's current
+    # position offset along that direction, so contact is SUSTAINED for the
+    # whole rollout -- the right probe for "does the friction effect compound
+    # over a long push?" (the fixed-target walk stops pushing once the block
+    # slides off the target).
+    push_dir = rs.uniform(-1.0, 1.0, size=(2,))
+    push_dir /= (np.linalg.norm(push_dir) + 1e-9)
+    target = block_xy0 + rs.uniform(-25.0, 25.0, size=(2,))
+
+    n_contacts = 0
+    block_xy = block_xy0.copy()
+    last_pose = np.array([block_xy0[0], block_xy0[1], angle0])
+    for _ in range(n_steps):
+        aim = (block_xy - 35.0 * push_dir) if track else target
+        direction = (aim - agent_xy) / action_scale
+        noise = rs.normal(0.0, 0.15, size=(2,))
+        act = np.clip((direction + noise) * _G4_ACTION_GAIN, -1.0, 1.0)
+        obs, _, done, info = env.step(act)
+        agent_xy = np.asarray(obs["proprio"][:2], dtype=np.float64)
+        n_contacts += int(info["n_contacts"])
+        last_pose = np.asarray(info["block_pose"], dtype=np.float64)
+        block_xy = last_pose[:2]
+        if done:
+            break
+    env.close()
+
+    d_xy = last_pose[:2] - block_xy0
+    d_theta = float(last_pose[2] - angle0)
+    # wrap Δangle to [-pi, pi] so a near-2pi spin isn't read as a huge change
+    d_theta = (d_theta + np.pi) % (2 * np.pi) - np.pi
+    translation = float(np.linalg.norm(d_xy))
+    pose = float(np.sqrt(d_xy[0] ** 2 + d_xy[1] ** 2 + (_G4_RAD_TO_PX * d_theta) ** 2))
+    return pose, translation, abs(d_theta), n_contacts
+
+
+def gate_g4(regimes: list[str], n: int = 120, n_steps: int = 40,
+            selftest: bool = False) -> None:
+    """G4: fixed identical actions under each regime => block trajectory
+    statistics differ, paired, beyond a measured noise band. See the block
+    comment above for the full pre-registered design.
+
+    selftest=True replaces every shifted regime with R0 (a deliberately fake
+    "shift") -- G4 must then FAIL criterion (b), proving it is not vacuous.
+    """
+    import numpy as np
+    from atlas.stats import paired_bootstrap
+    try:
+        from scipy.stats import ks_2samp
+    except Exception:
+        ks_2samp = None
+
+    r0 = regimes[0]
+    shifted = [(r0 if selftest else r) for r in regimes[1:]]
+    label = f"{regimes} (SELFTEST: shifts faked as {r0})" if selftest else f"{regimes}"
+    print(f"G4: regime reality check {label}, n={n} x {n_steps} steps...")
+
+    def batch(regime, seed_start):
+        rows = [_g4_rollout(regime, seed_start + i, n_steps) for i in range(n)]
+        return {k: np.array([x[i] for x in rows])
+                for i, k in enumerate(("pose", "trans", "angle", "contacts"))}
+
+    b0 = batch(r0, 0)
+    b0b = batch(r0, _G4_NULL_OFFSET)
+    pose0 = b0["pose"]
+
+    contact_rate = float((b0["contacts"] > 0).mean())
+    print(f"  R0 contact rate = {contact_rate:.2f}  "
+          f"(pose Δ mean {pose0.mean():.1f} px, sd {pose0.std():.1f})")
+    if contact_rate < 0.5:
+        raise AssertionError(
+            f"G4 FAILED: only {contact_rate:.0%} of R0 rollouts made contact -- "
+            "the aimed-walk actions are not engaging the block, so no regime "
+            "test has power. Fix the action generator before trusting G4.")
+    if contact_rate < 0.8:
+        print(f"  [WARN] R0 contact rate {contact_rate:.0%} < 0.8 -- reduced power.")
+
+    # ── negative control: two independent R0 samples, same physics ────────────
+    null_mean, (null_lo, null_hi) = paired_bootstrap(b0b["pose"], pose0)
+    null_band = max(abs(null_lo), abs(null_hi))
+    null_ok = null_lo <= 0.0 <= null_hi
+    print(f"  NULL  R0[{_G4_NULL_OFFSET}:] - R0[0:]  mean {null_mean:+.2f} px  "
+          f"CI [{null_lo:+.2f}, {null_hi:+.2f}]  "
+          f"{'OK (contains 0)' if null_ok else 'BROKEN (excludes 0!)'}")
+    if not null_ok:
+        raise AssertionError(
+            "G4 FAILED: the negative control (R0 vs R0, different seeds) has a "
+            f"CI that excludes zero ({null_lo:+.2f}, {null_hi:+.2f}) -- the test "
+            "procedure false-positives on pure sampling noise and cannot be "
+            "trusted when it fires on a real regime.")
+
+    # ── each shifted regime vs R0, paired by seed ────────────────────────────
+    failures = []
+    for name, actual in zip(regimes[1:], shifted):
+        bS = batch(actual, 0)
+        mean_d, (lo, hi) = paired_bootstrap(bS["pose"], pose0)   # same seeds => paired
+        excludes0 = not (lo <= 0.0 <= hi)
+        beats_noise = abs(mean_d) > null_band
+        ks_p = (ks_2samp(bS["pose"], pose0).pvalue if ks_2samp is not None else float("nan"))
+        d_trans = float(bS["trans"].mean() - b0["trans"].mean())
+        d_ang = float(bS["angle"].mean() - b0["angle"].mean())
+        verdict = "REAL" if (excludes0 and beats_noise) else "NOT DISTINGUISHABLE"
+        print(f"  {name:>3} vs {r0}:  Δpose {mean_d:+.2f} px  CI [{lo:+.2f}, {hi:+.2f}]"
+              f"  (Δtrans {d_trans:+.2f} px, Δ|angle| {d_ang:+.4f} rad; KS p={ks_p:.1e})"
+              f"  -> {verdict}")
+        if not (excludes0 and beats_noise):
+            failures.append(name)
+
+    if selftest:
+        if failures == regimes[1:]:
+            print("G4 SELFTEST PASSED  (faked shifts correctly reported NOT distinguishable)")
+            return
+        raise AssertionError(
+            f"G4 SELFTEST FAILED: faked shifts {set(regimes[1:]) - set(failures)} "
+            "were reported REAL -- the gate is vacuous (fires on no shift at all).")
+
+    if failures:
+        raise AssertionError(
+            f"G4 FAILED: regime(s) {failures} produce block trajectories "
+            f"statistically indistinguishable from {r0} (or within the noise "
+            "band) -- the physics modification is not real enough to build on.")
+    print(f"G4 PASSED  (all shifts real: null band ±{null_band:.2f} px)")
+
+
+def g4_duration_sweep(regimes: list[str], n: int = 120,
+                      steps_grid=(40, 80, 120, 160, 200)) -> None:
+    """Diagnostic (not a pass/fail gate): does a regime's trajectory-level
+    signature GROW with contact duration? Runs R0-vs-each-shift at several
+    n_steps, in both `track=False` (fixed target) and `track=True` (aim point
+    follows the block -> sustained push) modes, and prints Δpose against the
+    R0-vs-R0 null band at each point. If Δpose climbs above the null band as
+    n_steps grows, the effect compounds (usable in a full closed-loop episode
+    even if invisible in a short probe); if it stays flat and inside the band,
+    the shift is structurally undetectable this way.
+    """
+    import numpy as np
+    from atlas.stats import paired_bootstrap
+
+    r0 = regimes[0]
+    for track in (False, True):
+        mode = "block-tracking (sustained push)" if track else "fixed-target"
+        print(f"\n=== G4 duration sweep — {mode}, n={n} ===")
+        print(f"{'steps':>6} {'R0 contact':>11} {'null ±':>8}  " +
+              "  ".join(f"{name}:Δpose[CI]" for name in regimes[1:]))
+        for ns in steps_grid:
+            def batch(regime, s0):
+                rows = [_g4_rollout(regime, s0 + i, ns, track) for i in range(n)]
+                return (np.array([x[0] for x in rows]), np.array([x[3] for x in rows]))
+            pose0, con0 = batch(r0, 0)
+            pose0b, _ = batch(r0, _G4_NULL_OFFSET)
+            _, (nlo, nhi) = paired_bootstrap(pose0b, pose0)
+            band = max(abs(nlo), abs(nhi))
+            cols = []
+            for name in regimes[1:]:
+                poseS, _ = batch(name, 0)
+                md, (lo, hi) = paired_bootstrap(poseS, pose0)
+                flag = "  REAL" if (not (lo <= 0 <= hi)) and abs(md) > band else "  --"
+                cols.append(f"{name} {md:+6.1f} [{lo:+.1f},{hi:+.1f}]{flag}")
+            print(f"{ns:>6} {(con0 > 0).mean():>11.2f} {band:>8.2f}  " + "   ".join(cols))
 
 
 def _g5_build_and_reset(seed: int):
@@ -629,6 +815,14 @@ def main() -> None:
     parser.add_argument("--gate", choices=["G1", "G2", "G3a", "G3b", "G4", "G5", "G6"],
                         help="Run a specific gate.")
     parser.add_argument("--regime", default="R1", help="Regime for G4 (default R1)")
+    parser.add_argument("--g4-regimes", default="R0,R1,R2",
+                        help="G4: comma-separated, first is the reference (default R0,R1,R2)")
+    parser.add_argument("--g4-n", type=int, default=120,
+                        help="G4: rollouts per regime (default 120)")
+    parser.add_argument("--g4-selftest", action="store_true",
+                        help="G4: fake every shift as the reference regime; the gate MUST fail")
+    parser.add_argument("--g4-sweep", action="store_true",
+                        help="G4: run the contact-duration diagnostic sweep instead of the gate")
     args = parser.parse_args()
 
     if not args.all and args.gate is None:
@@ -681,9 +875,14 @@ def main() -> None:
         run_gate("G6", gate_g6, wm, wrapper)
 
     if run_all or run == "G4":
-        print("\nNote: G4 requires a running Push-T environment.")
-        print("Integrate this gate with the jepa-wms env setup (see README Setup).")
-        print("Skipping G4 in headless mode.")
+        # G4 runs the real pymunk Push-T sim (CPU, no model, no GPU) -- it is
+        # no longer headless-skipped (IMPLEMENTATION_PLAN_V3 §9). --regimes lets
+        # the caller pick which pair(s); default R0 vs R1 vs R2.
+        g4_regimes = args.g4_regimes.split(",")
+        if args.g4_sweep:
+            g4_duration_sweep(g4_regimes, args.g4_n)
+        else:
+            run_gate("G4", gate_g4, g4_regimes, args.g4_n, 40, args.g4_selftest)
 
     if failed:
         print(f"\n{'='*40}")

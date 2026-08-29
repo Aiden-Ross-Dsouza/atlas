@@ -26,26 +26,41 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from run_e0_planning import GOAL_TRAJ_LEN, load_dataset_states, sample_dataset_init_goal  # noqa: E402
+from run_e0_planning import (  # noqa: E402
+    DEFAULT_MAX_AGENT_BLOCK_DIST,
+    GOAL_TRAJ_LEN,
+    load_dataset_states,
+    sample_dataset_init_goal,
+)
 
 
-def reproduce_planning_episodes(states, seq_lengths, num_seeds: int, min_block_pos_diff: float) -> set[int]:
+def reproduce_planning_episodes(states, seq_lengths, num_seeds: int, min_block_pos_diff: float,
+                                max_agent_block_dist: float) -> set[int]:
+    # Must mirror run_e0_planning.sample_dataset_init_goal's accept condition
+    # EXACTLY, or the replayed RNG diverges from the real draw and the assertion
+    # below fires. P2d added a second predicate (agent_block_dist) at
+    # run_e0_planning.py:195; the previous version of this replay only checked
+    # block_pos_diff, so it broke out of the retry loop one or more attempts
+    # early whenever the real function kept retrying on the reachability filter.
     valid_eps = [i for i, l in enumerate(seq_lengths) if l >= GOAL_TRAJ_LEN]
     eps = set()
     for seed in range(num_seeds):
         rs = np.random.RandomState(seed)
         init_state, _goal_state = sample_dataset_init_goal(
-            states, seq_lengths, rs, min_block_pos_diff=min_block_pos_diff)
+            states, seq_lengths, rs, min_block_pos_diff=min_block_pos_diff,
+            max_agent_block_dist=max_agent_block_dist)
 
         rs2 = np.random.RandomState(seed)
-        ep_idx = None
+        ep_idx = init_s = None
         for _attempt in range(20):
             ep_idx = valid_eps[rs2.randint(len(valid_eps))]
             max_offset = seq_lengths[ep_idx] - GOAL_TRAJ_LEN
             offset = rs2.randint(max_offset + 1) if max_offset > 0 else 0
             init_s = states[ep_idx, offset]
             goal_s = states[ep_idx, offset + GOAL_TRAJ_LEN - 1]
-            if np.linalg.norm(goal_s[2:4] - init_s[2:4]) >= min_block_pos_diff:
+            block_pos_diff = np.linalg.norm(goal_s[2:4] - init_s[2:4])
+            agent_block_dist = np.linalg.norm(init_s[0:2] - init_s[2:4])
+            if block_pos_diff >= min_block_pos_diff and agent_block_dist <= max_agent_block_dist:
                 break
         assert np.allclose(init_s, init_state[:5]), (
             f"seed {seed}: reproduced init_state does not match sample_dataset_init_goal's own "
@@ -60,6 +75,9 @@ def main() -> None:
                          help="e0_seed_manifest.json from an E0 run (scripts/run_e0.py --out ...).")
     parser.add_argument("--num-planning-seeds", type=int, default=20)
     parser.add_argument("--min-block-pos-diff", type=float, default=40.0)
+    parser.add_argument("--max-agent-block-dist", type=float, default=DEFAULT_MAX_AGENT_BLOCK_DIST,
+                         help="Must match the value the planning run used (run_e0_planning.py "
+                              "--max-agent-block-dist; default is run_e0_planning's own default).")
     args = parser.parse_args()
 
     manifest = json.loads(args.manifest.read_text())
@@ -73,7 +91,8 @@ def main() -> None:
 
     states, seq_lengths = load_dataset_states()
     planning_eps = reproduce_planning_episodes(
-        states, seq_lengths, args.num_planning_seeds, args.min_block_pos_diff)
+        states, seq_lengths, args.num_planning_seeds, args.min_block_pos_diff,
+        args.max_agent_block_dist)
     print(f"\nPlanning episode_idx set for seeds 0..{args.num_planning_seeds - 1} "
           f"(n={len(planning_eps)}): {sorted(planning_eps)}")
 

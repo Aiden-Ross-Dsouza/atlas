@@ -22,11 +22,15 @@ import copy
 import functools
 import json
 import pickle
+import sys
 import time
 from pathlib import Path
 from typing import Literal
 
-import torch
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _determinism  # noqa: E402  — sets CUBLAS_WORKSPACE_CONFIG before torch
+
+import torch  # noqa: E402
 from tqdm import tqdm
 import atlas
 from atlas.chart import Chart, ChartKind
@@ -71,7 +75,7 @@ def _load_pusht_demo_dataset(split: str = "train"):
     return states, rel_actions, seq_lengths
 
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None, corruption: str = "none", corruption_severity: float = 0.5) -> list[dict]:
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None, corruption: str = "none", corruption_severity: float = 0.5, record_block_pose: bool = False, collect_nas: int = 1) -> list[dict]:
     """
     Collects real trajectories from PushTEnv under the specified regime and
     encodes them through the frozen vision backbone.
@@ -159,8 +163,9 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
         # collection and evaluation on literally the same code (a divergence
         # here would train on one task distribution and evaluate on another).
         from einops import rearrange
-        from run_e0_planning import (DEFAULT_MAX_AGENT_BLOCK_DIST, make_obs_td,
-                                      prepare_with_visual, sample_dataset_init_goal)
+        from run_e0_planning import (DEFAULT_MAX_AGENT_BLOCK_DIST, GOAL_TRAJ_LEN,
+                                      make_obs_td, prepare_with_visual,
+                                      sample_dataset_init_goal)
         if agent is None:
             raise ValueError("source='closed_loop' requires a GC_Agent (pass agent=...)")
         if max_agent_block_dist is None:
@@ -188,6 +193,15 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
         # Need traj_len real actions [offset, offset+traj_len) plus the state
         # AFTER the last one (offset+traj_len) as a valid (non-padding) row --
         # so seq_length must cover index offset+traj_len, i.e. >= traj_len+1.
+        if source == "closed_loop" and min(demo_seq_lengths) < GOAL_TRAJ_LEN:
+            # P5 / v3 §3.2: the (init, goal) pair is drawn GOAL_TRAJ_LEN-1 demo
+            # steps apart, DECOUPLED from the collector's own rollout length
+            # (traj_len). Assert the pool supports it rather than assuming.
+            raise ValueError(
+                f"closed_loop needs every demo episode to have seq_length >= "
+                f"GOAL_TRAJ_LEN={GOAL_TRAJ_LEN}; min in data/pusht_noise/"
+                f"{data_split} is {min(demo_seq_lengths)}."
+            )
         valid_eps = [i for i, l in enumerate(demo_seq_lengths) if l >= traj_len + 1]
         if not valid_eps:
             raise ValueError(
@@ -224,10 +238,15 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
                 # Goal must be prepared BEFORE the init reset: prepare_with_visual
                 # resets the env to whatever state it renders, so rendering the
                 # goal last would leave the env sitting on the goal.
-                init_state7, goal_state = sample_dataset_init_goal(
-                    demo_states, demo_seq_lengths, rs, traj_len=traj_len,
+                # P5 / v3 §3.2: goal separation is GOAL_TRAJ_LEN (31 raw steps,
+                # == run_e0_planning.py's eval value), NOT the collector's
+                # rollout length. Passing `traj_len` here drew goals only
+                # traj_len-1 steps apart — a shorter, easier task than eval.
+                # P18: return_indices=True so episode_idx/offset are recorded.
+                init_state7, goal_state, episode_idx, offset = sample_dataset_init_goal(
+                    demo_states, demo_seq_lengths, rs, traj_len=GOAL_TRAJ_LEN,
                     min_block_pos_diff=min_block_pos_diff,
-                    max_agent_block_dist=max_agent_block_dist)
+                    max_agent_block_dist=max_agent_block_dist, return_indices=True)
                 goal_obs, _ = prepare_with_visual(base_env, env, seed, goal_state)
                 agent.set_goal(make_obs_td(goal_obs["visual"], goal_obs["proprio"], device))
                 base_env.seed(seed)
@@ -255,6 +274,10 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
 
             obs, state = env.reset()
             imgs = [obs["visual"]]  # RGB array [224, 224, 3]
+            # Phase-0 measurement (P0-B motion gate): block (Tx, Ty, angle) per raw
+            # step. Frame 0 comes from the reset state; every subsequent frame from
+            # info["block_pose"] (PushTEnv._get_info). Off by default — pure add-on.
+            block_poses = [np.asarray([state[2], state[3], state[4]], dtype=np.float64)]
             proprios = [obs["proprio"]]
             raw_actions = []
             total_contacts = 0
@@ -274,40 +297,58 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
                     total_contacts += info["n_contacts"]
                     imgs.append(obs["visual"])
                     proprios.append(obs["proprio"])
+                    block_poses.append(np.asarray(info["block_pose"], dtype=np.float64))
                     raw_actions.append(act)
             elif source == "closed_loop":
-                # ON-POLICY data (the P4 follow-up): actions come from the CEM
-                # planner replanning against the LIVE regime-shifted state, so
-                # the trajectory contains the model's own overshoot AND the
-                # correction it then attempts. Replay ('dataset') and the
-                # scripted-reactive 'hybrid' collector both lack the latter --
-                # the diagnosed reason every P4 chart failed (E0_RESULTS.md).
+                # ON-POLICY data (v3 §5.2): actions come from the CEM planner
+                # replanning against the LIVE regime-shifted state, toward a real
+                # sample_dataset_init_goal pair (agent.set_goal above), at the
+                # eval planner config. The trajectory contains the model's own
+                # overshoot AND the correction it then attempts.
                 #
-                # The agent MUST be built with num_act_stepped=1: at the eval
-                # config's nas=6 a single plan covers the whole trajectory
-                # open-loop, which would reproduce exactly the non-reactive data
-                # this collector exists to replace.
+                # v3 §5.2 fix: `collect_nas` (== --collect-num-act-stepped) is now
+                # FUNCTIONAL -- the planner commits `collect_nas` model-chunks
+                # before replanning, matching the nas=2 EVAL protocol. Previously
+                # this loop replanned every chunk and discarded all but the first
+                # planned chunk, so collection did not match eval CEM behaviour
+                # (the C-1 mismatch).
                 n_chunks = traj_len // frameskip
-                for chunk_idx in range(n_chunks):
-                    # Each chunk is a full CEM search (collect_num_samples x
-                    # collect_iterations candidates) -- by far the slowest step
-                    # in this branch, and otherwise invisible until the whole
-                    # trajectory finishes. Surface it on the outer traj_pbar
-                    # rather than a nested bar, since num_trajs/n_chunks is
-                    # normally small and a second bar would just add noise.
+                # P4 / v3 §3.1: match run_e0_planning.py::run_episode's
+                # `steps_left` convention EXACTLY. That loop passes a LOOSE
+                # upper bound of (n_replans_target - replan_idx) * num_act_stepped
+                # in MODEL-step units, with n_replans_target = raw_steps // nas.
+                # CEM does plan_length = min(horizon, steps_left), so this keeps
+                # every collection search at plan_length = horizon (6) — the same
+                # lookahead as eval. Previously `n_chunks - chunk_idx` gave
+                # 5/3/1, truncating plan_length below 6 for 100% of collected
+                # steps (EVIDENCE_LEDGER §4 N5). The 5x unit inflation is
+                # reproduced deliberately; it is the reference eval protocol and
+                # must NOT be "corrected" here.
+                n_replans_target = max((n_chunks * frameskip) // collect_nas, 1)
+                for chunk_idx in range(0, n_chunks, collect_nas):
+                    # Each agent.act() is a full CEM search (collect_num_samples
+                    # x collect_iterations) -- the slowest step in this branch.
                     traj_pbar.set_postfix(chunk=f"{chunk_idx + 1}/{n_chunks}",
                                           contacts=total_contacts, attempt=attempt + 1)
                     obs_td = make_obs_td(obs["visual"], obs["proprio"], device)
-                    act_chunk = agent.act(obs_td, steps_left=max(n_chunks - chunk_idx, 1))
-                    # [1, frameskip*2] -> [frameskip, 2] raw env actions, matching
-                    # run_e0_planning.py::run_episode's own conversion exactly.
+                    steps_left = max(
+                        (n_replans_target - chunk_idx // collect_nas) * collect_nas, 1)
+                    act_chunk = agent.act(obs_td, steps_left=steps_left)
+                    # [t, frameskip*2] -> [(t f), 2] raw env actions.
                     act_chunk = rearrange(act_chunk.cpu(), "t (f d) -> (t f) d", d=2)
                     act_chunk = agent.preprocessor.denormalize_actions(act_chunk).numpy()
-                    for act in act_chunk[:frameskip]:
+                    # execute up to `collect_nas` model-chunks, but never past
+                    # traj_len (keep_idx subsample below assumes exactly traj_len
+                    # raw steps) or past what the planner actually returned.
+                    n_exec = min(frameskip * collect_nas,
+                                 (n_chunks - chunk_idx) * frameskip,
+                                 len(act_chunk))
+                    for act in act_chunk[:n_exec]:
                         obs, reward, done, info = env.step(act)
                         total_contacts += info["n_contacts"]
                         imgs.append(obs["visual"])
                         proprios.append(obs["proprio"])
+                        block_poses.append(np.asarray(info["block_pose"], dtype=np.float64))
                         raw_actions.append(act)
             else:
                 block_xy = state[2:4]
@@ -346,10 +387,17 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
                     total_contacts += info["n_contacts"]
                     imgs.append(obs["visual"])
                     proprios.append(obs["proprio"])
+                    block_poses.append(np.asarray(info["block_pose"], dtype=np.float64))
                     raw_actions.append(act)
 
-            if total_contacts > 0 or attempt == max_tries - 1:
-                break  # accept: real contact happened, or retries exhausted
+            if source == "closed_loop" or total_contacts > 0 or attempt == max_tries - 1:
+                # closed_loop (v3 §5.2): NO contact-rejection. The collector is
+                # goal-directed by the planner's cost function; a low/no-contact
+                # trajectory means the planner legitimately struggled under the
+                # shift -- real signal for training, not something to filter out.
+                # Filtering it re-conditions the training distribution on contact
+                # (the residual proxy this collector exists to remove).
+                break  # accept
 
         imgs_np = np.stack(imgs, axis=0)            # [T_raw+1, 224, 224, 3]
         proprios_np = np.stack(proprios, axis=0)    # [T_raw+1, proprio_dim]
@@ -361,6 +409,7 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
         keep_idx = list(range(0, traj_len + 1, frameskip))
         imgs_sub = imgs_np[keep_idx]                # [T_model+1, 224, 224, 3]
         proprios_sub = proprios_np[keep_idx]        # [T_model+1, proprio_dim]
+        block_poses_sub = np.stack(block_poses, axis=0)[keep_idx]  # [T_model+1, 3]
 
         # Encode visual+proprio TOGETHER via the wrapper's own encode() -- the
         # same obs-dict layout GC_Agent.act() feeds it (raw uint8 visual, raw
@@ -388,13 +437,72 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
             "episode_idx": episode_idx,  # source='dataset' only; None for 'scripted'
             "offset": offset,            # source='dataset' only; None for 'scripted'
             "n_contacts": total_contacts,  # informs the contact-rate check in main()
+            **({"block_pose": block_poses_sub} if record_block_pose else {}),
         })
 
     return trajectories
 
 
+def _traj_guard(args, regime: str) -> dict:
+    """The protocol fingerprint a persisted trajectory file must match before
+    --load-trajs will train on it (P9). Anything that changes the collected
+    distribution goes here."""
+    return {
+        "source": args.data_source,
+        "regime": regime,
+        "regime_config": dict(REGIME_CONFIGS.get(regime, {})),
+        "train_traj_len": args.train_traj_len,
+        "eval_traj_len": args.eval_traj_len,
+        "num_train_trajs": args.num_train_trajs,
+        "num_val_trajs": args.num_val_trajs,
+        "num_test_trajs": args.num_test_trajs,
+        "collect_cem": (f"{args.collect_num_samples}x{args.collect_iterations} "
+                        f"nas={args.collect_num_act_stepped}"
+                        if args.data_source == "closed_loop" else None),
+    }
+
+
+def dump_regime_chunks(out_dir: Path, regime: str, trajs: list[dict], world_model,
+                       collect_nas: int) -> None:
+    """Emit chunks_{regime}.jsonl: every T=collect_nas sliding window with its
+    UMF under the frozen c₀ predictor, its latent Frobenius displacement, and
+    its block pixel displacement. This is the on-policy chunk artifact §6.1/§6.6
+    re-derive τ and the motion gate from (P9 / v3 §5 deviation-note 1).
+
+    Assumes world_model.model.predictor is in its pristine c₀ state (no chart
+    applied) — true at the call site (collection plans against frozen c₀).
+    """
+    import numpy as np
+    from atlas.score import rollout_umf
+
+    path = out_dir / f"chunks_{regime}.jsonl"
+    n = 0
+    with open(path, "w") as f:
+        for ti, traj in enumerate(trajs):
+            enc = traj["encoder_output"]          # [T+1, N, D]
+            acts = traj["actions"]                # [T, 10]
+            bp = traj.get("block_pose")           # [T+1, 3] or None
+            T = acts.shape[0]
+            for i in range(0, T - collect_nas + 1):
+                j = i + collect_nas
+                proprio_ctxt = traj["proprio"][i:i + 1].unsqueeze(0)
+                u = rollout_umf(world_model, enc[i:j + 1], acts[i:j],
+                                proprio_ctxt=proprio_ctxt)
+                lat = (enc[j] - enc[i]).norm(p="fro").item()
+                blk = (float(np.linalg.norm(np.asarray(bp[j][:2]) - np.asarray(bp[i][:2])))
+                       if bp is not None else None)
+                f.write(json.dumps({
+                    "regime": regime, "traj": ti, "window": [i, j],
+                    "umf_c0": u, "latent_disp": lat, "block_disp_px": blk,
+                }) + "\n")
+                n += 1
+    print(f"  [P9] wrote {n} T={collect_nas} chunks -> {path}", flush=True)
+
+
 def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict],
-                       motion_gate: float | None = None) -> tuple[float, float]:
+                       motion_gate: float | None = None,
+                       chunk_nas: int = 2,
+                       chunk_motion_gate: float | None = None) -> dict:
     """
     Evaluates a fine-tuned chart on held-out validation trajectories.
 
@@ -406,22 +514,47 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict],
                      world_model.model.
         motion_gate: Informative-chunk threshold (gate G6) — see
                      atlas.score.compute_motion_gate. None = skip gate.
+        chunk_nas:   Window size (model steps) for the additional T=chunk_nas
+                     UMF (P8): the deployed loop and every Phase-0 threshold
+                     (τ, motion gate, σ_r) score T=2 chunks, but the trajectory
+                     rollout below is 5–6 model steps, so its UMF is on a
+                     different scale from τ. Report both.
+        chunk_motion_gate: gate for the T=chunk_nas windowed calls ONLY (§7-B2).
+                     `motion_gate` is trajectory-scale and would reject nearly
+                     every 2-step window. None → windowed calls are ungated.
 
-    Returns (avg_eval_loss, avg_eval_umf).
+    Returns a dict:
+        loss                 — mean open-loop prediction loss over all trajs
+        umf                  — mean GATED trajectory-T UMF (the historical
+                               `eval_umf`; unchanged definition)
+        umf_ungated          — mean trajectory-T UMF with NO motion gate (P10:
+                               so the gate's effect is visible, not baked in;
+                               the gate drops low-displacement / high-UMF
+                               chunks so `umf` is systematically optimistic)
+        umf_chunkT{n}        — mean GATED UMF over T=chunk_nas sliding windows
+                               (P8: comparable to τ ≈ 0.262)
+        umf_chunkT{n}_ungated
+        n_trajs              — trajectory count
+        n_umf                — trajs that passed the gate for `umf` (P10b:
+                               `umf` and `loss` are means over different
+                               subsets and nothing recorded which)
+        n_umf_chunkT{n}      — informative windows for umf_chunkT{n}
+        n_windows            — total T=chunk_nas windows considered
     """
     import numpy as np
     from atlas.harness import compute_trajectory_loss
     from atlas.score import _open_loop_rollout, _make_z_ctxt, umf
 
-    losses = []
-    umf_scores = []
+    losses, umf_gated, umf_ungated = [], [], []
+    cw_gated, cw_ungated, n_windows = [], [], 0
 
     with torch.no_grad():
         for traj in val_trajectories:
             enc_out = traj["encoder_output"]
             actions = traj["actions"]
             z_vis = enc_out[0]
-            proprio_ctxt = traj["proprio"][0:1].unsqueeze(0)  # [1, 1, P_tok, D_p]
+            proprio = traj["proprio"]
+            proprio_ctxt = proprio[0:1].unsqueeze(0)  # [1, 1, P_tok, D_p]
             z_ctxt = _make_z_ctxt(world_model, z_vis, proprio_ctxt)
 
             # Apply chart specifically for the open-loop rollout, then restore.
@@ -442,17 +575,69 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict],
 
             # umf internally handles applying and restoring the chart,
             # expecting the predictor to start in baseline state.
-            score = umf(chart, world_model, enc_out, actions, motion_gate=motion_gate,
+            s_gated = umf(chart, world_model, enc_out, actions, motion_gate=motion_gate,
+                          proprio_ctxt=proprio_ctxt)
+            if s_gated is not None:
+                umf_gated.append(s_gated)
+            s_ung = umf(chart, world_model, enc_out, actions, motion_gate=None,
                         proprio_ctxt=proprio_ctxt)
-            if score is not None:
-                umf_scores.append(score)
+            if s_ung is not None:
+                umf_ungated.append(s_ung)
 
-    avg_eval_loss = float(np.mean(losses)) if losses else float("nan")
-    avg_eval_umf = float(np.mean(umf_scores)) if umf_scores else float("nan")
-    return avg_eval_loss, avg_eval_umf
+            # P8: T=chunk_nas sliding windows on the same trajectory.
+            T = actions.shape[0]
+            for i in range(0, T - chunk_nas + 1):
+                n_windows += 1
+                j = i + chunk_nas
+                pc = proprio[i:i + 1].unsqueeze(0)
+                w_g = umf(chart, world_model, enc_out[i:j + 1], actions[i:j],
+                          motion_gate=chunk_motion_gate, proprio_ctxt=pc)  # §7-B2
+                if w_g is not None:
+                    cw_gated.append(w_g)
+                w_u = umf(chart, world_model, enc_out[i:j + 1], actions[i:j],
+                          motion_gate=None, proprio_ctxt=pc)
+                if w_u is not None:
+                    cw_ungated.append(w_u)
+
+    mean = lambda xs: float(np.mean(xs)) if xs else float("nan")
+    return {
+        "loss": mean(losses),
+        "umf": mean(umf_gated),
+        "umf_ungated": mean(umf_ungated),
+        f"umf_chunkT{chunk_nas}": mean(cw_gated),
+        f"umf_chunkT{chunk_nas}_ungated": mean(cw_ungated),
+        "n_trajs": len(val_trajectories),
+        "n_umf": len(umf_gated),
+        f"n_umf_chunkT{chunk_nas}": len(cw_gated),
+        "n_windows": n_windows,
+    }
 
 
-def main() -> None:
+def _umf_detail_fields(m: dict, motion_gate: float | None, args,
+                        chunk_motion_gate: float | None = None) -> dict:
+    """P8/P10/P10b: the extra UMF-provenance fields that travel with eval_umf in
+    results.json. `m` is an evaluate_e0_chart() return dict (or {} on error)."""
+    nas = args.collect_num_act_stepped
+    return {
+        "eval_umf_ungated": m.get("umf_ungated"),                     # P10
+        f"eval_umf_chunkT{nas}": m.get(f"umf_chunkT{nas}"),           # P8 (τ-scale)
+        f"eval_umf_chunkT{nas}_ungated": m.get(f"umf_chunkT{nas}_ungated"),
+        "eval_n_trajs": m.get("n_trajs"),                             # P10b
+        "eval_n_umf": m.get("n_umf"),
+        f"eval_n_umf_chunkT{nas}": m.get(f"n_umf_chunkT{nas}"),
+        "eval_n_windows": m.get("n_windows"),
+        "motion_gate_value": (float(motion_gate) if motion_gate is not None else None),
+        "motion_gate_chunk_value": (float(chunk_motion_gate)          # §7-B2
+                                    if chunk_motion_gate is not None else None),
+        "motion_gate_rule": ("RETIRED (P10): 10th-pct of train latent displacement "
+                             "(score.compute_motion_gate default) — motion_gate_value "
+                             "at T=train_traj_len//frameskip, motion_gate_chunk_value at "
+                             f"T={nas} for the windowed UMF (§7-B2). v3 §6.6 replaces "
+                             "both with P95 over block-static chunks — NOT yet applied."),
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="E0: Adapter capacity fine-tune.")
     parser.add_argument("--kinds", nargs="+", default=["ln_act", "lora4", "full"],
                         choices=["ln_act", "lora4", "full"])
@@ -528,25 +713,54 @@ def main() -> None:
                               "E0_IMPLEMENTATION_PLAN.md T9 -- use if the replay path proves "
                               "too slow). 'closed_loop': ON-POLICY -- real (init, goal) pair "
                               "from run_e0_planning.py's own sampler, actions produced by the "
-                              "CEM planner replanning every model chunk against the live "
-                              "shifted state. The only source whose trajectories contain the "
-                              "model's own overshoot AND its attempted correction; 'hybrid' is "
-                              "reactive but its corrections come from a scripted policy, not "
-                              "from the model being adapted. Costs one CEM search per chunk -- "
-                              "see --collect-num-samples.")
+                              "CEM planner replanning every --collect-num-act-stepped model "
+                              "chunks against the live shifted state, at eval-matched "
+                              "lookahead + goal separation (v3 §3.1/§3.2). The only source "
+                              "whose trajectories contain the model's own overshoot AND its "
+                              "attempted correction; 'hybrid' is reactive but its corrections "
+                              "come from a scripted policy, not from the model being adapted. "
+                              "Costs one CEM search per replan -- see --collect-num-samples.")
+    parser.add_argument("--debug-predictor-fingerprint", action="store_true",
+                         help="Print a sha256 of predictor params before each regime's "
+                              "collection (P1 falsification test): with --regimes R0,R2 the "
+                              "fingerprints must be IDENTICAL after the fix, DIFFERENT before.")
+    parser.add_argument("--collect-only", action="store_true",
+                         help="Collect + persist trajectories (and the chunks_{regime}.jsonl "
+                              "dump) then EXIT before any fine-tuning (P2 — splits the Modal "
+                              "collection job from the fine-tune job so a fine-tune failure "
+                              "cannot destroy the collection).")
+    parser.add_argument("--load-trajs", type=Path, default=None,
+                         help="Directory containing trajs_{regime}.pt files from a prior run "
+                              "(P9). When set, trajectories are LOADED instead of collected — "
+                              "the expensive CEM collection is paid once and every fine-tune "
+                              "re-run is then nearly free. Refuses to run if the stored "
+                              "protocol fingerprint (_traj_guard) does not match the current "
+                              "args. Also auto-detected in --out on resume.")
     parser.add_argument("--data-split", type=str, default="train",
                          help="data/pusht_noise/{split}/ to draw real episodes from "
                               "(--data-source=dataset, hybrid or closed_loop only).")
-    parser.add_argument("--collect-num-samples", type=int, default=100,
-                         help="CEM population for --data-source=closed_loop COLLECTION only "
-                              "(eval keeps the substrate's validated 300). Collection needs "
-                              "trajectories that react to the shift, not optimal ones, and "
-                              "cost is linear here: 300x30 would be ~9x this, putting a "
-                              "28-trajectory collection into GPU-hours. Deviation from the "
-                              "validated planner config -- record it with any result.")
-    parser.add_argument("--collect-iterations", type=int, default=10,
-                         help="CEM iterations for closed_loop collection (see "
-                              "--collect-num-samples for the cost rationale).")
+    parser.add_argument("--collect-num-samples", type=int, default=300,
+                         help="CEM population for --data-source=closed_loop COLLECTION only. "
+                              "SUBMISSION_PLAN.md E-C: defaults to the eval-side budget (300, "
+                              "matching run_e0_planning.py's own --num-samples default) so "
+                              "collection and evaluation are budget-matched. Previously "
+                              "hardcoded to 100 (a ~9x cheaper, deliberately mismatched budget "
+                              "-- see FIXLOG.md E-C). Override to reproduce the old, cheaper, "
+                              "mismatched collection run if needed.")
+    parser.add_argument("--collect-iterations", type=int, default=30,
+                         help="CEM iterations for closed_loop collection. SUBMISSION_PLAN.md "
+                              "E-C: defaults to the eval-side budget (30, matching "
+                              "run_e0_planning.py's own --iterations default). Previously "
+                              "hardcoded to 10.")
+    parser.add_argument("--collect-num-act-stepped", type=int, default=2,
+                         help="num_act_stepped for the closed_loop collector. FUNCTIONAL "
+                              "since v3 §5.2 (P21): the collector loop replans every "
+                              "`collect_nas` model-chunks and executes all of them, and "
+                              "`steps_left` now matches run_e0_planning.py's convention so "
+                              "plan_length stays at horizon=6 — collection CEM cadence + "
+                              "lookahead now match eval. Default 2 per IMPLEMENTATION_PLAN_V3 "
+                              "§3.6 (the eval protocol). The old 'this flag is a no-op' "
+                              "caveat is obsolete.")
     parser.add_argument("--collect-max-tries", type=int, default=2,
                          help="Contact-rejection retries per trajectory for closed_loop. Much "
                               "lower than the default 8: each retry is a full planned episode, "
@@ -554,7 +768,13 @@ def main() -> None:
                               "than the scripted sampler it was tuned for.")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="atlas-e0", help="WandB project name")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+
+    _determinism.make_deterministic(0)  # cuBLAS/cuDNN determinism (v3 P0-G)
 
     wandb_group = f"e0_experiment_{int(time.time())}"
 
@@ -615,15 +835,17 @@ def main() -> None:
         sys.path.insert(0, str(Path(__file__).parent))
         from run_e0_planning import build_cfg
         from evals.simu_env_planning.planning.gc_agent import GC_Agent
-        # num_act_stepped=1 is the whole point: it forces a replan every model
-        # chunk, which is what makes the collected trajectory reactive.
+        # v3 §5.2: num_act_stepped is threaded into the agent's cfg AND is now
+        # FUNCTIONAL in the collection loop (load_regime_trajectories' closed_loop
+        # branch replans every `collect_nas` model-chunks, executing all of them).
         collector_agent = GC_Agent(
             build_cfg(args.collect_num_samples, args.collect_iterations, horizon=6,
-                      num_act_stepped=1),
+                      num_act_stepped=args.collect_num_act_stepped),
             wrapper, dset=None, preprocessor=prep)
         collector_agent.device = device
         print(f"closed_loop collection: CEM {args.collect_num_samples}x"
-              f"{args.collect_iterations}, num_act_stepped=1 (replan every chunk)", flush=True)
+              f"{args.collect_iterations}, num_act_stepped={args.collect_num_act_stepped}, "
+              f"contact filter OFF (v3 §5.2)", flush=True)
 
     # [Debug print statement] Print setup info
     print(f"\nE0: {len(args.kinds)} kinds × {len(args.regimes)} regimes "
@@ -632,6 +854,7 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     results: dict = {}
+    seen_seeds: dict = {}     # P19: seed -> "regime/split", across all regimes this run
     seed_manifest: dict = {}  # regime -> {"train": [...], "eval": [...]} accepted seeds --
                               # written to e0_seed_manifest.json so downstream experiments
                               # (E1) can be audited for zero seed overlap with E0.
@@ -640,38 +863,107 @@ def main() -> None:
         results[regime] = {}
         # [Debug print statement] Print regime start
         print(f"\n── Regime {regime} ─────────────────────────────────────────────", flush=True)
+
+        # P1 / v3 §5.2: on-policy collection MUST plan against the frozen c₀
+        # predictor. run_e0_finetune()'s Chart.restore_() re-applies the chart's
+        # TRAINED weights for ln_act/full (atlas/chart.py:126-127), and the
+        # per-kind pristine reload lives INSIDE the kind loop below — so with
+        # --regimes R0,R2 in one process, R2 would be collected under an
+        # R0-adapted predictor. Reload pristine c₀ here, before collection.
+        # collector_agent holds `wrapper`; wrapper.model IS `wm`, so this
+        # in-place load_state_dict is seen by the agent (same object).
+        wm.predictor.load_state_dict(pristine_predictor_state)
+        if args.debug_predictor_fingerprint:
+            import hashlib
+            fp = hashlib.sha256(b"".join(
+                p.detach().cpu().numpy().tobytes() for p in wm.predictor.parameters()
+            )).hexdigest()[:16]
+            print(f"  [P1] predictor fingerprint before {regime} collection: {fp}", flush=True)
+
         print(f"  Loading trajectories for regime {regime}...", flush=True)
         # Separate lengths: training backprops through the full unroll (memory
         # scales with length, kept short); eval runs under no_grad (cheap, kept
         # long since UMF needs real accumulated displacement). See --train-traj-len
         # / --eval-traj-len help text and code-review.md Bug #6d/#6e.
-        collect_kw = ({"agent": collector_agent, "max_tries": args.collect_max_tries}
+        collect_kw = ({"agent": collector_agent, "max_tries": args.collect_max_tries,
+                       "collect_nas": args.collect_num_act_stepped,
+                       "record_block_pose": True}
                       if args.data_source == "closed_loop" else {})
-        train_trajectories = load_regime_trajectories(
-            wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
-            device=device, seed_offset=0, source=args.data_source, data_split=args.data_split,
-            **collect_kw)
-        val_trajectories = load_regime_trajectories(
-            wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
-            seed_offset=10_000, source=args.data_source, data_split=args.data_split,
-            **collect_kw)
-        # FIX_SPEC.md A4: disjoint TEST set (seed_offset=20_000) -- the number
-        # actually reported as eval_umf, so early-stopping's repeated use of the
-        # val set does not bias it.
-        test_trajectories = load_regime_trajectories(
-            wrapper, prep, regime, num_trajs=args.num_test_trajs, traj_len=args.eval_traj_len,
-            device=device, seed_offset=20_000, source=args.data_source,
-            data_split=args.data_split, **collect_kw) if args.num_test_trajs > 0 else []
+
+        # P9 / P2c: load persisted trajectories if a prior run collected them,
+        # so re-runs of the fine-tune do not re-pay the CEM collection cost. A
+        # resumed run also lands here (trajs_{regime}.pt in --out) instead of
+        # re-collecting ~2h of trajectories to skip a cached chart.
+        guard = _traj_guard(args, regime)
+        traj_file = args.out / f"trajs_{regime}.pt"
+        src_file = None
+        if args.load_trajs is not None and (args.load_trajs / f"trajs_{regime}.pt").exists():
+            src_file = args.load_trajs / f"trajs_{regime}.pt"
+        elif traj_file.exists():
+            src_file = traj_file
+
+        if src_file is not None:
+            blob = torch.load(src_file, weights_only=False)
+            if blob["guard"] != guard:
+                raise ValueError(
+                    f"--load-trajs protocol mismatch for {regime}:\n"
+                    f"  stored:  {blob['guard']}\n  current: {guard}\n"
+                    f"Refusing to train on a different protocol's data.")
+            train_trajectories = blob["train"]
+            val_trajectories = blob["val"]
+            test_trajectories = blob["test"]
+            print(f"  [P9] loaded {len(train_trajectories)}/{len(val_trajectories)}/"
+                  f"{len(test_trajectories)} train/val/test trajectories from {src_file} "
+                  f"(NO collection)", flush=True)
+        else:
+            train_trajectories = load_regime_trajectories(
+                wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
+                device=device, seed_offset=0, source=args.data_source, data_split=args.data_split,
+                **collect_kw)
+            val_trajectories = load_regime_trajectories(
+                wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
+                seed_offset=10_000, source=args.data_source, data_split=args.data_split,
+                **collect_kw)
+            # FIX_SPEC.md A4: disjoint TEST set (seed_offset=20_000) -- the number
+            # actually reported as eval_umf, so early-stopping's repeated use of the
+            # val set does not bias it.
+            test_trajectories = load_regime_trajectories(
+                wrapper, prep, regime, num_trajs=args.num_test_trajs, traj_len=args.eval_traj_len,
+                device=device, seed_offset=20_000, source=args.data_source,
+                data_split=args.data_split, **collect_kw) if args.num_test_trajs > 0 else []
+            # Persist immediately (encoder_output kept fp32 — measure size on the
+            # smoke before switching to .half()). Then re-runs load instead of
+            # re-collecting.
+            torch.save({"guard": guard, "train": train_trajectories,
+                        "val": val_trajectories, "test": test_trajectories},
+                       traj_file)
+            print(f"  [P9] persisted trajectories -> {traj_file} "
+                  f"({traj_file.stat().st_size / 1e6:.0f} MB)", flush=True)
+            if args.data_source == "closed_loop":
+                dump_regime_chunks(args.out, regime, train_trajectories + val_trajectories,
+                                   wrapper, args.collect_num_act_stepped)
+        def _manifest_rows(trajs):  # P12: n_contacts was stdout-only before
+            return [{"seed": t["seed"], "episode_idx": t["episode_idx"],
+                     "offset": t["offset"], "n_contacts": t.get("n_contacts")}
+                    for t in trajs]
         seed_manifest[regime] = {
             "source": args.data_source,
             "regime_config": dict(REGIME_CONFIGS.get(regime, {})),
-            "train": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
-                      for t in train_trajectories],
-            "eval": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
-                     for t in val_trajectories],
-            "test": [{"seed": t["seed"], "episode_idx": t["episode_idx"], "offset": t["offset"]}
-                     for t in test_trajectories],
+            "train": _manifest_rows(train_trajectories),
+            "eval": _manifest_rows(val_trajectories),
+            "test": _manifest_rows(test_trajectories),
         }
+        # P19: seeds must be disjoint within a regime AND across regimes (they
+        # collide silently at num_trajs >= 501 for closed_loop). Assert it.
+        _seed_sets = {k: {r["seed"] for r in seed_manifest[regime][k]}
+                      for k in ("train", "eval", "test")}
+        for a, b in (("train", "eval"), ("train", "test"), ("eval", "test")):
+            dup = _seed_sets[a] & _seed_sets[b]
+            assert not dup, f"P19: {regime} {a}/{b} seed overlap: {sorted(dup)[:5]}"
+        for k, s in _seed_sets.items():
+            clash = {sd: seen_seeds[sd] for sd in s if sd in seen_seeds}
+            assert not clash, f"P19: {regime}/{k} seeds already used by {clash}"
+            seen_seeds.update({sd: f"{regime}/{k}" for sd in s})
         # [Debug print statement] Print trajectories loaded
         print(f"  [Debug] Loaded {len(train_trajectories)} train & {len(val_trajectories)} eval trajectories for {regime}", flush=True)
 
@@ -684,9 +976,13 @@ def main() -> None:
             # traj_len steps, recorded by load_regime_trajectories() above.
             all_trajs = train_trajectories + val_trajectories
             n_with_contact = sum(1 for t in all_trajs if t["n_contacts"] > 0)
-            print(f"  [Debug] Real-demo replay contact rate for {regime}: "
+            _kind = ("on-policy planner" if args.data_source == "closed_loop"
+                     else "real-demo replay")  # P12: label was always "Real-demo replay"
+            print(f"  [Debug] {_kind} contact rate for {regime}: "
                   f"{n_with_contact}/{len(all_trajs)} trajectories had >=1 contact "
-                  f"(n_contacts per traj: {[t['n_contacts'] for t in all_trajs]})", flush=True)
+                  f"(n_contacts per traj: {[t['n_contacts'] for t in all_trajs]}). "
+                  f"§15-2 pre-registered R2 check: if this collapses toward 0, "
+                  f"damping=0.1 is the fallback.", flush=True)
 
         # Gate G6: informative-chunk threshold, computed once from this
         # regime's own training displacements (10th percentile) -- wired into
@@ -697,7 +993,34 @@ def main() -> None:
             for t in train_trajectories
         ])
         motion_gate = compute_motion_gate(train_displacements)
-        print(f"  [Debug] motion_gate (10th pct of train displacement) = {motion_gate:.4f}", flush=True)
+        print(f"  [Debug] motion_gate (10th pct of T={args.train_traj_len // 5}-step "
+              f"train displacement) = {motion_gate:.4f}", flush=True)
+
+        # §7-B2: the T=nas windowed UMF (P8) must be gated at the SAME granularity
+        # it is applied at. `motion_gate` above is the 10th pct of whole-trajectory
+        # (T=6) displacement; a 2-step window's displacement is far smaller, so
+        # that threshold rejects almost every window (§6.6's named failure).
+        # Same RETIRED 10th-pct rule, but at T=nas. (v3 §6.6's block-static P95
+        # replacement is a separate Phase-0 task, fed by chunks_{regime}.jsonl.)
+        _nas = args.collect_num_act_stepped
+        chunk_displacements = torch.tensor([
+            (t["encoder_output"][i + _nas] - t["encoder_output"][i]).norm(p="fro").item()
+            for t in train_trajectories
+            for i in range(0, t["actions"].shape[0] - _nas + 1)
+        ])
+        if chunk_displacements.numel() == 0:
+            # traj too short for even one T=nas window — windowed UMF is ungated.
+            chunk_motion_gate = None
+            print(f"  [Debug] chunk_motion_gate: SKIPPED (no T={_nas} windows)", flush=True)
+        else:
+            chunk_motion_gate = compute_motion_gate(chunk_displacements)
+            print(f"  [Debug] chunk_motion_gate (10th pct, T={_nas}) = {chunk_motion_gate:.4f} "
+                  f"(vs traj-scale {motion_gate:.1f})", flush=True)
+
+        if args.collect_only:
+            print(f"  [P2] --collect-only: trajectories for {regime} persisted, "
+                  f"skipping fine-tune.", flush=True)
+            continue
 
         for kind in args.kinds:
             # Reset the predictor to its pristine pretrained state before every
@@ -718,11 +1041,17 @@ def main() -> None:
                     chart = Chart.load(chart_file, wm.predictor)
                     n_params = chart.n_params()  # real parameter count, not a tensor count (T12 #9)
                     n_trainable = chart.n_trainable_params()  # FIX_SPEC.md A11
-                    val_loss, val_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
+                    val_m = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate,
+                                              args.collect_num_act_stepped, chunk_motion_gate)
                     if test_trajectories:
-                        eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, test_trajectories, motion_gate)
+                        eval_m = evaluate_e0_chart(wrapper, chart, test_trajectories, motion_gate,
+                                                   args.collect_num_act_stepped, chunk_motion_gate)
+                        eval_umf_source = "test"
                     else:
-                        eval_loss, eval_umf = val_loss, val_umf
+                        eval_m = val_m
+                        eval_umf_source = "val_ALIASED"  # P3: no disjoint test split
+                    val_umf = val_m["umf"]
+                    eval_loss, eval_umf = eval_m["loss"], eval_m["umf"]
                 except Exception as e:
                     # Print the real error instead of silently returning NaN --
                     # a swallowed exception here previously masked a real bug
@@ -739,15 +1068,21 @@ def main() -> None:
                     n_trainable = 0
                     val_umf = float("nan")
                     eval_loss, eval_umf = float("nan"), float("nan")
+                    eval_m = {}
+                    eval_umf_source = "error"
                 results[regime][kind] = {
                     "train_loss": final_loss,
                     "eval_loss": eval_loss,
                     "eval_umf": eval_umf,
+                    "eval_umf_source": eval_umf_source,  # P3: "test" (disjoint, A4) or
+                                                          # "val_ALIASED" (eval_umf==val_umf,
+                                                          # selection bias NOT measurable)
                     "val_umf": val_umf,
                     "params": n_params,
                     "params_stored": n_params,
                     "params_trainable": n_trainable,
                     "status": "completed (cached)",
+                    **_umf_detail_fields(eval_m, motion_gate, args, chunk_motion_gate),  # P8/P10/P10b/B2
                 }
                 print(f"    Done {kind}_{regime} (Cached): Train Loss = {final_loss:.6f} | Eval Loss = {eval_loss:.6f} | Eval UMF = {eval_umf:.4f}", flush=True)
                 continue
@@ -794,11 +1129,22 @@ def main() -> None:
             # Held-out Evaluation. val_* drives nothing here (early stopping
             # already used it); test_* (disjoint seed_offset=20_000) is the
             # reported eval_umf per FIX_SPEC.md A4.
-            val_loss, val_umf = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate)
+            val_m = evaluate_e0_chart(wrapper, chart, val_trajectories, motion_gate,
+                                      args.collect_num_act_stepped, chunk_motion_gate)
             if test_trajectories:
-                eval_loss, eval_umf = evaluate_e0_chart(wrapper, chart, test_trajectories, motion_gate)
+                eval_m = evaluate_e0_chart(wrapper, chart, test_trajectories, motion_gate,
+                                           args.collect_num_act_stepped, chunk_motion_gate)
+                eval_umf_source = "test"
             else:
-                eval_loss, eval_umf = val_loss, val_umf
+                # P3: NO disjoint test split -> eval_umf is just the early-stopping
+                # selection number. The A4 bias (eval_umf - val_umf) is then
+                # identically 0 by construction, NOT a measured +0.0. p0g_collect
+                # now passes --num-test-trajs 8 so this branch should not be hit
+                # in P0-G; kept for --num-test-trajs 0 back-compat.
+                eval_m = val_m
+                eval_umf_source = "val_ALIASED"
+            val_loss, val_umf = val_m["loss"], val_m["umf"]
+            eval_loss, eval_umf = eval_m["loss"], eval_m["umf"]
 
             if args.wandb:
                 try:
@@ -815,12 +1161,15 @@ def main() -> None:
             results[regime][kind] = {
                 "train_loss": final_loss,
                 "eval_loss": eval_loss,
-                "eval_umf": eval_umf,          # from the disjoint TEST set (A4)
+                "eval_umf": eval_umf,          # test set (A4) IFF eval_umf_source=="test"
+                "eval_umf_source": eval_umf_source,  # "test" | "val_ALIASED" (P3)
                 "val_umf": val_umf,            # early-stopping set; bias = eval_umf - val_umf
+                                               # is meaningful ONLY when source=="test"
                 "params": chart.n_params(),
                 "params_stored": chart.n_params(),           # FIX_SPEC.md A11
                 "params_trainable": chart.n_trainable_params(),
                 "status": "completed",
+                **_umf_detail_fields(eval_m, motion_gate, args, chunk_motion_gate),  # P8/P10/P10b/B2
             }
             # [Debug print statement] Print fine-tuning & eval completed
             print(f"    Done {kind}_{regime}: Train Loss = {final_loss:.6f} | Eval Loss = {eval_loss:.6f} | Eval UMF = {eval_umf:.4f}", flush=True)
@@ -834,6 +1183,14 @@ def main() -> None:
     # these charts. E1's own seeds (atlas.streams.paired_seed, SHA256-derived)
     # live in a completely different space from these small deterministic
     # integers, but this manifest makes that an auditable fact, not a claim.
+    seed_manifest["_provenance"] = _determinism.settings_dict(0)
+    seed_manifest["_provenance"].update(
+        data_source=args.data_source,
+        collect_cem=(f"{args.collect_num_samples}x{args.collect_iterations} "
+                     f"nas={args.collect_num_act_stepped}"
+                     if args.data_source == "closed_loop" else None),
+        contact_filter=("OFF" if args.data_source == "closed_loop" else "ON"),
+    )
     seed_manifest_json = args.out / "e0_seed_manifest.json"
     seed_manifest_json.write_text(json.dumps(seed_manifest, indent=2))
     print(f"  - Seed manifest : {seed_manifest_json}")

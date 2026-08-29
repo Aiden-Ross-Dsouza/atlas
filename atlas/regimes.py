@@ -1,10 +1,15 @@
 """
 regimes.py — Physics regime wrappers and visual corruption wrappers for Push-T.
 
-Three dynamics regimes (primary, matched appearance):
-  R0  default — shipped parameters (friction=0.0, elasticity=0.0 everywhere)
-  R1  high friction — agent+block shape.friction raised (was: mass x0.2 — see below)
-  R2  high restitution — agent+block shape.elasticity raised (was: space.damping)
+Three dynamics regimes (primary, matched appearance) — see REGIME_CONFIGS below,
+which is authoritative:
+  R0  default — shipped parameters (friction=0.0, elasticity=0.0, damping=0)
+  R1  high friction — agent+block shape.friction = 2.0 (was: mass x0.2, then 0.8)
+  R2  high damping — space.damping = 0.5 (was: mass x0.2 → elasticity 0.9, both
+      proven mechanically dead: space.damping is hardcoded 0 in the shipped env,
+      which annihilates restitution velocity; damping is the axis that survives.
+      P21: this line previously read "shape.elasticity raised", contradicting
+      REGIME_CONFIGS 60 lines down — corrected 2026-08-29.)
 
 CORRECTNESS-CRITICAL BUG FOUND 2026-08-23, see REGIME_DESIGN_REVIEW.md and
 ATLAS_implementation_plan_v2.md §6.1a: R1 was originally specified as a T-block
@@ -14,9 +19,10 @@ impulse solver treats a kinematic body as having infinite mass, which makes the
 post-collision velocity of the body it hits algebraically INDEPENDENT of that
 body's own mass/moment, at any scale (0.001x to 1000x tested, byte-identical
 trajectories every time). No mass value can ever produce a regime shift here.
-Re-targeted onto shape.friction (R1) and shape.elasticity (R2) instead — both
-are dimensionless coefficients, not mass-like quantities, so they are NOT
-subject to the same cancellation (confirmed empirically, see below).
+Re-targeted onto shape.friction (R1) and space.damping (R2) instead — friction
+is a dimensionless coefficient, damping a global velocity-retention rate; neither
+is a mass-like quantity, so neither is subject to the cancellation above
+(confirmed empirically, see below).
 
 NON-OBVIOUS TRAP: pymunk combines two colliding shapes' friction/elasticity
 multiplicatively-ish (empirically: if EITHER shape's friction/elasticity is
@@ -52,6 +58,15 @@ RegimeName = Literal["R0", "R1", "R2"]
 # Values chosen well above the shipped 0.0 baseline for both parameters, and
 # empirically confirmed (test_physicsregime-style direct repro) to produce a
 # visible collision-response difference once contact occurs.
+# FUTURE "R3" candidate (not implemented) — agent PD tracking gains k_p/k_v
+# (pusht_env.py:384, = 100, 20). The only appearance-matched dynamics lever left
+# unused: friction (R1) is prediction-level only and saturates at 2.0, elasticity
+# is mechanically dead (space.damping hardcoded 0), mass cancels, action_scale /
+# geometry are confounded / not matched. Changing k_p/k_v changes the KINEMATIC
+# pusher's own motion -> v_rel at contact -> a real, appearance-matched dynamics
+# shift with both prediction- and trajectory-level effects. Needs a _get_agent()
+# PD-gain setter + its own G4 calibration before use. See
+# research_audit/IMPLEMENTATION_PLAN_V3.md §15 item 6 and REGIME_DESIGN_REVIEW.md.
 REGIME_CONFIGS: dict[str, dict] = {
     "R0": {},                              # default: no modifications
     # Calibrated 2026-08-25 (E0_RECOVERY_PLAN.md P0/P1, see §0.3-0.5). These

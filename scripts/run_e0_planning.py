@@ -157,7 +157,7 @@ DEFAULT_MAX_AGENT_BLOCK_DIST = 160.0
 def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.random.RandomState,
                               traj_len: int = GOAL_TRAJ_LEN, min_block_pos_diff: float = 40.0,
                               max_agent_block_dist: float = DEFAULT_MAX_AGENT_BLOCK_DIST,
-                              max_tries: int = 20) -> tuple[np.ndarray, np.ndarray]:
+                              max_tries: int = 20, return_indices: bool = False):
     """
     Samples a real (init, goal) pair from the same real demo episode, `traj_len`
     raw timesteps apart.
@@ -204,6 +204,10 @@ def sample_dataset_init_goal(states: np.ndarray, seq_lengths: list[int], rs: np.
     # regardless, so zero-padding matches the existing convention exactly.
     init_state = np.concatenate([init_state, [0.0, 0.0]])
     goal_state = np.concatenate([goal_state, [0.0, 0.0]])
+    if return_indices:
+        # P18: so closed_loop collection can record which real demo episode +
+        # offset it drew (episode_idx is otherwise null for that source).
+        return init_state, goal_state, int(ep_idx), int(offset)
     return init_state, goal_state
 
 

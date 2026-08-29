@@ -97,9 +97,10 @@ class Expander:
         next_actions: torch.Tensor,
         motion_gate: float | None,
         next_proprio_ctxt: torch.Tensor | None = None,
+        verify_chunks: list[tuple] | None = None,
     ) -> ProbeOutcome:
         """
-        If strikes >= q: fit a candidate and verify on the next unseen chunk.
+        If strikes >= q: fit a candidate and verify on held-out chunk(s).
 
         Args:
             library:             The current chart library (may be modified).
@@ -111,6 +112,16 @@ class Expander:
             motion_gate:         Informative-chunk gate threshold.
             next_proprio_ctxt:   Encoded first-frame proprio for the next chunk
                                  [1, 1, P_tok, D] — see score.umf()'s docstring.
+            verify_chunks:       OPTIONAL. A list of (encoder_output, actions,
+                                 proprio_ctxt) held-out chunks. When given, the
+                                 candidate must (a) have mean UMF < tau over them
+                                 and (b) beat the incumbent on a MAJORITY of them
+                                 — a less noise-prone accept rule than the
+                                 single-chunk default (G7 Group B found ~50% of
+                                 single-chunk-accepted commits were one-hit
+                                 wonders). When None (default), the original
+                                 single next-chunk rule is used unchanged, so
+                                 every prior result stands.
 
         Returns:
             ProbeOutcome string.
@@ -151,14 +162,32 @@ class Expander:
         _fit_candidate(candidate, world_model, self._deficit_chunks,
                        self.cfg.n_probe, self.cfg.lr)
 
-        # ── Verify on the next unseen chunk ───────────────────────────────────
-        cand_umf = compute_umf(candidate, world_model, next_encoder_output,
-                                next_actions, motion_gate, proprio_ctxt=next_proprio_ctxt)
-        best_umf = compute_umf(best_chart, world_model, next_encoder_output,
-                                next_actions, motion_gate, proprio_ctxt=next_proprio_ctxt)
-
-        passes_tau = (cand_umf is not None) and (cand_umf < self.cfg.tau)
-        beats_best = (cand_umf is not None) and (best_umf is None or cand_umf < best_umf)
+        # ── Verify on held-out chunk(s) ───────────────────────────────────────
+        vchunks = verify_chunks or [(next_encoder_output, next_actions, next_proprio_ctxt)]
+        pairs = []
+        for enc_v, act_v, pc_v in vchunks:
+            cu = compute_umf(candidate, world_model, enc_v, act_v, motion_gate, proprio_ctxt=pc_v)
+            bu = compute_umf(best_chart, world_model, enc_v, act_v, motion_gate, proprio_ctxt=pc_v)
+            if cu is not None:
+                pairs.append((cu, bu))
+        if not pairs:
+            passes_tau = beats_best = False
+        else:
+            mean_cand = sum(c for c, _ in pairs) / len(pairs)
+            passes_tau = mean_cand < self.cfg.tau
+            # `b is None` (incumbent gated on a chunk where the candidate was
+            # not) counts as a candidate win — this matches the original
+            # single-chunk rule's `best_umf is None or cand_umf < best_umf`, so
+            # additivity at len==1 is exact. It is also effectively unreachable:
+            # the motion gate is chart-independent (it thresholds ‖z_T−z_0‖ of
+            # the observed latents), so candidate and incumbent gate together.
+            wins = sum(1 for c, b in pairs if b is None or c < b)
+            # Majority of the chunks that SURVIVED gating, not of the requested
+            # count — if a verify chunk gates out, the bar tightens accordingly
+            # (e.g. 3 requested, 2 survive => needs 2/2). At len==1 this is
+            # `wins == 1` ⇔ the original `cand_umf < best_umf`.
+            beats_best = wins > len(pairs) / 2
+        cand_umf = pairs[0][0] if pairs else None  # back-compat for _last_probe_debug readers
 
         if passes_tau and beats_best:
             library.add(candidate)
