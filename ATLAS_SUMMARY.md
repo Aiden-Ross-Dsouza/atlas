@@ -376,15 +376,18 @@ scale-up already done for §4.1) before it's a citable finding either way.
 
 A separate question from "does the chart help": if you already have several
 charts, can the same UMF signal correctly pick which chart matches the
-current situation? Tested by deliberately shifting either the *physics*
-(what UMF should detect) or the *visual appearance* (what it shouldn't react
-to), and comparing UMF-based routing against a naive "similarity to what the
-scene looks like" baseline router (called S-dyn):
+current situation? Tested by deliberately shifting the *physics* and
+comparing UMF-based routing against S-dyn — a weaker baseline that scores
+each chart by the cosine similarity between its predicted and the observed
+first latent step (`atlas/router.py::_sdyn_score`). S-dyn is a one-step,
+direction-only variant of the same prediction signal UMF uses; it is **not**
+a visual/appearance-similarity router (the appearance-similarity router
+S-obs in the proposal was never implemented):
 
 | Router | Accuracy, 3-chart library (chance = 33%) |
 |---|---:|
 | **UMF** | ~~**60.3%** — real, ~2× better than chance~~ **29.8% (post-A1/A2 re-run, see banner above)** |
-| S-dyn (appearance-based baseline) | ~~36.5% — indistinguishable from chance~~ **29.4% (post-A1/A2 re-run)** |
+| S-dyn (one-step latent-direction baseline) | ~~36.5% — indistinguishable from chance~~ **29.4% (post-A1/A2 re-run)** |
 
 The confusion matrix shows *why* S-dyn fails: it defaults to the same chart
 regardless of the true physics situation, essentially guessing. UMF's
@@ -396,7 +399,7 @@ same behaviour too.)*
 **2-chart decisive cell (`ln_act`×R2), pre-A1/A2 numbers (superseded): UMF
 0.833 vs. S-dyn 0.570. Post-A1/A2 re-run: UMF 0.419 vs. S-dyn 0.419 —
 identical.** UMF no longer routes correctly more often than the
-appearance-based baseline at this cell. *(Audit note, FIX_SPEC.md A15: an
+S-dyn baseline at this cell. *(Audit note, FIX_SPEC.md A15: an
 earlier version of this paragraph reported a "pre-fix +55.6pp → post-fix
 +26.3pp" before/after. The "+55.6pp" figure has no surviving raw records —
 moot now that the +26.3pp itself is superseded per the banner above.)* Full
@@ -450,8 +453,8 @@ improve success.
 - The planner's own cost-ranking is close to zero-correlated with true
   outcomes per-situation, for the frozen model itself, not just the chart
   (§4.3) — a real mechanism for the above.
-- ~~UMF-based chart routing works and clearly beats an appearance-based
-  baseline (§4.5).~~ **SUPERSEDED 2026-08-28 — see §4.5's banner.** Post-A1/A2
+- ~~UMF-based chart routing works and clearly beats a one-step
+  latent-direction baseline (S-dyn) (§4.5).~~ **SUPERSEDED 2026-08-28 — see §4.5's banner.** Post-A1/A2
   hysteresis-fix re-run: UMF and S-dyn are statistically indistinguishable
   (3-chart confusion matrix 29.8% vs. 29.4%; decisive 2-chart cell 41.9% vs.
   41.9%, byte-identical). Cell C (over-expansion, 0 commits) still holds.

@@ -177,7 +177,7 @@ canonical copies in their own directories — this is a convenience copy, not a 
 
 ## Headline
 
-**UMF-based selection discriminates a dynamics shift from an appearance shift; S-dyn does not.**
+**UMF-based selection discriminates dynamics specialists; S-dyn (a one-step latent-direction baseline, `atlas/router.py::_sdyn_score` — not an appearance-similarity router) does not.**
 Routing accuracy is governed by a single quantity — whether the chart's UMF advantage clears the
 pre-registered hysteresis margin (`m = 0.05`, CLAUDE.md §1.7).
 
