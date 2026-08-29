@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import modal
+from tqdm import tqdm
 
 atlas_volume = modal.Volume.from_name("atlas-data", create_if_missing=True)
 MOUNT = "/atlas_root"
@@ -120,21 +121,47 @@ def p0g_collect(regime: str = "R2",
                 num_val_trajs: int = _P0G_DEFAULTS["num_val_trajs"],
                 num_test_trajs: int = _P0G_DEFAULTS["num_test_trajs"],
                 eval_traj_len: int = _P0G_DEFAULTS["eval_traj_len"],
-                out_subdir: str = "p0g_onpolicy", git_sha: str = "unknown") -> None:
+                out_subdir: str = "p0g_onpolicy", git_sha: str = "unknown",
+                traj_offset: int = 0, skip_val_test: bool = False) -> None:
     """P0-G on-policy chart-training-data COLLECTION only (v3 §5.2). ONE regime
     per call. closed_loop collector, all v3 fixes: contact filter OFF,
     --collect-num-act-stepped FUNCTIONAL, N=300/it=10/nas=2, eval-matched
     lookahead + goal separation (§3.1/§3.2), determinism on. Persists
     trajs_{regime}.pt + chunks_{regime}.jsonl, then exits.
-    Smoke: --num-trajs 5 --num-val-trajs 2 --num-test-trajs 2."""
+    Smoke: --num-trajs 5 --num-val-trajs 2 --num-test-trajs 2.
+
+    traj_offset/skip_val_test: sharding hooks (§ user request 2026-08-29,
+    mirrors modal_e0_planning.py's --num-shards). Use p0g-collect-sharded
+    rather than setting these by hand."""
     import sys
     atlas_volume.reload()
     cmd = [sys.executable, "scripts/run_e0.py", *_P0G_COMMON, "--collect-only",
            "--regimes", regime,
+           "--collect-traj-offset", str(traj_offset),
            *_p0g_flags(traj_len, eval_traj_len, num_trajs, num_val_trajs,
                        num_test_trajs, num_samples, iterations, nas),
            "--out", f"{MOUNT}/phase0_v3/{out_subdir}"]
+    if skip_val_test:
+        cmd.append("--collect-skip-val-test")
     _run(cmd, git_sha)
+    atlas_volume.commit()
+
+
+@app.function(volumes={MOUNT: atlas_volume}, timeout=1200)
+def merge_p0g_shards(regime: str, shard_subdirs: list[str], out_subdir: str) -> None:
+    """Runs scripts/merge_p0g_shards.py inside a container with the volume
+    mounted, so combining shards needs no local download (mirrors
+    modal_e0_planning.py::merge_shards)."""
+    import subprocess
+    import sys
+    atlas_volume.reload()
+    shard_dirs = [f"{MOUNT}/phase0_v3/{s}" for s in shard_subdirs]
+    subprocess.run(
+        [sys.executable, "scripts/merge_p0g_shards.py", "--regime", regime,
+         "--shard-dirs", *shard_dirs,
+         "--out-dir", f"{MOUNT}/phase0_v3/{out_subdir}"],
+        check=True, cwd="/src",
+    )
     atlas_volume.commit()
 
 
@@ -207,6 +234,86 @@ def p0g_collect_entry(regime: str = "R2",
                        num_val_trajs=num_val_trajs, num_test_trajs=num_test_trajs,
                        eval_traj_len=eval_traj_len, out_subdir=out_subdir,
                        git_sha=_local_git_sha())
+
+
+@app.local_entrypoint(name="p0g-collect-sharded")
+def p0g_collect_sharded_entry(regime: str = "R2",
+                              num_trajs: int = _P0G_DEFAULTS["num_trajs"],
+                              traj_len: int = _P0G_DEFAULTS["traj_len"],
+                              nas: int = _P0G_DEFAULTS["nas"],
+                              num_samples: int = _P0G_DEFAULTS["num_samples"],
+                              iterations: int = _P0G_DEFAULTS["iterations"],
+                              num_val_trajs: int = _P0G_DEFAULTS["num_val_trajs"],
+                              num_test_trajs: int = _P0G_DEFAULTS["num_test_trajs"],
+                              eval_traj_len: int = _P0G_DEFAULTS["eval_traj_len"],
+                              out_subdir: str = "p0g_onpolicy",
+                              num_shards: int = 4) -> None:
+    """num_shards > 1: splits [0, num_trajs) train trajectories into that many
+    contiguous, near-equal ranges (same divmod scheme as
+    modal_e0_planning.py's --num-shards), launches each as its own CONCURRENT
+    Modal container via .spawn() (not sequential .remote() calls), waits for
+    all to finish, then merges via merge_p0g_shards.py. The actual wall-clock
+    lever: collection is a sequential per-trajectory CEM loop (not
+    GPU-flop-bound at this batch size), so N containers in parallel beats one
+    container N times as long, for the same total GPU-time cost. E.g.
+    --num-trajs 100 --num-shards 4 runs four L4s concurrently, ~25 trajectories
+    each, instead of one L4 for 4x as long.
+
+    Exactly ONE shard (shard 0) collects val/test; the others pass
+    --collect-skip-val-test (val/test are cheap, 8 each, and splitting them
+    buys nothing). Shard i gets num_trajs = base + (1 if i < rem else 0)
+    trajectories at traj_offset = running total so far -- disjoint seeds,
+    proven by scripts/merge_p0g_shards.py's overlap check on merge.
+
+    Smoke first at a tiny --num-trajs before trusting this at N=100 (§1.1) --
+    e.g. --num-trajs 8 --num-shards 2 --num-val-trajs 2 --num-test-trajs 2."""
+    git_sha = _local_git_sha()
+    if num_shards <= 1:
+        p0g_collect.remote(regime=regime, num_trajs=num_trajs, traj_len=traj_len,
+                           nas=nas, num_samples=num_samples, iterations=iterations,
+                           num_val_trajs=num_val_trajs, num_test_trajs=num_test_trajs,
+                           eval_traj_len=eval_traj_len, out_subdir=out_subdir, git_sha=git_sha)
+        return
+
+    base, rem = divmod(num_trajs, num_shards)
+    bounds = []  # (offset, size)
+    offset = 0
+    for i in range(num_shards):
+        size = base + (1 if i < rem else 0)
+        if size == 0:
+            continue  # more shards requested than trajectories to cover
+        bounds.append((offset, size))
+        offset += size
+
+    print(f"Splitting {num_trajs} train trajectories into {len(bounds)} shard(s): {bounds}")
+    shard_subdirs = [f"{out_subdir}_shard{i}" for i in range(len(bounds))]
+    calls = [
+        p0g_collect.spawn(
+            regime=regime, num_trajs=size, traj_len=traj_len, nas=nas,
+            num_samples=num_samples, iterations=iterations,
+            num_val_trajs=num_val_trajs, num_test_trajs=num_test_trajs,
+            eval_traj_len=eval_traj_len, out_subdir=subdir, git_sha=git_sha,
+            traj_offset=off, skip_val_test=(i != 0),  # only shard 0 collects val/test
+        )
+        for i, ((off, size), subdir) in enumerate(zip(bounds, shard_subdirs))
+    ]
+    # Containers run concurrently (already launched via .spawn() above); this
+    # loop only blocks LOCALLY waiting for results, in spawn order not finish
+    # order -- fine for a progress bar, all N complete regardless.
+    for call in tqdm(calls, desc=f"p0g_collect_{regime} shards", unit="shard"):
+        call.get()
+
+    print("All shards complete -- merging into the canonical file...")
+    merge_p0g_shards.remote(regime=regime, shard_subdirs=shard_subdirs, out_subdir=out_subdir)
+
+
+@app.local_entrypoint(name="p0g-merge-shards")
+def p0g_merge_shards_entry(regime: str, shard_subdirs: str, out_subdir: str) -> None:
+    """Re-run just the merge step on already-collected shard directories --
+    e.g. after fixing a merge-side bug, without re-paying for collection.
+    shard_subdirs: comma-separated, e.g. p0g_R2_shard0,p0g_R2_shard1."""
+    merge_p0g_shards.remote(regime=regime, shard_subdirs=shard_subdirs.split(","),
+                            out_subdir=out_subdir)
 
 
 @app.local_entrypoint(name="p0g-finetune")

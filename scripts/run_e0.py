@@ -75,7 +75,7 @@ def _load_pusht_demo_dataset(split: str = "train"):
     return states, rel_actions, seq_lengths
 
 
-def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None, corruption: str = "none", corruption_severity: float = 0.5, record_block_pose: bool = False, collect_nas: int = 1) -> list[dict]:
+def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: int = 5, traj_len: int = 50, device: str = "cpu", max_tries: int = 8, seed_offset: int = 0, frameskip: int = 5, source: DataSource = "scripted", data_split: str = "train", agent=None, min_block_pos_diff: float = 40.0, max_agent_block_dist: float | None = None, corruption: str = "none", corruption_severity: float = 0.5, record_block_pose: bool = False, collect_nas: int = 1, traj_idx_offset: int = 0) -> list[dict]:
     """
     Collects real trajectories from PushTEnv under the specified regime and
     encodes them through the frozen vision backbone.
@@ -214,7 +214,11 @@ def load_regime_trajectories(world_model, preprocessor, regime: str, num_trajs: 
     traj_pbar = tqdm(range(num_trajs), desc=f"collect_{source}_{regime}", unit="traj")
     for traj_idx in traj_pbar:
         for attempt in range(max_tries):
-            seed = seed_base + traj_idx * max_tries + attempt
+            # traj_idx_offset (sharding): shifts which slice of the seed space
+            # this call draws from, so N concurrent shard containers collecting
+            # disjoint traj_idx ranges [0,k), [k,2k), ... never draw the same
+            # seed. Default 0 -> byte-identical to the unsharded formula.
+            seed = seed_base + (traj_idx + traj_idx_offset) * max_tries + attempt
             rs = np.random.RandomState(seed)
             # with_velocity=True: matches scripts/run_e1.py and the shipped
             # eval YAML (env.with_velocity: true) -- the checkpoint's
@@ -499,6 +503,137 @@ def dump_regime_chunks(out_dir: Path, regime: str, trajs: list[dict], world_mode
     print(f"  [P9] wrote {n} T={collect_nas} chunks -> {path}", flush=True)
 
 
+BLOCK_STATIC_PX = 1.0  # matches phase0_measure.py's existing "block-static" convention
+
+
+def report_block_static_fraction(out_dir: Path, regime: str,
+                                 split_trajs: dict[str, list[dict]]) -> dict | None:
+    """Reports, per split (train/val/eval/test) and combined, what fraction of
+    COLLECTED trajectories and T=nas chunks have block pixel displacement below
+    BLOCK_STATIC_PX -- i.e. the block barely or never moved.
+
+    This is pure REPORTING, not filtering: nothing here changes which
+    trajectories/chunks train a chart or feed umf_scores. It exists because
+    nobody currently knows this number -- e.g. --num-val-trajs 8 is silently
+    "8 minus however many are dead", and that gap has never been measured.
+    Written for closed_loop trajectories (record_block_pose=True); returns
+    None and prints a note if block_pose is absent (other sources).
+
+    Chunk-level static fraction is computed straight from a trajectory's own
+    block_pose here (not read back from chunks_{regime}.jsonl, which only
+    covers train+val) so it can also cover the test split.
+    """
+    import numpy as np
+
+    if not any(t.get("block_pose") is not None for trajs in split_trajs.values() for t in trajs):
+        print(f"  [Debug] block-static report for {regime}: SKIPPED (no block_pose recorded "
+              f"-- only closed_loop trajectories carry it)", flush=True)
+        return None
+
+    report: dict = {"regime": regime, "block_static_px_threshold": BLOCK_STATIC_PX, "splits": {}}
+    all_traj_static, all_chunk_static, all_traj_n, all_chunk_n = 0, 0, 0, 0
+
+    for split, trajs in split_trajs.items():
+        trajs_with_bp = [t for t in trajs if t.get("block_pose") is not None]
+        if not trajs_with_bp:
+            continue
+        traj_static = 0
+        chunk_n, chunk_static = 0, 0
+        for t in trajs_with_bp:
+            bp = t["block_pose"]  # [T_model+1, 3]
+            whole_disp = float(np.linalg.norm(np.asarray(bp[-1][:2]) - np.asarray(bp[0][:2])))
+            if whole_disp < BLOCK_STATIC_PX:
+                traj_static += 1
+        report["splits"][split] = {"n_trajs": len(trajs_with_bp), "n_traj_static": traj_static,
+                                   "frac_traj_static": traj_static / len(trajs_with_bp)}
+        # Chunk-level static fraction (T=nas windows) is reported separately by
+        # derive_and_report_motion_gate() from chunks_{regime}.jsonl, which
+        # currently covers train+val only (dump_regime_chunks is not called on
+        # test) -- noted there, not duplicated here.
+        all_traj_static += traj_static
+        all_traj_n += len(trajs_with_bp)
+
+    report["combined"] = {
+        "n_trajs": all_traj_n, "n_traj_static": all_traj_static,
+        "frac_traj_static": (all_traj_static / all_traj_n) if all_traj_n else None,
+    }
+
+    path = out_dir / f"block_static_{regime}.json"
+    path.write_text(json.dumps(report, indent=2))
+    print(f"  [Debug] block-static report for {regime}: "
+          f"{all_traj_static}/{all_traj_n} trajectories "
+          f"({100 * all_traj_static / all_traj_n:.0f}%) have whole-trajectory block "
+          f"displacement < {BLOCK_STATIC_PX}px (never moved) -> {path}", flush=True)
+    return report
+
+
+def derive_and_report_motion_gate(out_dir: Path, regime: str, chunks_path: Path,
+                                  current_gate_10pct: float) -> dict | None:
+    """v3 §6.6: derive the P95-over-block-static-chunks motion gate from the
+    full on-policy chunk dump, alongside the retired 10th-percentile value and
+    the REALISED false-pass rate of each rule -- i.e. what fraction of
+    block-static chunks (block_disp_px < BLOCK_STATIC_PX, no real dynamics
+    signal) would still be scored as "informative" (latent_disp > gate) under
+    each candidate. This does NOT adopt a new gate value anywhere in the
+    pipeline -- CLAUDE.md §15-5 already requires explicit human sign-off for
+    the motion gate, and this function's whole job is to produce real evidence
+    to sign off against instead of leaving §6.6 unmeasured. Additive-only:
+    reads chunks_{regime}.jsonl (written by dump_regime_chunks), changes
+    nothing else.
+    """
+    import numpy as np
+
+    if not chunks_path.exists():
+        print(f"  [Debug] §6.6 gate derivation for {regime}: SKIPPED "
+              f"({chunks_path} not found)", flush=True)
+        return None
+    rows = [json.loads(l) for l in chunks_path.read_text().splitlines() if l.strip()]
+    if not rows:
+        return None
+
+    latent_disp = np.array([r["latent_disp"] for r in rows], dtype=float)
+    block_disp = np.array([r["block_disp_px"] for r in rows if r["block_disp_px"] is not None],
+                          dtype=float)
+    static_mask = np.array([r["block_disp_px"] is not None and r["block_disp_px"] < BLOCK_STATIC_PX
+                            for r in rows])
+    n_static = int(static_mask.sum())
+
+    gate_10pct = float(current_gate_10pct)
+    gate_p95_static = (float(np.percentile(latent_disp[static_mask], 95))
+                       if n_static > 0 else None)
+
+    def false_pass_rate(gate: float | None) -> float | None:
+        # A block-static chunk that still clears the gate (latent_disp > gate)
+        # is a FALSE PASS: scored as informative despite carrying no real
+        # block-motion signal (agent-only motion can still move the latent).
+        if gate is None or n_static == 0:
+            return None
+        return float((latent_disp[static_mask] > gate).sum()) / n_static
+
+    report = {
+        "regime": regime, "n_chunks": len(rows), "n_block_static_chunks": n_static,
+        "frac_block_static_chunks": n_static / len(rows),
+        "gate_10pct_RETIRED": gate_10pct,
+        "gate_10pct_false_pass_rate": false_pass_rate(gate_10pct),
+        "gate_p95_over_block_static_v3_6_6": gate_p95_static,
+        "gate_p95_false_pass_rate": false_pass_rate(gate_p95_static),
+        "note": ("NEITHER value is adopted by this run -- CLAUDE.md §15-5 requires explicit "
+                "human sign-off on the motion gate. This report exists to give that sign-off "
+                "real evidence instead of a percentile heuristic. false_pass_rate = fraction "
+                "of block-static chunks (block_disp_px < %.1fpx) that still clear the gate "
+                "(latent_disp > gate) -- i.e. treated as informative despite no real block "
+                "motion; lower is better." % BLOCK_STATIC_PX),
+    }
+    path = out_dir / f"gate_calibration_{regime}.json"
+    path.write_text(json.dumps(report, indent=2))
+    print(f"  [Debug] §6.6 gate derivation for {regime}: n_static={n_static}/{len(rows)} "
+          f"({100*n_static/len(rows):.0f}%) | 10pct={gate_10pct:.1f} "
+          f"(false-pass {report['gate_10pct_false_pass_rate']}) | "
+          f"P95-static={gate_p95_static} (false-pass {report['gate_p95_false_pass_rate']}) "
+          f"-> {path}. NOT adopted -- needs human sign-off (§15-5).", flush=True)
+    return report
+
+
 def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict],
                        motion_gate: float | None = None,
                        chunk_nas: int = 2,
@@ -528,9 +663,16 @@ def evaluate_e0_chart(world_model, chart: Chart, val_trajectories: list[dict],
         umf                  — mean GATED trajectory-T UMF (the historical
                                `eval_umf`; unchanged definition)
         umf_ungated          — mean trajectory-T UMF with NO motion gate (P10:
-                               so the gate's effect is visible, not baked in;
-                               the gate drops low-displacement / high-UMF
-                               chunks so `umf` is systematically optimistic)
+                               so the gate's effect on the mean is visible, not
+                               baked in. Direction is NOT assumed here — an
+                               earlier claim that gating is always optimistic
+                               ["low displacement -> small denominator -> large
+                               UMF"] was checked against real R2 chunks
+                               2026-08-29 and found backwards on that sample
+                               [corr(latent_disp, umf_c0) = +0.398,
+                               phase0_v3/p0g_smoke_v3/chunks_R2.jsonl] — report
+                               both numbers and let the reader compare, don't
+                               assert a sign)
         umf_chunkT{n}        — mean GATED UMF over T=chunk_nas sliding windows
                                (P8: comparable to τ ≈ 0.262)
         umf_chunkT{n}_ungated
@@ -724,6 +866,19 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Print a sha256 of predictor params before each regime's "
                               "collection (P1 falsification test): with --regimes R0,R2 the "
                               "fingerprints must be IDENTICAL after the fix, DIFFERENT before.")
+    parser.add_argument("--collect-traj-offset", type=int, default=0,
+                         help="Sharding (mirrors run_e0_planning.py's --episode-start pattern, "
+                              "modal_e0_planning.py's --num-shards): shifts the TRAIN seed space "
+                              "so N concurrent shard containers each collecting num_train_trajs "
+                              "trajectories with offsets 0, k, 2k, ... draw disjoint seeds instead "
+                              "of duplicating each other's work. Not applied to val/test -- see "
+                              "--collect-skip-val-test. Merge shard outputs with "
+                              "scripts/merge_p0g_shards.py. Default 0 = unsharded, unchanged.")
+    parser.add_argument("--collect-skip-val-test", action="store_true",
+                         help="Sharding: skip collecting val/test trajectories entirely (they're "
+                              "cheap and NOT split across shards -- exactly one shard, typically "
+                              "--collect-traj-offset 0, should omit this flag so it collects them; "
+                              "every other shard passes it).")
     parser.add_argument("--collect-only", action="store_true",
                          help="Collect + persist trajectories (and the chunks_{regime}.jsonl "
                               "dump) then EXIT before any fine-tuning (P2 — splits the Modal "
@@ -769,6 +924,42 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="atlas-e0", help="WandB project name")
     return parser
+
+
+def compute_motion_gates(train_trajectories: list[dict], nas: int,
+                         verbose_label: str = "") -> tuple[float, float | None]:
+    """Gate G6 (motion_gate) + §7-B2 (chunk_motion_gate), factored out of
+    main() so scripts/merge_p0g_shards.py can recompute both on a MERGED
+    train set (sharded collection must not report per-shard gate values —
+    they're calibrated over whatever trajectories happen to land in that
+    shard, not the full requested set)."""
+    train_displacements = torch.tensor([
+        (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
+        for t in train_trajectories
+    ])
+    motion_gate = compute_motion_gate(train_displacements)
+    print(f"  [Debug] motion_gate (10th pct of T={train_trajectories[0]['actions'].shape[0]}-step "
+          f"train displacement){' for ' + verbose_label if verbose_label else ''} = "
+          f"{motion_gate:.4f}", flush=True)
+
+    # §7-B2: the T=nas windowed UMF (P8) must be gated at the SAME granularity
+    # it is applied at. `motion_gate` above is the 10th pct of whole-trajectory
+    # displacement; a 2-step window's displacement is far smaller, so that
+    # threshold rejects almost every window (§6.6's named failure). Same
+    # RETIRED 10th-pct rule, but at T=nas. (v3 §6.6's block-static P95
+    # replacement is a separate Phase-0 task, fed by chunks_{regime}.jsonl.)
+    chunk_displacements = torch.tensor([
+        (t["encoder_output"][i + nas] - t["encoder_output"][i]).norm(p="fro").item()
+        for t in train_trajectories
+        for i in range(0, t["actions"].shape[0] - nas + 1)
+    ])
+    if chunk_displacements.numel() == 0:
+        print(f"  [Debug] chunk_motion_gate: SKIPPED (no T={nas} windows)", flush=True)
+        return motion_gate, None
+    chunk_motion_gate = compute_motion_gate(chunk_displacements)
+    print(f"  [Debug] chunk_motion_gate (10th pct, T={nas}){' for ' + verbose_label if verbose_label else ''} "
+          f"= {chunk_motion_gate:.4f} (vs traj-scale {motion_gate:.1f})", flush=True)
+    return motion_gate, chunk_motion_gate
 
 
 def main() -> None:
@@ -919,18 +1110,27 @@ def main() -> None:
             train_trajectories = load_regime_trajectories(
                 wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
                 device=device, seed_offset=0, source=args.data_source, data_split=args.data_split,
-                **collect_kw)
-            val_trajectories = load_regime_trajectories(
-                wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
-                seed_offset=10_000, source=args.data_source, data_split=args.data_split,
-                **collect_kw)
-            # FIX_SPEC.md A4: disjoint TEST set (seed_offset=20_000) -- the number
-            # actually reported as eval_umf, so early-stopping's repeated use of the
-            # val set does not bias it.
-            test_trajectories = load_regime_trajectories(
-                wrapper, prep, regime, num_trajs=args.num_test_trajs, traj_len=args.eval_traj_len,
-                device=device, seed_offset=20_000, source=args.data_source,
-                data_split=args.data_split, **collect_kw) if args.num_test_trajs > 0 else []
+                traj_idx_offset=args.collect_traj_offset, **collect_kw)
+            # Sharding (--collect-skip-val-test): val/test are cheap (8 each vs
+            # 100 train) and NOT split across shards -- one shard (offset=0)
+            # collects them, the rest skip, and merge_p0g_shards.py takes them
+            # from that shard. traj_idx_offset is NOT applied to val/test (they
+            # always start their own seed space at 0; only relevant when this
+            # shard is the one collecting them at all).
+            if args.collect_skip_val_test:
+                val_trajectories, test_trajectories = [], []
+            else:
+                val_trajectories = load_regime_trajectories(
+                    wrapper, prep, regime, num_trajs=args.num_val_trajs, traj_len=args.eval_traj_len, device=device,
+                    seed_offset=10_000, source=args.data_source, data_split=args.data_split,
+                    **collect_kw)
+                # FIX_SPEC.md A4: disjoint TEST set (seed_offset=20_000) -- the number
+                # actually reported as eval_umf, so early-stopping's repeated use of the
+                # val set does not bias it.
+                test_trajectories = load_regime_trajectories(
+                    wrapper, prep, regime, num_trajs=args.num_test_trajs, traj_len=args.eval_traj_len,
+                    device=device, seed_offset=20_000, source=args.data_source,
+                    data_split=args.data_split, **collect_kw) if args.num_test_trajs > 0 else []
             # Persist immediately (encoder_output kept fp32 — measure size on the
             # smoke before switching to .half()). Then re-runs load instead of
             # re-collecting.
@@ -942,6 +1142,14 @@ def main() -> None:
             if args.data_source == "closed_loop":
                 dump_regime_chunks(args.out, regime, train_trajectories + val_trajectories,
                                    wrapper, args.collect_num_act_stepped)
+                # Distribution reporting, NOT filtering (per user direction 2026-08-29):
+                # (1) what fraction of collected trajectories/chunks never moved the
+                #     block at all -- answers Part 3 Q8 honestly ("8 val trajectories"
+                #     is really "8 minus the dead fraction", previously unmeasured).
+                report_block_static_fraction(args.out, regime, {
+                    "train": train_trajectories, "val": val_trajectories,
+                    "test": test_trajectories,
+                })
         def _manifest_rows(trajs):  # P12: n_contacts was stdout-only before
             return [{"seed": t["seed"], "episode_idx": t["episode_idx"],
                      "offset": t["offset"], "n_contacts": t.get("n_contacts")}
@@ -984,38 +1192,15 @@ def main() -> None:
                   f"§15-2 pre-registered R2 check: if this collapses toward 0, "
                   f"damping=0.1 is the fallback.", flush=True)
 
-        # Gate G6: informative-chunk threshold, computed once from this
-        # regime's own training displacements (10th percentile) -- wired into
-        # every umf() call below instead of the motion_gate=None the eval
-        # path has always used (E0_IMPLEMENTATION_PLAN.md T5).
-        train_displacements = torch.tensor([
-            (t["encoder_output"][-1] - t["encoder_output"][0]).norm(p="fro").item()
-            for t in train_trajectories
-        ])
-        motion_gate = compute_motion_gate(train_displacements)
-        print(f"  [Debug] motion_gate (10th pct of T={args.train_traj_len // 5}-step "
-              f"train displacement) = {motion_gate:.4f}", flush=True)
+        motion_gate, chunk_motion_gate = compute_motion_gates(
+            train_trajectories, args.collect_num_act_stepped, verbose_label=regime)
 
-        # §7-B2: the T=nas windowed UMF (P8) must be gated at the SAME granularity
-        # it is applied at. `motion_gate` above is the 10th pct of whole-trajectory
-        # (T=6) displacement; a 2-step window's displacement is far smaller, so
-        # that threshold rejects almost every window (§6.6's named failure).
-        # Same RETIRED 10th-pct rule, but at T=nas. (v3 §6.6's block-static P95
-        # replacement is a separate Phase-0 task, fed by chunks_{regime}.jsonl.)
-        _nas = args.collect_num_act_stepped
-        chunk_displacements = torch.tensor([
-            (t["encoder_output"][i + _nas] - t["encoder_output"][i]).norm(p="fro").item()
-            for t in train_trajectories
-            for i in range(0, t["actions"].shape[0] - _nas + 1)
-        ])
-        if chunk_displacements.numel() == 0:
-            # traj too short for even one T=nas window — windowed UMF is ungated.
-            chunk_motion_gate = None
-            print(f"  [Debug] chunk_motion_gate: SKIPPED (no T={_nas} windows)", flush=True)
-        else:
-            chunk_motion_gate = compute_motion_gate(chunk_displacements)
-            print(f"  [Debug] chunk_motion_gate (10th pct, T={_nas}) = {chunk_motion_gate:.4f} "
-                  f"(vs traj-scale {motion_gate:.1f})", flush=True)
+        if args.data_source == "closed_loop":
+            # v3 §6.6's gate derived from the real on-policy chunk dump, reported
+            # alongside the retired 10th-pct value and each rule's realised
+            # false-pass rate, for explicit human sign-off (§15-5). NOT adopted here.
+            derive_and_report_motion_gate(args.out, regime,
+                                          args.out / f"chunks_{regime}.jsonl", motion_gate)
 
         if args.collect_only:
             print(f"  [P2] --collect-only: trajectories for {regime} persisted, "
