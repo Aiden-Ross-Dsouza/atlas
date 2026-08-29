@@ -329,10 +329,23 @@ def p0g_finetune_entry(regime: str = "R2", steps: int = 2000,
                        eval_traj_len: int = _P0G_DEFAULTS["eval_traj_len"]) -> None:
     """Collection-defining params must MATCH the p0g_collect run being loaded
     (they default identically off _P0G_DEFAULTS; override all of them together
-    if the collection was non-default). §7-B1."""
-    p0g_finetune.remote(regime=regime, steps=steps, out_subdir=out_subdir,
-                        load_subdir=load_subdir or None, git_sha=_local_git_sha(),
-                        num_trajs=num_trajs, traj_len=traj_len, nas=nas,
-                        num_samples=num_samples, iterations=iterations,
-                        num_val_trajs=num_val_trajs, num_test_trajs=num_test_trajs,
-                        eval_traj_len=eval_traj_len)
+    if the collection was non-default). §7-B1.
+
+    Uses .spawn() (fire-and-forget), NOT .remote() -- found the hard way
+    (2026-08-30): a bare .remote() call keeps an open RPC in flight for the
+    ENTIRE fine-tune duration, tied to THIS LOCAL PROCESS staying alive. If
+    the local process is killed (not just network-dropped -- confirmed
+    reproducible twice, cancelling a real 100-trajectory fine-tune mid-run at
+    steps 60 and 206), the client propagates a cancellation despite
+    --detach. .spawn() submits and returns immediately -- the function call
+    is independently trackable server-side from that point on, exactly like
+    p0g_collect_sharded_entry's per-shard .spawn() calls, which DID survive a
+    local kill. Check progress/completion via `modal app logs <app-id>`."""
+    call = p0g_finetune.spawn(regime=regime, steps=steps, out_subdir=out_subdir,
+                              load_subdir=load_subdir or None, git_sha=_local_git_sha(),
+                              num_trajs=num_trajs, traj_len=traj_len, nas=nas,
+                              num_samples=num_samples, iterations=iterations,
+                              num_val_trajs=num_val_trajs, num_test_trajs=num_test_trajs,
+                              eval_traj_len=eval_traj_len)
+    print(f"Spawned p0g_finetune (regime={regime}) as function call {call.object_id}. "
+          f"Not waiting locally -- check `modal app logs` for progress/completion.")
