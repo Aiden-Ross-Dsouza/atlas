@@ -19,7 +19,7 @@ This is `REDTEAM.md`'s recommended narrative after attacking every claim in the 
 | Claim | One-line evidence | Strength |
 |---|---|---|
 | CEM planner cost-ranking collapses under a regime shift, not universally, and does so gradually | Monotonic dose-response curve, ρ 0.532→0.295→0.169→0.078→0.001 across 5 shift strengths, n=20/point; regret 8.5px vs 88.1px at endpoints | **Primary contribution** |
-| Prediction-error routing (UMF) discriminates dynamics shifts better than an appearance-based baseline | 60.3% vs chance 33% vs S-dyn 36.5%; S-dyn degenerately defaults to one chart | **Secondary contribution**, scoped to selector-vs-label accuracy, no planner in the loop |
+| Multi-step normalised prediction error (UMF) discriminates dynamics specialists better than a one-step latent-direction baseline (S-dyn) | 60.3% vs chance 33% vs S-dyn 36.5%; S-dyn degenerately defaults to one chart | **Secondary contribution**, scoped to selector-vs-label accuracy, no planner in the loop |
 | No prior work routes among persistent adapters on a frozen visual world model by measured predictive fitness | Serious recency-weighted literature search, ~20 papers read directly, no scooping candidate found | **Primary novelty claim**, holds |
 | Lightweight adapter reduces the model's own prediction error with more training data | UMF falls monotonically 0.336→0.302→0.268 across a 5× data range | **Secondary, with a disclosed caveat** (shared fixed validation set across the sweep) |
 | Adapter does not improve one-shot open-loop planning success | 44.0% vs 43.0%, N=100, CI [−9,+7], McNemar p=1.000 | **Reported negative result, explicitly scoped** to one-shot open-loop planning + off-policy-trained adapter |
@@ -75,9 +75,9 @@ This is a well-powered null (the CI is roughly half the width of an earlier N=20
 
 ---
 
-## 4. Secondary result: fitness-based routing beats an appearance-based baseline
+## 4. Secondary result: multi-step normalised fitness routing beats a one-step latent-direction baseline
 
-Across a 3-chart library, UMF-based selection correctly identifies the regime-appropriate chart **60.3%** of the time (chance = 33%); a naive appearance-similarity baseline (S-dyn) manages **36.5%**, indistinguishable from chance. The confusion matrix shows why: S-dyn nearly always defaults to the identity chart regardless of the true physics regime — a qualitatively degenerate failure, not merely a weaker margin. This rules out "UMF just barely edges out a competent baseline": S-dyn is not discriminating dynamics shifts at all.
+Across a 3-chart library, UMF-based selection correctly identifies the regime-appropriate chart **60.3%** of the time (chance = 33%); S-dyn -- a one-step latent-delta cosine baseline, not an appearance/visual-similarity router (`atlas/router.py::_sdyn_score`; the appearance-similarity router S-obs in the proposal was never implemented) -- manages **36.5%**, indistinguishable from chance. The confusion matrix shows why: S-dyn nearly always defaults to the identity chart regardless of the true physics regime — a qualitatively degenerate failure, not merely a weaker margin. This rules out "UMF just barely edges out a competent baseline": S-dyn is not discriminating dynamics shifts at all.
 
 On the decisive two-chart cell isolating dynamics shift from appearance shift: UMF **0.833** vs. S-dyn **0.570** (+26.3pp). **Report only these two numbers, not a causal story about which fix produced the change.** An earlier version of this comparison (pre-fix, 0.880/0.324) is no longer independently reproducible from raw data, and the router's spread-normalized hysteresis margin is provably, algebraically inert for any exactly-2-chart library (the incumbent, when not already the winner, is by construction the maximum of a 2-element set, so the margin condition can never trigger a "hold"). Whatever moved the number between the two measurements was a separate change to how routing state persists across chunks, not the hysteresis margin — do not credit the margin fix in the write-up.
 
@@ -123,7 +123,7 @@ State these boundaries explicitly in the paper, not just observe them by omissio
 
 ## 6. Suggested abstract paragraph (draft — adapt freely)
 
-> World models built on frozen visual foundation models are often adapted to new physical dynamics via lightweight, swappable modules ("charts"), selected online by a measured predictive-fitness signal. We show that under a physics-regime shift, the failure is not primarily in the world model's prediction accuracy but in the planner's own candidate-ranking process: a CEM planner's cost function ranks action sequences well under nominal dynamics (Spearman ρ = 0.53, n=20 seeds) and degrades smoothly and monotonically to chance-level, and sometimes counterproductive, ranking quality as a damping shift is scaled from zero to its full value (ρ = 0.53 → 0.30 → 0.17 → 0.08 → 0.00 across five shift strengths, n=20/point), even when a chart demonstrably reduces the underlying model's prediction error. Consistent with this mechanism, a chart trained to reduce prediction error under the shifted regime produces no measurable improvement in one-shot open-loop planning success at high statistical power (N=100), extending a growing literature on the dissociation between model-quality metrics and downstream control competence to frozen-backbone, adapter-based world models. Separately, we show that the same predictive-fitness signal reliably discriminates a genuine dynamics shift from a visual appearance change — correctly selecting the regime-appropriate chart 60% of the time against a 33% chance rate, versus 37% for an appearance-based baseline that degenerates to always selecting the same chart. Together these results argue that in this setting, the bottleneck to online adaptation is the planner's search process under distribution shift, not the world model's representational capacity to absorb it — a distinction with direct implications for where future work on continual world models should focus its adaptation machinery.
+> World models built on frozen visual foundation models are often adapted to new physical dynamics via lightweight, swappable modules ("charts"), selected online by a measured predictive-fitness signal. We show that under a physics-regime shift, the failure is not primarily in the world model's prediction accuracy but in the planner's own candidate-ranking process: a CEM planner's cost function ranks action sequences well under nominal dynamics (Spearman ρ = 0.53, n=20 seeds) and degrades smoothly and monotonically to chance-level, and sometimes counterproductive, ranking quality as a damping shift is scaled from zero to its full value (ρ = 0.53 → 0.30 → 0.17 → 0.08 → 0.00 across five shift strengths, n=20/point), even when a chart demonstrably reduces the underlying model's prediction error. Consistent with this mechanism, a chart trained to reduce prediction error under the shifted regime produces no measurable improvement in one-shot open-loop planning success at high statistical power (N=100), extending a growing literature on the dissociation between model-quality metrics and downstream control competence to frozen-backbone, adapter-based world models. Separately, we show that the same predictive-fitness signal reliably discriminates a genuine dynamics shift from a visual appearance change — correctly selecting the regime-appropriate chart 60% of the time against a 33% chance rate, versus 37% for a one-step latent-direction baseline (S-dyn) that degenerates to always selecting the same chart. Together these results argue that in this setting, the bottleneck to online adaptation is the planner's search process under distribution shift, not the world model's representational capacity to absorb it — a distinction with direct implications for where future work on continual world models should focus its adaptation machinery.
 
 ---
 
@@ -147,3 +147,79 @@ The only existing closed-loop measurement (nas=2, N=20: baseline 40.0% vs. chart
 - [x] MBCD venue fix: flagged in §5c's table — **this one still needs to be applied to `ATLAS_proposal_v7.md` §10 itself, not just noted here**, since this notes file doesn't carry the proposal's reference list.
 
 **Everything in this checklist is now either applied in this document's own prose or flagged with its exact target location. The only action item left outside this file is the MBCD venue correction in `ATLAS_proposal_v7.md` §10.**
+
+---
+
+## 8. v3 Phase-0 findings (added 2026-08-28; provisional until E0′ / P0-G)
+
+### 8.1 Planner-budget calibration (P0-C) — `iterations = 10` adopted, not final
+
+Pre-registered gate (IMPLEMENTATION_PLAN_V3 §3.5): frozen baseline, R2, `nas=2`,
+`N=300`, `horizon=6`, n=20 paired episodes (seed = episode index), at
+`iterations ∈ {30, 15, 10}`. Adopt the smallest whose SR lies inside the paired
+bootstrap CI of `iterations=30`.
+
+| iterations | SR (n=20) | Δ vs it=30 | 95% CI | McNemar p | wall/episode |
+|---|---|---|---|---|---|
+| 30 | 8/20 = 40% | — | — | — | ~5.8 min |
+| 15 | 9/20 = 45% | +0.05 | [−0.10, +0.20] | 1.000 | ~2.9 min |
+| 10 | 10/20 = 50% | +0.10 | [−0.10, +0.30] | 0.625 | ~1.8 min |
+
+Both cut settings land inside the it=30 CI, so the rule adopts **`iterations = 10`**
+(≈3× cheaper; makes the E4 stream affordable). **The N=20 result is "adopted", not
+"final": E0′ at N=100 is the decisive check.** If it=10 holds at N=100 it is
+confirmed; if it degrades, revert to it=30 and cut experiment sizes per §14 — and
+the P0-C discordant-episode audit (below) already establishes the degradation would
+not be a wiring bug, just an unlucky n=20 sample.
+
+**For the appendix — verbatim from `phase0_v3/p0c/discordant_analysis.txt`:** only 4
+of 20 episodes were discordant between it=10 and it=30 (episodes 8, 9, 17, 19), and
+one (19) flipped *toward* more iterations — not a monotone "less search wins" pattern.
+The `planner_diagnostics` traces confirm the `--iterations` flag is honoured in the
+raw data (15 vs 10 CEM iterations/replan recorded, not just wall-time scaling). In
+episodes 8/9/17 the lower-iteration run nailed its first plan and terminated in 5–12
+steps before compounding model error could accumulate; the higher-iteration runs
+missed the first plan and drifted the block to 110–225 px off over 2–3 further
+replans. This is the planning-side face of optimiser-vs-model-error over-exploitation
+(§2's theme), not a bug — but at n=20 with 4 discordant episodes it is statistically
+noise, hence the N=100 checkpoint.
+
+### 8.2 Regime reality (P0-F / G4) — R2 solid, R1 is a prediction-level shift only
+
+Rewritten G4 (fixed identical actions, no planner, paired by seed, tested vs an
+R0-vs-R0 noise band; IMPLEMENTATION_PLAN_V3 §9):
+
+- **R2 (damping 0.5): a genuine regime shift at every level.** Block pose endpoint
+  moves +32–41 px vs R0 (KS p = 2×10⁻¹¹), stable across 40→200-step pushes.
+- **R1 (friction 2.0): NOT a trajectory-level shift.** A fixed push ends only
+  +8–9 px further than under R0 — inside the ±13 px R0-vs-R0 noise band — and this
+  is **flat across 40→200 steps** (the "friction compounds over a long push"
+  hypothesis is measured and rejected). `regimes.py` notes friction saturates at
+  2.0, so the axis has no headroom.
+- **But R1 *is* a prediction-level shift.** P0-D: the frozen world model's UMF
+  exceeds the R0 95th-percentile on **34%** of informative R1 chunks vs **5%** for
+  R0 — and (stratified check) R1's strike chunks have *higher* block displacement
+  than its non-strike chunks (51 vs 37 px), so this is genuine misprediction on
+  high-motion chunks, not small-denominator UMF inflation.
+
+**Paper consequence:** describe R1 accurately — a regime under which the frozen
+model mispredicts dynamics (a real, chart-correctable deficit) but which produces
+only a marginal change in where a fixed push ends up. Do **not** lump it with R2 as
+"a large behavioural shift". Whether R1 stays in E0/E2 is a live call; if kept, its
+weakness is stated, not hidden (per CLAUDE.md §1.8).
+
+**Rescope adopted (2026-08-28):** R2 (damping) is the sole regime for any
+trajectory-level or success-rate claim — E1 routing, E3+E4 continual stream. R1
+(friction) is kept only for prediction-level claims: RQ2 (dynamics-vs-appearance —
+R1 is the *harder* test, since UMF must track dynamics with no dramatic visual or
+trajectory cue) and RQ0 (a chart specialising on a real-but-subtle prediction shift
+is a legitimate capacity test). R1 is dropped from E0′'s full N=100 success-rate arm
+and from E1/E3/E4 entirely.
+
+**Future work — the "R3" regime.** Friction turned out prediction-level only, and
+per `REGIME_DESIGN_REVIEW.md` the only appearance-matched dynamics lever left is the
+pusher's PD tracking gains `k_p`/`k_v` (`pusht_env.py:384`). A "stiff vs sluggish
+actuator" regime changes contact velocity directly, so unlike friction it should
+carry *both* a prediction-level and a trajectory-level effect. Name it in future
+work as the appearance-matched, mechanistically-distinct second dynamics shift to
+validate next. Full spec: `IMPLEMENTATION_PLAN_V3.md` §15 item 6.
