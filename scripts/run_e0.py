@@ -1094,18 +1094,35 @@ def main() -> None:
             src_file = traj_file
 
         if src_file is not None:
-            blob = torch.load(src_file, weights_only=False)
+            # map_location="cpu": a persisted file's tensors may have been
+            # saved from a GPU collection container OR re-saved by a CPU-only
+            # merge (scripts/merge_p0g_shards.py, which itself loads with
+            # map_location="cpu" -- see that script's comment) -- don't assume
+            # either. Load onto CPU unconditionally, then move to `device`
+            # explicitly below, so this path is correct regardless of the
+            # file's provenance. Missing this caused a real crash: fine-tuning
+            # from a merged (CPU-saved) trajectory file against a CUDA
+            # predictor raised "Expected all tensors to be on the same
+            # device, cpu and cuda:0" inside the first forward pass.
+            blob = torch.load(src_file, map_location="cpu", weights_only=False)
             if blob["guard"] != guard:
                 raise ValueError(
                     f"--load-trajs protocol mismatch for {regime}:\n"
                     f"  stored:  {blob['guard']}\n  current: {guard}\n"
                     f"Refusing to train on a different protocol's data.")
-            train_trajectories = blob["train"]
-            val_trajectories = blob["val"]
-            test_trajectories = blob["test"]
+
+            def _to_device(trajs: list[dict]) -> list[dict]:
+                for t in trajs:
+                    for k in ("encoder_output", "actions", "proprio"):
+                        if k in t and torch.is_tensor(t[k]):
+                            t[k] = t[k].to(device)
+                return trajs
+            train_trajectories = _to_device(blob["train"])
+            val_trajectories = _to_device(blob["val"])
+            test_trajectories = _to_device(blob["test"])
             print(f"  [P9] loaded {len(train_trajectories)}/{len(val_trajectories)}/"
                   f"{len(test_trajectories)} train/val/test trajectories from {src_file} "
-                  f"(NO collection)", flush=True)
+                  f"(NO collection, moved to {device})", flush=True)
         else:
             train_trajectories = load_regime_trajectories(
                 wrapper, prep, regime, num_trajs=args.num_train_trajs, traj_len=args.train_traj_len,
