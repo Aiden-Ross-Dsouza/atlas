@@ -4,12 +4,14 @@
 is the *work order*. Finding IDs (P1, P2, …) refer to that file's table. Read it first — every fix
 below assumes you know what it is fixing and why.
 
-**Status (updated 2026-08-29):** §2–§4 implemented in code by the V3-6/V3-7/V3-8 sessions; §7's two
-defects fixed by V3-9 (§7-B1 verified model-free + regression test; §7-B2 fixed, mechanism verified
-synthetically, real-data severity owed once collection produces `trajs_R2.pt`). See the per-section
-STATUS boxes. **Still before launch:** a real Modal smoke (every model-in-the-loop falsification +
-the timing/cost re-measure is still owed — see the STATUS boxes' "NOT RUN" lines), §4.3/§4.5's open
-items, and human launch approval. P0-G has not launched.
+**Status (updated 2026-08-29):** §2–§4 implemented in code (V3-6/7/8); §7's two defects fixed (V3-9:
+§7-B1 verified model-free + regression test `tests/test_p0g_guard.py`; §7-B2 fixed and now **confirmed
+on real data**). **A real Modal smoke has PASSED end-to-end** (`p0g_collect --regime R2 --num-trajs 5
+--collect-only`, pandereshubham, 2026-08-29 — record: `phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md`):
+§3.1/§3.2/§3.4 verified live, `trajs_R2.pt` + `chunks_R2.jsonl` persisted, P12/P18/P19/P20 confirmed,
+150.6 s/traj (6 h collect timeout holds). **Still before launch:** `p0g_finetune` on a real container
+(guard match proven by test, not exercised), R0 collection, §4.1/§4.4/§4.5, §4.3's open decision, and
+human launch approval. P0-G (the full 100-traj run) has not launched.
 
 ---
 
@@ -489,9 +491,12 @@ Three separate problems with what P0-G reports, all fixable without touching `um
 3. **Unrecorded `n` (P10b).** `evaluate_e0_chart` appends to `umf_scores` only when `umf` returns
    non-`None`, so `eval_loss` and `eval_umf` can be means over different subsets and nothing records
    which. **Fix:** record `len(umf_scores)` alongside — `phase0_v3/p0c/p0c_it10_summary.json` already
-   does exactly this as `"umf_episodes_with_value": 18`; copy that convention. Note the gate drops
-   *low*-displacement trajectories, which have the smallest UMF denominator and hence the largest
-   UMF, so the gated mean is **systematically optimistic** — same direction as P3, compounding it.
+   does exactly this as `"umf_episodes_with_value": 18`; copy that convention. **Directional-bias
+   claim CORRECTED 2026-08-29** — the original text here claimed the gate always makes the mean
+   "systematically optimistic" (low-displacement chunks having the smallest denominator, hence the
+   largest UMF). That was never checked against data. Checked 2026-08-29 on real R2 on-policy chunks
+   (`phase0_v3/p0g_smoke_v3/chunks_R2.jsonl`, n=35): `corr(latent_disp, umf_c0) = +0.398` — the
+   opposite sign. Report `n` and both the gated and ungated mean; do not assert a direction.
 
 **FALSIFICATION TEST:** on a 3-trajectory smoke where you set the gate artificially high enough to
 drop one trajectory, confirm `results.json` records `n = 2` while `eval_loss` is still a mean over 3.
@@ -700,16 +705,24 @@ failure mode that is invisible until a 4-hour collection has already been paid f
 
 ### 7-B2 🟠 FIX BEFORE TRUSTING CHARTS — the τ-scale chunk UMF is gated at the wrong granularity
 
-> **STATUS 2026-08-29 (V3-9):** FIXED. `run_e0.py::main()` computes
-> `chunk_motion_gate` (10th pct of T=nas train-window disps); `evaluate_e0_chart`
-> uses it for the windowed calls only; `_umf_detail_fields` records both gates;
-> `eval_umf_chunkT{nas}_ungated` kept. FALSIFICATION: the exact real-data test
-> **could not run — no `trajs_R2.pt` exists yet.** SYNTHETIC substitute (real
-> `compute_motion_gate`, directed-motion latents) confirmed the mechanism:
-> BEFORE traj-gate gates 100% of windows, AFTER chunk-gate gates 10%. **Real
-> over-gating fraction is UNVERIFIED — owed once collection produces
-> `trajs_R2.pt`.** Not refuted: the mismatch is real by construction and §6.6
-> mandates the fix regardless of magnitude.
+> **STATUS 2026-08-29 (V3-9 + smoke):** FIXED and **CONFIRMED ON REAL DATA — the
+> over-gating claim only.** `run_e0.py::main()` computes `chunk_motion_gate`
+> (10th pct of T=nas train-window disps); `evaluate_e0_chart` uses it for
+> windowed calls only; both gates in `_umf_detail_fields`;
+> `eval_umf_chunkT{nas}_ungated` kept. FALSIFICATION off the smoke's real
+> `trajs_R2.pt` / `chunks_R2.jsonl` (35 T=2 windows):
+> `motion_gate`(T=6) = 244.18, `chunk_motion_gate`(T=2) = 142.34 →
+> **BEFORE traj-gate gates 37% (13/35), AFTER chunk-gate gates 9% (3/35)**.
+> The over-gating magnitude is confirmed; the fix (a granularity-matched gate)
+> is correct regardless of bias direction. **Direction correction 2026-08-29:**
+> the survivor-mean numbers (0.632 traj-gated vs 0.579 chunk-gated) were
+> originally reported as "traj-gate optimistically biased, per P10b" — that
+> inherited P10b's un-checked sign claim. Checked directly:
+> `corr(latent_disp, umf_c0) = +0.398` on this sample, the opposite sign from
+> P10b's assumption, so the traj-gate's *extra* drops (mean umf 0.461, below
+> the 0.553 overall mean) *raise* the survivor mean, not lower it — the
+> observed 0.632 > 0.579 is real but is not evidence of "optimistic" bias in
+> the P10b sense. See `phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md`.
 
 **The defect.** §4.4 added T=`nas` sliding-window UMF so the reported number is comparable to
 τ ≈ 0.262. But `evaluate_e0_chart` passes the **trajectory-scale** `motion_gate` into those window

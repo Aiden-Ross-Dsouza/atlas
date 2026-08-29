@@ -2679,6 +2679,221 @@ Modal smoke, exercised the new code paths with mocked `umf`/`rollout_umf`/
 `_open_loop_rollout` on sliced windows, `dump_regime_chunks` `rollout_umf` on a
 real pristine predictor, the collector loop itself.
 
+**V3-9 SMOKE — first real end-to-end run, 2026-08-29, pandereshubham Modal.**
+App `ap-P1QFg3vMEbLgYx5TJdXaAb`, `p0g_collect_entry --regime R2 --num-trajs 5
+--num-val-trajs 2 --num-test-trajs 2 --collect-only`. Full record:
+`phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md` (+ raw `trajs_R2.pt`, `chunks_R2.jsonl`,
+`e0_seed_manifest.json` archived there). **PASS end-to-end**, exit 0.
+- Two launch bugs found + fixed first: (a) `modal run` on Windows dies on a `✓`
+  in modal's own output → `PYTHONUTF8=1`; (b) `modal_phase0.py` imports
+  `_p0g_spec` at module load but on Modal the entrypoint is at `/root/`, so
+  `REPO_ROOT/"scripts"` → `/scripts` (missing) → `ModuleNotFoundError` crash-loop.
+  Fixed: `_p0g_spec` moved to its own dep-free module `scripts/_p0g_spec.py`
+  (modal_phase0 + the test both import it); sys.path fallback to `/src/scripts`;
+  `image.add_local_file(_p0g_spec.py → /root/)`. (The add_local_file sits before
+  run_commands so it re-triggers the torch layer build — move it after
+  run_commands in a follow-up; the sys.path fallback alone would suffice.)
+- **Verified live:** §3.4 single-regime; §3.2 `chunk=1/6` (traj_len 30); §3.1
+  nas=2 → 3 CEM searches/traj, **150.6 s/traj** (= §7-C-2's "≈135 s roughly
+  doubles" estimate, so the 6 h collect timeout holds with ~1.15 h margin at
+  116 trajs/regime); §2.1 `trajs_R2.pt` 25 MB/7 trajs (→ ~385 MB/regime fp32,
+  under the 600 MB estimate), `chunks_R2.jsonl` 35 rows; §2.2 `--collect-only`
+  clean exit; §3.3 test split present; §7-B1 `collect_cem "300x10 nas=2"` matches
+  `_P0G_DEFAULTS`; P12 label + `n_contacts` in manifest ([6,1,5,13,2] train,
+  **7/7 with contact** — no §15-2 collapse); P18 real `episode_idx`/`offset`
+  (not null); P19 no seed clash; P20 `git_commit` real (not "unknown").
+- **§7-B2 REAL-DATA falsification (now runnable off `trajs_R2.pt`):**
+  `motion_gate` (T=6) = **244.18**, `chunk_motion_gate` (T=2) = **142.34**.
+  Applied to the 35 real T=2 windows: BEFORE (traj-gate 244) gates **13/35 =
+  37 %**; AFTER (chunk-gate 142) gates **3/35 = 9 %**. **§7-B2's over-gating
+  claim is confirmed on real data** (milder than the synthetic 100% — real R2
+  latents have a motion floor — but a real ~4× over-gating); the fix (a
+  granularity-matched gate) is correct on that basis alone.
+- **Bonus:** `umf_c0` on R2 T=2 on-policy chunks under frozen c₀ = median 0.568
+  (min 0.086, max 0.945) — well above τ≈0.262; this is the on-policy chunk set
+  P0-A/P0-D re-derivation is owed (§5 deviation-note-1), now persisted.
+- NOT run: `p0g_finetune` on a real container, R0 collection, §4.1/§4.4/§4.5,
+  full P0-G (needs launch approval).
+
+**⚠️ CORRECTION, same day, caught by external review (not by this session).**
+The paragraph above originally also reported survivor mean `umf_c0` 0.632
+(traj-gate) vs 0.579 (chunk-gate) as "traj-gate optimistically biased, per
+P10b" — asserting P10b's directional-bias claim as confirmed. **That claim was
+never checked and was wrong.** Checked directly on the 35 real chunks:
+`corr(latent_disp, umf_c0) = +0.398` — the opposite sign from what P10b assumes
+(low displacement -> small denominator -> large UMF -> gating is "optimistic").
+The traj-gate's 10 *extra* drops (beyond the chunk-gate) have mean UMF 0.461,
+*below* the 0.553 overall mean — removing them raises the survivor mean, which
+is the observed 0.632 > 0.579, but is not evidence of P10b's mechanism. This is
+exactly the pattern `CLAUDE.md` §1.9 exists to catch: a plausible, unverified
+claim stated as a finding, then propagated. **Fixed at every copy**:
+`research_audit/P0G_REVIEW.md` P10b row rewritten to stop asserting a sign;
+`research_audit/P0G_FIX_PLAN.md` §4.4 item 3 and §7-B2's STATUS box corrected;
+`phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md` §7-B2 corrected in place with the
+retraction kept visible (not silently removed); `scripts/run_e0.py`'s
+`evaluate_e0_chart` docstring no longer asserts a gating-bias direction. The
+over-gating magnitude claim (37% vs 9%, ~4×) is unaffected and stands.
+
+### V3-10 — post-smoke: correction + two new reporting features (2026-08-29)
+
+Three user-directed items after the smoke, none gating launch.
+
+**1. Direction-error correction (covered above, restated for the FIXLOG index):**
+P10b's directional-bias claim (`P0G_REVIEW.md`, `P0G_FIX_PLAN.md` §4.4/§7-B2,
+`phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md`, `scripts/run_e0.py` docstring) was
+never checked and was backwards on real data (`corr(latent_disp, umf_c0) =
++0.398` on the smoke's 35 R2 chunks, not the assumed negative correlation).
+Fixed at every copy; the over-gating magnitude claim (37% vs 9%) is unaffected.
+
+**2. `report_block_static_fraction()` (`run_e0.py`).** Reports, per split
+(train/val/test) and combined, what fraction of collected trajectories have
+whole-trajectory block pixel displacement < `BLOCK_STATIC_PX=1.0` (matches
+`phase0_measure.py`'s existing convention). Pure reporting — filters nothing.
+Writes `block_static_{regime}.json`, wired into `main()` right after
+`dump_regime_chunks` (closed_loop only).
+- FALSIFICATION (RAN, real data — the smoke's downloaded `trajs_R2.pt`, not
+  synthetic): all 9 collected trajectories (5 train/2 val/2 test) reported
+  correctly, `frac_traj_static = 0/9 = 0.0` per split and combined. No-block_pose
+  input (other collector sources) → `SKIPPED`, returns `None`, no crash —
+  verified directly.
+- **Answer to Part 3 Q8, at this smoke's n:** 0% dead at n=9 — not evidence the
+  true rate is 0; n=2 val trajectories can't bound a rare event. The real number
+  is owed from the full run.
+
+**3. `derive_and_report_motion_gate()` (`run_e0.py`).** Derives v3 §6.6's P95
+gate from block-static T=nas chunks in the full `chunks_{regime}.jsonl` dump,
+reports it alongside the retired 10th-pct value and each rule's REALISED
+false-pass rate (fraction of block-static chunks that still clear the gate —
+scored informative despite no real block motion). Writes
+`gate_calibration_{regime}.json`. **Does NOT adopt either value** — `CLAUDE.md`
+§15-5 already requires human sign-off for the motion gate; this only supplies
+real evidence for it. Wired into `main()` right after the traj-scale
+`motion_gate` is computed (closed_loop only); gracefully skips + returns `None`
+if the chunks file is missing (e.g. a `--load-trajs`-only fine-tune run pointed
+at a different `--out`).
+- FALSIFICATION (RAN, real data — smoke's `chunks_R2.jsonl`, n=35): 5/35 = 14%
+  block-static chunks; 10pct gate (244.2) has **0%** false-pass; P95-static gate
+  (**163.4**) has **20%** false-pass. Missing-file case → `SKIPPED`, `None`, no
+  crash — verified directly. Full table + framing:
+  `phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md`. **Not adopted; awaiting sign-off.**
+
+Both functions were unit-verified against the smoke's real persisted data
+(downloaded artifacts, not run inside a fresh Modal container) — the ordering
+bug this surfaced (an earlier draft called `derive_and_report_motion_gate`
+before `motion_gate` was computed, a `NameError`) was caught and fixed before
+any Modal spend.
+
+### V3-11 — two follow-up smokes, 2026-08-29: R0 collect-only + p0g_finetune
+
+Both PASS end-to-end, pandereshubham. Full record in
+`phase0_v3/p0g_smoke_v3/SMOKE_RESULTS.md`.
+- **R0 collect-only** (`ap-bzGgUwbAKF9jO2edv6S0Ds`): same shape as the R2 smoke,
+  150–156 s/traj, all P9/P12/P18/P19/P20 artifacts written correctly.
+- **`p0g_finetune` smoke** (`ap-QzmFlnbtuGAMgJsS23a4gL`, `--load-trajs` the
+  already-collected R2 trajs, matching counts so the §7-B1 guard matches): PASS.
+  §7-B1 now proven live (not just by the unit test). **~0.55 s/gradient step**
+  at 5 train trajectories. `evaluate_e0_chart`'s new `chunk_motion_gate` path ran
+  cleanly end-to-end for the first time (`eval_umf_source: "test"`, UMF 0.459).
+- **R0-vs-R2 contact comparison (§15-2), n=9/regime — first on-policy look:**
+  R0 mean 16.3 contacts/traj (1/9 zero), R2 mean 6.7 (0/9 zero). Real ~2.4×
+  reduction under R2, NOT a collapse to zero. n too small to be decisive; the
+  shape of the check the full run settles.
+- τ/σ_r illustrative-only candidates from n=35 R0 chunks: P95=0.471, IQR=0.110
+  — not comparable to the real τ=0.262 measurement's n, not adopted.
+
+### V3-12 — P0-G sharding (user request 2026-08-29): parallel collection across N Modal containers
+
+Mirrors the existing, already-proven pattern in `modal/modal_e0_planning.py`
+(`--num-shards`, `.spawn()`, `merge_shards()`) — that pattern is for the
+planning/eval side; this wires the equivalent for P0-G's collection side,
+which has the identical shape (a sequential per-trajectory CEM loop, not
+GPU-flop-bound, so N containers in parallel beats one for N× as long, same
+total cost).
+
+**Changes:**
+- `scripts/run_e0.py::load_regime_trajectories`: new `traj_idx_offset: int = 0`
+  param — `seed = seed_base + (traj_idx + traj_idx_offset) * max_tries +
+  attempt`. Default 0 is byte-identical to the old formula (verified: no
+  existing call site passes it, so nothing changes for unsharded runs).
+- New CLI flags `--collect-traj-offset` (threaded only into the TRAIN
+  `load_regime_trajectories` call) and `--collect-skip-val-test` (skips val/test
+  entirely — they're cheap and not worth splitting; exactly one shard should
+  collect them).
+- Factored `compute_motion_gates(train_trajectories, nas)` out of `main()`
+  (previously inline) so the merge step can recompute both gates on the
+  MERGED set — a per-shard gate is calibrated on that shard's own subset, not
+  the requested total, and must not be reported as if it were.
+- New `scripts/merge_p0g_shards.py`: concatenates shards' `trajs_{regime}.pt`
+  (train), takes val/test from whichever shard collected them, concatenates
+  `chunks_{regime}.jsonl` and the seed manifest's train rows, rejects on
+  overlapping seeds or a protocol mismatch (any guard field disagreeing except
+  `num_train_trajs`), and recomputes `compute_motion_gates` +
+  `report_block_static_fraction` + `derive_and_report_motion_gate` on the
+  merged data.
+- `modal/modal_phase0.py`: `p0g_collect` gained `traj_offset`/`skip_val_test`
+  params; new `merge_p0g_shards` Modal function (runs the merge script inside
+  a volume-mounted container, no local download, mirrors
+  `modal_e0_planning.py::merge_shards`); new entrypoint `p0g-collect-sharded`
+  (`--num-shards`, same divmod bounds-splitting + `.spawn()`/`.get()` pattern
+  as `modal_e0_planning.py::main`).
+
+**FALSIFICATION (RAN, real data — no synthetic substitute needed here):**
+- Bounds arithmetic: `divmod`-based split verified for (100,4)→[(0,25),(25,25),
+  (50,25),(75,25)] (matches the "4 containers, 25 each" the user remembered),
+  plus (5,2), (8,3), (1,4) — every case sums exactly to `num_trajs`, no
+  gaps/overlaps.
+- Merge script exercised on the REAL smoke `trajs_R2.pt`/`chunks_R2.jsonl`
+  (not synthetic), split into two genuinely disjoint shards (train[0:2] +
+  train[2:5], real distinct seeds 1000/1002 vs 1004/1006/1008): **PASS** —
+  merged train=5 (all 5 real seeds, sorted), val=2, test=2, chunks=35 rows,
+  recomputed `motion_gate=244.18`/`chunk_motion_gate=142.34` **exactly matching**
+  the values independently computed on the unsplit data earlier this session.
+- BEFORE/AFTER on a real bug found while testing: the merge script's final
+  success print used a `✅` emoji, crashing with `UnicodeEncodeError` on the
+  Windows console (same class of bug as the earlier `modal run` launch
+  failure) — exit 1 despite a fully correct merge. **AFTER** (emoji removed):
+  exit 0, clean.
+- Deliberately-broken-input tests (§1.1): two shards with an overlapping seed
+  (1004 in both) → `ValueError: Overlapping seeds across shards: [1004]`,
+  correctly rejected. Two shards with a mismatched `collect_cem` field
+  (protocol drift) → `ValueError: Shard protocol mismatch`, correctly rejected.
+
+**RUN on real Modal (2026-08-29, pandereshubham): `p0g-collect-sharded --regime
+R2 --num-trajs 8 --num-shards 2 --num-val-trajs 2 --num-test-trajs 2`.** Both
+shards collected correctly and concurrently (confirmed 2 tasks running at once)
+— shard0 (4 train + 2 val + 2 test) and shard1 (4 train, `--collect-skip-val-test`
+correctly applied). **The merge step failed on first run — a real bug, caught
+exactly as intended:**
+
+**Bug found:** `merge_p0g_shards` (the Modal function) runs on a plain CPU
+container (no `gpu=` — correct, it does no GPU work) but `torch.load(p,
+weights_only=False)` on trajectory tensors saved from the GPU collection
+containers raises `RuntimeError: Attempting to deserialize object on a CUDA
+device but torch.cuda.is_available() is False`. My earlier local falsification
+of the merge script (previous FIXLOG entry) did NOT catch this because the
+local test machine has a physical GPU (RTX 4050) — `torch.cuda.is_available()`
+is True there, masking the exact failure mode the real CPU-only Modal
+container hits.
+- BEFORE (RAN, reproduced locally): `torch.cuda.is_available = lambda: False`
+  (simulating the real container) + `torch.load(..., weights_only=False)` on
+  the real smoke's `trajs_R2.pt` → the identical `RuntimeError`, verbatim.
+- FIX: `map_location="cpu"` added to the one `torch.load` call in
+  `scripts/merge_p0g_shards.py` (merge is pure concatenation + light stats,
+  never needs GPU tensors).
+- AFTER (RAN, same simulated condition): succeeds, `len(train)=5`. Full merge
+  falsification suite (clean merge, overlap rejection, protocol-mismatch
+  rejection) re-run under the simulated condition: all still correct.
+- **Then re-verified on the REAL Modal CPU container** (new local_entrypoint
+  `p0g-merge-shards`, added because `merge_p0g_shards`'s `list[str]` param
+  isn't parseable directly from the Modal CLI — re-ran merge-only on the
+  already-collected shard data, no re-collection needed): **succeeded**,
+  `ap-0KEKhYNoBX4NK8KJoiTKsW`. Merged 8 train (seeds 1000–1014, all unique) /
+  2 val / 2 test / 50 chunk rows; gates recomputed cleanly
+  (`motion_gate=276.2`, `chunk_motion_gate=141.9`, `P95-static=162.1`).
+
+**The full sharded pipeline (parallel collect -> merge) is now proven
+end-to-end on real Modal infrastructure**, not just unit-tested locally.
+
 ### New Phase-0 diagnostic scripts (not experiment code)
 
 `scripts/phase0_measure.py`, `scripts/phase0_g7_groupA.py`,
