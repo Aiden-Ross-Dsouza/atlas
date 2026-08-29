@@ -25,8 +25,8 @@ conflicts.
 |---|---|---:|---|
 | 0 Setup | — | $0 | **DONE** 2026-08-27 |
 | 1 Tier A — Stage 1 (code) | `atlas-fixer` | $0 | **DONE** 2026-08-27, see `FIXLOG.md` |
-| 1 Tier A — Stage 2 (re-runs) | `atlas-fixer` | ~$3.20 | not started |
-| 2 Gates + unfinished audit | `atlas-process-auditor` | $0 | in progress |
+| 1 Tier A — Stage 2 (re-runs) | `atlas-fixer` + orchestrator | ~$0 (ran locally, no Modal needed — see `FIXLOG.md`) | **DONE** 2026-08-28 — E2 re-run (A1+A2+A3, incl. all three `*_posthysteresis` variants and a genuinely new, isolated q=3 measurement — the first pass's substitution of `e2_R2` for "new q=3 run" was caught and corrected) and A4 re-score both done; A9 retrain done (reproduces: new `val_umf` 0.3335 vs. old 0.3357 within noise — but surfaced a previously unmeasured, worse `eval_umf`=0.4125 on the disjoint test split, disclosed alongside the old number, not substituted for it). All 11 result dirs renamed `atlas_out/*_phase1stage2_2026-08-28` for unambiguous phase attribution. Dated supersede banners added to `ATLAS_SUMMARY.md`/`E0_RESULTS.md`/`E2_RESULTS.md`; full trail in `FIXLOG.md`. `EVIDENCE_LEDGER.md` bookkeeping still outstanding. Also discovered, not fixed: `expand.py::_fit_candidate`'s chart-commit decision is non-deterministic run-to-run — confirmed root cause is unseeded CUDA gradient descent (dropout ruled out directly), logged in `FIXLOG.md`, no FIX_SPEC entry yet |
+| 2 Gates + unfinished audit | `atlas-process-auditor` | $0 | **DONE** 2026-08-28 — G1-G6 rewritten/verified (G2 and G5 independently re-confirmed to fail on deliberately broken input, not just on the agent's report); D1-D4/D10 done; see `FIXLOG.md`, `RED_FLAG_SWEEP.md`, `E0_DIRECTORY_INVENTORY.md`. Known open item: `gate_g3a` is flaky/order-dependent when run after G1/G2 in `--all` — pre-existing, logged not fixed |
 | 3 E4/continual fixes | `atlas-fixer` | ~$0.50 | not started |
 | 4 Defence experiments | `atlas-runner` / `atlas-analyst` | ~$31 | not started |
 | 5 Continual stream | `atlas-runner` | ~$19 | not started |
@@ -34,11 +34,11 @@ conflicts.
 
 ## Recommended order
 
-Phase 1 Stage 1 (done) → **Phase 3** → Phase 1 Stage 2 → Phase 2 remainder →
+Phase 1 Stage 1 (done) → Phase 1 Stage 2 (done) → Phase 2 (done) → **Phase 3** →
 Phase 4 → Phase 5 → Phase 6.
 
-Phase 3 is moved up because its Step 0 is a go/no-go measurement that could change
-Phase 5's entire design — better to learn that before spending Stage 2's budget.
+Phase 3 is next: it unblocks Phase 5 and its Step 0 is a cheap go/no-go
+measurement that could change Phase 5's entire design.
 
 ---
 

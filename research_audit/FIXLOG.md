@@ -1904,6 +1904,788 @@ touched, only additional runs.
   `results.json`/manifest inspection (both pasted in full to the user, not
   summarised).
 
+### Phase 4 — E-A / E-C code prerequisites (code-only, no runs), 2026-08-28
+
+Both items below are **code prerequisites only**, dispatched ahead of the
+actual E-A/E-C experiment runs (`SUBMISSION_PLAN.md` Part C, ~$6 and ~$9
+respectively). No GPU job beyond `--help`/syntax-check was run. Both new
+flags default OFF/matched such that omitting them reproduces prior behavior
+exactly; this was not independently re-verified by a full before/after run
+(see "Re-run needed" below) because doing so would itself be the (out of
+scope, not-yet-authorised) experiment run.
+
+### E-A — `--save-latents` on `scripts/diagnose_cem_costs.py`
+
+- **Date:** 2026-08-28.
+- **Defect:** `scripts/diagnose_cem_costs.py::rollout_true_outcomes` (previously
+  lines 98-124) rolls every CEM candidate out for real but only ever saved
+  the scalar cost and true final distance — never the encoder outputs needed
+  to later compute UMF against the planner's own query distribution
+  (`SUBMISSION_PLAN.md` Part C, E-A).
+- **Change:** Added `from atlas.score import rollout_umf` (import only,
+  `atlas/score.py` untouched). Added a new function
+  `rollout_true_outcomes_and_umf()` (`scripts/diagnose_cem_costs.py`, after
+  the original `rollout_true_outcomes`) that performs the identical real
+  rollout but additionally encodes the real visual/proprio observed at every
+  model-chunk boundary (matching `run_e0.py::load_regime_trajectories`'s
+  subsampling convention) and calls `atlas.score.rollout_umf` (not `umf()`,
+  since the kind's chart, if any, is already applied to `wm.predictor` for
+  the whole per-kind block by `main()` — matches `rollout_umf`'s
+  already-applied-predictor contract) to get a per-candidate UMF value.
+  Added `--save-latents` (`store_true`, default off). When set, `main()`
+  calls the new function instead of the original and stores the result under
+  three NEW keys in `results[kind]`: `umf_per_candidate` (list, `None` for
+  any motion-gated candidate), `umf_mean`, `umf_n_gated`. **Scope decision,
+  not a bug:** raw per-candidate encoder-output latents themselves are NOT
+  persisted (300 candidates x 7 frames x 256 x 384 floats per seed per kind
+  is ~800MB and does not fit this script's existing per-seed
+  JSON/incremental-jsonl format) — per the dispatch spec's own "or
+  equivalently the raw prediction error" alternative, only the resulting
+  scalar UMF is saved. A downstream fitting step (E-A's "fit `ln_act` with
+  the existing `run_e0_finetune` loss") needs the raw transitions and would
+  reuse `run_e0.py`'s own trajectory-collection path, not this function —
+  flagged inline in the new function's docstring for whoever runs E-A next.
+  The original `rollout_true_outcomes` function is completely untouched;
+  `main()`'s `else` branch (flag unset) calls it exactly as before, with the
+  same arguments, so default output is unaffected by this change.
+- **Claims affected:** E-A (`SUBMISSION_PLAN.md` Part C) — no claim ID
+  assigned yet (experiment not yet run); will map to a new N-id once E-A
+  actually runs and produces a `cost_ranking_*` file with `--save-latents`.
+- **Re-run needed:** yes, but explicitly NOT launched by this dispatch (out
+  of scope per the dispatching instructions — code-only task). The actual
+  E-A collection (~30 seeds x 300 candidates under R2) is unauthorized GPU
+  spend until a future session/user explicitly approves it.
+- **Verification:** `python -c "import ast; ast.parse(...)"` on the file —
+  passed (`SYNTAX_OK`). `.venv/Scripts/python.exe scripts/diagnose_cem_costs.py
+  --help` — ran to completion, printed full usage including the new
+  `--save-latents` flag and its help text (pasted in full in this session's
+  report). No before/after functional assertion was run (per rule 3, an
+  assertion needs runnable steps; `--help`/parse-only is the maximum allowed
+  under this dispatch's explicit "do NOT launch a real collection run"
+  instruction — the correctness of `rollout_umf`'s output on real candidates
+  is unverified until E-A actually runs).
+- **Verified by:** this session, direct command output (pasted, not
+  summarised).
+
+### E-C — `--collect-num-act-stepped` on `scripts/run_e0.py`
+
+- **Date:** 2026-08-28.
+- **Defect:** `scripts/run_e0.py`'s `closed_loop` collector hardcoded
+  `num_act_stepped=1` with no flag (previously line 622) and defaulted
+  `--collect-num-samples`/`--collect-iterations` to 100x10 (previously lines
+  540/547) against an eval-side budget of 300x30 (`run_e0_planning.py`'s own
+  `--num-samples`/`--iterations` defaults) — a 9x search-budget gap between
+  collection and evaluation (`SUBMISSION_PLAN.md` Part C, E-C).
+- **Change:** `scripts/run_e0.py` — changed `--collect-num-samples` default
+  100→300 and `--collect-iterations` default 10→30 (both flags already
+  existed; only their defaults changed, matching `run_e0_planning.py`'s own
+  `--num-samples`/`--iterations` defaults exactly, read from that file rather
+  than guessed). Added a new flag `--collect-num-act-stepped` (default 6,
+  matching `run_e0_planning.py`'s own `--num-act-stepped` default exactly)
+  and threaded it into the `GC_Agent`/`build_cfg` call that previously
+  hardcoded `num_act_stepped=1`. Updated the adjacent print statement and
+  code comments accordingly.
+  **Important caveat discovered while wiring this (documented, not
+  "fixed" — out of this dispatch's scope):** the `closed_loop` collection
+  loop in `load_regime_trajectories()` (`scripts/run_e0.py`, the
+  `elif source == "closed_loop":` branch) unconditionally replans every
+  single model chunk (`for chunk_idx in range(n_chunks): ... agent.act(...)`)
+  and always executes only the first `frameskip` raw actions of whatever the
+  planner returns (`act_chunk[:frameskip]`), and CEM's internal
+  `plan_length = min(horizon, steps_left)` does not depend on
+  `num_act_stepped` at all (`CEMPlanner.plan`,
+  `hub/hub/facebookresearch_jepa-wms_main/evals/simu_env_planning/planning/planning/planner.py:272-276,333`).
+  So `--collect-num-act-stepped`, as now wired, changes only how many
+  already-planned actions `CEMPlanner.plan()` *returns*
+  (`actions[:self.num_act_stepped]`) — all but the first `frameskip` of
+  which `run_e0.py`'s loop discards unused — and does **not** change the
+  collector's actual replan cadence or the resulting trajectory at all.
+  `SUBMISSION_PLAN.md`'s C-2 table's "Replans/episode: 6" for collection is
+  produced by this loop's own unconditional per-chunk structure, not by
+  `num_act_stepped=1`. This means: (a) the dispatch's literal instruction —
+  default `--collect-num-act-stepped` to the eval default (6) — was followed
+  exactly, but (b) that default value functionally has **no effect** on
+  collection behavior given the current loop structure, so it does not by
+  itself close the "two opposite extremes of replan frequency" mismatch
+  `SUBMISSION_PLAN.md` describes for E-C; only the 300x30 budget-match
+  actually changes collection behavior. Left as documented, not fixed —
+  changing the loop's execution logic (e.g. to actually consume more than
+  `frameskip` actions per replan when `num_act_stepped>1`) would be a
+  behavioral redesign beyond "thread a flag through, remove the hardcode,"
+  which is all this dispatch authorized.
+- **Claims affected:** E-C, N5/`closed_loop` numbers (`SUBMISSION_PLAN.md`
+  Part C) — no new claim ID yet (experiment not yet re-run).
+- **Re-run needed:** yes, explicitly NOT launched by this dispatch. Given the
+  caveat above, whoever runs E-C next should re-read this entry before
+  assuming `--collect-num-act-stepped`'s default value does anything to
+  collection behavior beyond changing `GC_Agent`'s returned-action-tensor
+  size.
+- **Verification:** `python -c "import ast; ast.parse(...)"` — passed
+  (`SYNTAX_OK`). `.venv/Scripts/python.exe scripts/run_e0.py --help` — ran to
+  completion (required `import atlas` to resolve, confirmed via
+  `PYTHONPATH=.`), printed full usage including
+  `--collect-num-samples`/`--collect-iterations`/`--collect-num-act-stepped`
+  with their updated help text (pasted in full in this session's report). No
+  functional before/after run — out of scope per this dispatch.
+- **Verified by:** this session, direct command output (pasted, not
+  summarised).
+
+### Orchestrator correction — `--collect-num-act-stepped` default was wrong, 2026-08-28
+
+- **Defect:** the E-C dispatch above followed its own literal instruction
+  (default `--collect-num-act-stepped` to the eval-side value, 6) — but that
+  instruction was a mis-transcription of `SUBMISSION_PLAN.md`'s actual E-C
+  spec on the orchestrating session's part, not a considered design
+  decision. `SUBMISSION_PLAN.md` Part C (E-C) and `research_audit/PHASE_PROMPTS.md`
+  Step 4e are both explicit: re-collect at the eval-matched 300x30
+  sample/iteration budget while **keeping nas=1**, so that replan frequency
+  remains the *one* deliberate collection/eval mismatch left standing —
+  exactly the axis E-D (Step 4d) is designed to measure separately. A
+  default of 6 would silently remove that one remaining controlled
+  difference before E-D ever runs.
+- **Fix:** `scripts/run_e0.py`'s `--collect-num-act-stepped` default changed
+  6 → 1. Help text updated to state the spec's intent explicitly and warn
+  against overriding it for the E-C re-collection. The flag itself (not a
+  hardcode) is unchanged from the prior entry — only its default value and
+  documentation changed. The prior entry's finding that this flag has **no
+  effect on collector behavior at any value**, given the current
+  `load_regime_trajectories()` loop structure, still stands and is
+  unaffected by this correction — it was never contingent on which default
+  was chosen.
+- **Claims affected:** E-C, N5/`closed_loop` (same as prior entry) — same
+  "no claim ID yet, experiment not yet run" status.
+- **Re-run needed:** yes, still not launched.
+- **Verification:** `python -c "import ast; ast.parse(open('scripts/run_e0.py', encoding='utf-8').read())"` → `SYNTAX_OK`.
+- **Verified by:** orchestrating session, direct diff read of the
+  `atlas-fixer` dispatch's actual change against `SUBMISSION_PLAN.md`'s own
+  text (not the dispatch's self-report) — caught the mis-default before any
+  experiment consumed it.
+
+---
+
+### COHERENCE_AUDIT_2 write-up + tooling pass (docs / standalone-tooling only), 2026-08-28
+
+Scope: the four items `COHERENCE_AUDIT_2.md` (PART 1) flags as write-up /
+tooling defects that v3's `IMPLEMENTATION_PLAN_V3.md` deliberately leaves out
+of the experimental plan. **No file under `atlas/`, no `scripts/run_*.py`, no
+`configs/atlas/*` touched. No experiment re-run, no number in `atlas_out/`
+changed.**
+
+#### CA2-1 — S-dyn mislabelled as an "appearance-based" baseline
+
+- **Date:** 2026-08-28
+- **Defect:** `Paper_Draft/ATLAS_INITIAL_DRAFT.tex` (abstract, contributions
+  bullet 2, §Experimental Setup, §Results 4.1, §Conclusion), `PAPER_DRAFT.md`
+  (abstract L27, contributions L45), `ATLAS_SUMMARY.md` (§4.5 intro + table
+  row + two later mentions), `research_audit/PAPER_DRAFT_NOTES.md` (§0 table,
+  §4 heading + body, §6 draft abstract), `E2_RESULTS.md` (Headline L180) all
+  describe S-dyn as "appearance-based" / "appearance-derived dynamics
+  fingerprint" / "similarity to what the scene looks like" / "input
+  similarity alone". `atlas/router.py::_sdyn_score` (read, not modified)
+  computes `-cos_sim(z1_obs - z0, z1_hat - z0)` — negative cosine between the
+  observed and the chart-predicted **first latent step** of the open-loop
+  rollout. It is a one-step, direction-only, unnormalised variant of the same
+  prediction signal UMF uses; it sees the scene only through the frozen DINO
+  encoder, exactly as UMF does. The proposal's actual appearance-similarity
+  router is **S-obs**, deferred to supplementary and never implemented
+  (`grep` confirms no `_sobs` / `sobs` in `atlas/`).
+- **Change:** every "appearance"/"input-similarity" description of S-dyn
+  replaced with its true mechanism ("a one-step latent-direction / latent-delta
+  cosine baseline"). The headline contrast is reframed throughout as
+  *multi-step normalised prediction error (UMF)* vs. *one-step direction
+  cosine (S-dyn)*, **not** "predictive fitness vs. appearance routing". Where
+  a doc contrasted "dynamics shift vs. appearance shift" specifically about
+  the **darkening-corruption expansion diagnostic** (a genuine appearance
+  shift), that wording was left intact — it is correct there.
+- **Files:** `Paper_Draft/ATLAS_INITIAL_DRAFT.tex:23,34,57,66,138`;
+  `PAPER_DRAFT.md:27,45`; `ATLAS_SUMMARY.md:377-387,398-399,453-454`;
+  `research_audit/PAPER_DRAFT_NOTES.md:22,78,80,126`; `E2_RESULTS.md:180`.
+  `CLAUDE.md` checked — it names "S-dyn" and "S-obs router" but never calls
+  S-dyn appearance-based, so no edit needed. `research_audit/EVIDENCE_LEDGER.md`
+  N6/N9 checked — not mislabelled (N9's "appearance shift" = the darkening
+  diagnostic), no edit.
+- **Claims affected:** C-1, N6 (framing only — no number changed). Already
+  flagged by `PAPER_FACT_CHECK.md` A6, `REDTEAM.md` N6 Attack 2,
+  `COHERENCE_AUDIT_2.md` Agent 2 H1 / Agent 3 HIGH-2 / Agent 5 M1.
+- **Re-run needed:** no.
+- **Verification:** `grep -rn "appearance-based|appearance-derived|appearance-similarity|scene looks like|input similarity" Paper_Draft/ ATLAS_INITIAL_DRAFT.tex PAPER_DRAFT.md ATLAS_SUMMARY.md research_audit/PAPER_DRAFT_NOTES.md E2_RESULTS.md` → only remaining hits are about the darkening corruption (genuine appearance shift) or S-obs, none about S-dyn.
+- **Verified by:** this session, direct grep + read of `atlas/router.py:170-198`.
+
+#### CA2-2 — MBCD venue: ICML 2021 → AAMAS 2021
+
+- **Date:** 2026-08-28
+- **Defect:** `ATLAS_proposal_v7.md:56` — "MBCD (ICML 2021)". Alegre, Bazzan
+  & da Silva, *Minimum-Delay Adaptation in Non-Stationary Reinforcement
+  Learning via Online High-Confidence Change-Point Detection*
+  (arXiv:2105.09452) was published at **AAMAS 2021** (Proc. 20th Int. Conf.
+  on Autonomous Agents and Multiagent Systems). Confirmed via web search
+  (arXiv page, the authors' own `people.cs.umass.edu` copy, the `mbcd`
+  GitHub repo). A LatinX-in-AI @ ICML 2021 workshop version also exists,
+  which likely seeded the error; the archival venue is AAMAS.
+- **Change:** `ATLAS_proposal_v7.md:56` "ICML 2021" → "AAMAS 2021". The
+  proposal's other three MBCD mentions (`:115`, `:123`, `:319` References)
+  already say AAMAS 2021 — this was the last inconsistent one. `PAPER_DRAFT.md:58`
+  already says "Alegre et al. 2021, AAMAS". `Paper_Draft/references.bib` does
+  not cite MBCD (no bib entry, no `\cite`). No other file cites a venue for
+  it.
+- **Claims affected:** C1-novelty (Related Work accuracy). Flagged by
+  `LITERATURE_AUDIT.md` §3/§10, `PAPER_DRAFT_NOTES.md` §5c, `NEXT_ACTIONS.md`,
+  `COHERENCE_AUDIT_2.md` Agent 4.
+- **Re-run needed:** no.
+- **Verification:** `grep -rn "MBCD" *.md Paper_Draft/` → every surviving
+  venue mention now reads AAMAS 2021.
+- **Verified by:** this session, web search + grep.
+
+#### CA2-3 — `scripts/make_tables.py` T5 renders a garbage table from superseded input
+
+- **Date:** 2026-08-28
+- **Defect:** `atlas_out/e0/T5.md` and its copy in
+  `atlas_out/e0_a4_rescore_phase1stage2_2026-08-28/T5.md` show
+  `Params = 26/12/69`, `Eval UMF = 0.67/1.30/1.67` — matching
+  `atlas_out/e0/results.json` (a pre-A11 / pre-rollout-fix file whose
+  `params` field records parameter-*group* counts, per "Deliberately NOT
+  fixed" below) but **not** the corrected sibling `results.json` in the
+  rescore dir (params `10764/10292640/20800884`, eval_umf `0.947/0.703/0.870`).
+  Root cause is two latent `make_t5` defects, not the metric:
+  1. `main()` defaults `--e0-dir` to `atlas_out/e0` — a directory the D4
+     inventory marks SUPERSEDED. `make_tables.py --all` (or bare `--table T5`)
+     silently regenerates the garbage table from it with no warning; the
+     rescore-dir copy is a manual `cp` of that output (its mtime, 03:27,
+     predates the rescore `results.json`'s 03:57).
+  2. `make_t5` resolves the frozen-model reference UMF (for the `ΔUMF` and
+     `% of full` columns — the pre-registered capacity metric) only by
+     looking for a `c0`/`baseline`/`frozen`/`identity` **key inside
+     `kinds`**. `run_e0.py` writes `results[regime]` as `{ln_act, lora4,
+     full}` with no such key (confirmed at `run_e0.py:778,851`), so those two
+     columns were structurally always `—`.
+- **Change (`scripts/make_tables.py`, standalone table generator — not a
+  `run_*.py`):**
+  - New `_t5_resolve_baseline_umf()` — resolves the frozen UMF from, in
+    order: a regime-level scalar key (`baseline_umf`/`frozen_umf`/`c0_umf`),
+    a `c0`/`baseline`/`frozen`/`identity` per-kind row (unchanged path), or
+    `{e0_dir}/frozen_baseline.json`. E0′ (§8.1: "frozen c₀ vs. ln_act" arm)
+    can now feed `ΔUMF` / `% of full` by any of these.
+  - Guard: if any non-baseline kind has a positive integer trainable-param
+    count `< 1000` (`_T5_MIN_PLAUSIBLE_PARAMS` — smaller than `ln_act`'s
+    ~10.7k), `make_t5` **raises `ValueError`** naming the file as
+    superseded/pre-A11, instead of rendering it. `--all` passes
+    `strict=False` → prints `[skip] …` and continues (doesn't abort the
+    other tables); explicit `--table T5` raises.
+  - Baseline / scalar rows are now skipped when emitting adapter rows (no
+    self-referential `c0` row with `ΔUMF +0.0000`).
+  - T5.md now carries a `_Source: <path> (mtime …)_` provenance line so a
+    stale table is self-identifying.
+  - `_print_markdown_table` gained an optional `note=` param (back-compatible;
+    T1/T2 unaffected).
+- **NOT done, per task scope:** the stale `atlas_out/e0/T5.md` and the
+  rescore-dir copy were **not** regenerated — the correct E0 capacity table
+  depends on v3's E0′, which has not run. The script is now correct and
+  ready; `atlas_out/e0/results.json` stays as the archived record of what was
+  run (already listed under "Deliberately NOT fixed").
+- **Claims affected:** none directly (release-artifact tooling). The
+  capacity/supplementary table (`ATLAS_proposal_v7.md` §7, T5) could not be
+  generated correctly before this.
+- **Re-run needed:** no (tooling only).
+- **Verification:**
+  - `python -m py_compile scripts/make_tables.py` → clean.
+  - `make_tables.py --table T5 --e0-dir atlas_out/e0` → `ValueError: T5:
+    atlas_out\e0\results.json looks like superseded / pre-A11 data … [('R0',
+    'ln_act', 26), ('R0', 'lora4', 12), ('R0', 'full', 69)]`. **Failed
+    before fix: yes** — pre-fix the same invocation wrote a 9-row T5.md with
+    `Params 26/12/69`. Passes after (raises): yes.
+  - `make_t5` on a synthetic well-formed E0′-shaped `results.json` (c0 +
+    ln_act/lora4/full on R2, `baseline_umf` scalar + ln_act on R1) → correct
+    `Params` (10,764 / 118,176 / 20,800,884), `ΔUMF` and `% of full`
+    populated (`+0.0800 … 67%` etc.), no `c0` adapter row, provenance line
+    present.
+- **Verified by:** this session, direct command output.
+
+#### CA2-4 — `scripts/audit_e0_train_planning_overlap.py` trips its own drift-guard
+
+- **Date:** 2026-08-28
+- **Defect:** the script (E0_RECOVERY_PLAN.md P2c's train/planning-eval
+  disjointness verifier) fails on any manifest with
+  `AssertionError: seed 2: reproduced init_state does not match
+  sample_dataset_init_goal's own draw`. `reproduce_planning_episodes` replays
+  the RNG call sequence of `run_e0_planning.sample_dataset_init_goal` to
+  recover each planning seed's `episode_idx`, but its accept condition was
+  `block_pos_diff >= min_block_pos_diff` only. The real function
+  (`run_e0_planning.py:195`, P2d) added a second predicate
+  `agent_block_dist <= max_agent_block_dist` (`DEFAULT_MAX_AGENT_BLOCK_DIST =
+  160.0`). When the real function keeps retrying on the reachability filter,
+  the old replay broke out one or more attempts early → different
+  `ep_idx`/`offset` → assertion fires. So E0 train/eval disjointness was
+  *asserted* (E0_RECOVERY_PLAN.md P2c) but not *verified*.
+- **Change (`scripts/audit_e0_train_planning_overlap.py`, standalone audit
+  tool — not a `run_*.py`):** import `DEFAULT_MAX_AGENT_BLOCK_DIST` from
+  `run_e0_planning`; add `--max-agent-block-dist` CLI arg (default = the real
+  function's default); `reproduce_planning_episodes` now mirrors the full
+  two-predicate accept condition (computes `agent_block_dist` and requires
+  both) and threads `max_agent_block_dist` into the real
+  `sample_dataset_init_goal` call it makes for the ground-truth comparison.
+- **Result of actually running it (now that it runs):**
+  - `atlas_out/e0_a9_retrain_phase1stage2_2026-08-28` — **no overlap**
+    (TRAIN∩planning = ∅, offline-EVAL∩planning = ∅) at 20 planning seeds.
+  - `atlas_out/e0_v6_R1`, `atlas_out/e0_train_sweep_60` — **no overlap**.
+  - `atlas_out/e0_train_sweep_100` — **1-episode overlap**: episode `235` is
+    in both the 100-trajectory training set and the planning-eval set (at 20
+    seeds and at the run's actual 40 seeds — `e0_planning_sweep_100/ln_act_R2.jsonl`
+    has 40 episodes). 1/40 = 2.5%. This is a real, small leakage on the
+    sweep-100 chart only. **Documented, not fixed** — per CLAUDE.md "do not
+    fix a bug you find while auditing"; the sweep numbers already carry the
+    A9 optimistic-bias caveat, and a chart trained on 100 trajectories is not
+    dominated by one shared episode, but it should be stated. Whoever cites
+    the training-data sweep (`ATLAS_SUMMARY.md` §4.2, `PAPER_DRAFT.md` §4.2,
+    .tex §4.2) should note the sweep-100 point has a 2.5% train/eval episode
+    overlap.
+- **Is the check still meaningful under v3's on-policy collector (C.3)?**
+  **Partly — its unit of comparison must change.** Today it compares the
+  *replayed-demo `episode_idx`* used to fine-tune a chart against the
+  `episode_idx` drawn for planning eval — correct for the `dataset`/`hybrid`
+  collectors, which replay a recorded demo's action sequence. Under C.3
+  (`IMPLEMENTATION_PLAN_V3.md` §5 / §8.1) a chart is trained on **on-policy
+  CEM rollout transitions** generated by planning toward real dataset goals
+  under the shifted regime — there is no replayed demo episode, so
+  "episode_idx overlap" no longer captures the leakage of interest. The
+  right question under C.3 is: **do the `(init_state, goal_state)` pairs (or
+  the planning seeds) used to collect chart-training rollouts overlap those
+  used for E0′ planning eval?** For that check to be possible, C.3's
+  collector must write a seed/`(init,goal)` manifest (analogous to
+  `e0_seed_manifest.json`'s `train` block but recording the sampled pairs,
+  not demo indices), and it should draw from a **disjoint seed range**
+  (a `seed_offset`, as `run_e0.py`'s train/val/test splits already do) from
+  the eval seeds — the check should then assert that offset is respected and
+  that the `(episode_idx, offset)` init/goal pairs are disjoint. Until C.3
+  lands with such a manifest, this script remains the right tool for the
+  `dataset`-collector comparison arm E0′ keeps (`IMPLEMENTATION_PLAN_V3.md`
+  §8.1: "the `dataset`-collector chart is run as the one-variable comparison
+  arm on R2 only").
+- **Claims affected:** N4 and the E0 training-data-sweep trend (disjointness
+  now verified for the a9-retrain and the sweep-60 charts; sweep-100 has the
+  2.5% overlap noted above). No number recomputed.
+- **Re-run needed:** no (audit tool; re-runnable any time, cheap, no GPU).
+- **Verification:** `git stash` the script → run → `AssertionError: seed 2 …`
+  (**fails before fix: yes**); `git stash pop` → run → completes, prints
+  TRAIN / EVAL / planning episode sets and overlap verdict (passes after:
+  yes). `python -m py_compile` clean. Ran against 4 real manifests (results
+  above).
+- **Verified by:** this session, direct before/after command output.
+
+---
+
+## v3 Phase-0 additions (2026-08-29)
+
+### V3-1 — `atlas/expand.py::maybe_expand` gains optional `verify_chunks`
+
+- **Not a bug fix — an authorised additive feature** (user-requested this session,
+  after G7 Group B). The single-chunk accept criterion is statistically
+  underpowered: ~33–50 % of commits are one-hit wonders (win the one verification
+  chunk, lose the next same-regime chunks — measured, `phase0_v3/g7_groupB_*`).
+- **Change:** new optional param `verify_chunks: list[tuple] | None = None`. When
+  given, the candidate commits iff (a) mean UMF < τ over the set AND (b) it beats
+  the incumbent on a *majority* of them. When `None` (default) the original single
+  `next_*` chunk rule runs unchanged.
+- **Additivity proof:** for one chunk, `beats_best = wins > len/2` reduces to
+  `wins == 1` ⇔ `cand_umf < best_umf` (original); `passes_tau = mean_cand < τ`
+  reduces to `cand_umf < τ` (original). So every caller that does not pass
+  `verify_chunks` is byte-identical.
+- **Fails before fix: N/A** (additive). **Regression check:** `smoke_gates.py
+  --gate G3a` → PASSED (committed), `--gate G3b` → PASSED (rejected_score), both
+  on the default path. E2's N9 commit numbers unaffected (that caller passes no
+  `verify_chunks`).
+- **Sweep result** (`phase0_v3/g7_groupB_nverify_sweep_disjoint.txt`): the first
+  sweep's quality check overlapped the accept window (circular). Fixed: each commit
+  records `verify_idx`, the follow-up loop skips it. Disjoint-window generalisation
+  rate 40 %→60 %→71 % at N = 1→3→5. `n_probe` sweep deferred (machine instability).
+  Proposed default `n_verify = 3` (IMPLEMENTATION_PLAN_V3 §15 item 6) — needs
+  explicit approval, joint `n_verify`×`n_probe` re-sweep on P0-G charts first.
+
+### V3-2 — `scripts/run_e0.py::load_regime_trajectories` gains `record_block_pose`
+
+- Optional `record_block_pose: bool = False`; when True, returns
+  `block_pose: [T_model+1, 3]` (subsampled `info["block_pose"]`). Needed for
+  P0-B's block-static-chunk motion-gate calibration and G4's trajectory statistic.
+  Default off → no behaviour change. Not a §C.3 collector edit.
+
+### V3-3 — `scripts/smoke_gates.py::gate_g4` rewritten (per plan §9)
+
+- Old G4: mean-pixel-value comparison, `1e-6` threshold, never run headless
+  (vacuous — CHECK 4.1). New G4: fixed identical aimed-walk actions per regime,
+  no planner, paired by seed, primary statistic = combined block pose change,
+  tested vs a real-variance R0-vs-R0 null band, with a `--g4-selftest` that fakes
+  the shifts and must fail. Demonstrated to fail on the fake input (selftest
+  passes = gate correctly reports "not distinguishable"). CPU-only.
+
+### V3-4 — `scripts/_determinism.py` + wired into forward-scoring scripts
+
+- **Bug:** cuBLAS re-autotunes GEMM kernels per process launch; cuDNN picks
+  non-deterministic algorithms. **Fails before fix:** `phase0_measure.py` run
+  twice → **48/48 chunks differ** by ~1e-4 (`umf_c0`, `e1_c0`, `latent_disp`).
+  NOT dropout — checked: `predictor.training == False`, 0 active Dropout modules.
+- **Fix:** new `scripts/_determinism.py` — `CUBLAS_WORKSPACE_CONFIG=:4096:8` (env,
+  before torch), `torch.use_deterministic_algorithms(True, warn_only=True)`,
+  `cudnn.deterministic=True`, `benchmark=False`, TF32 pinned off, seeded.
+  Imported before `torch` in `phase0_measure.py`, `phase0_g7_groupB.py`,
+  `run_e0.py`; `make_deterministic(0)` called in each `main()`;
+  `torch.manual_seed(seed_base)` per stream in `phase0_g7_groupB.py`.
+- **Passes after:** `phase0_measure.py` ×2 → **0/48 differ, bit-identical.** No
+  "no deterministic implementation" warnings for this workload.
+- **Impact on already-reported Phase-0 numbers:** τ (0.262) and the motion gate
+  (242.7) are P95 over 100+ chunks → stable at 4 sig figs. P0-D strike rate:
+  ±~0.7 pp possible on a boundary chunk. G7-B commit decisions: the ±2-commit/
+  6-seed variance traced here. No *conclusion* changes; the P0-G re-run is
+  reproducible.
+
+### V3-5 — P0-G on-policy collector fixes (`run_e0.py::load_regime_trajectories`)
+
+All four authorised by the user 2026-08-29 (v3 §15 items). closed_loop source only.
+
+1. **`total_contacts > 0` acceptance filter OFF for `closed_loop`** (`run_e0.py:358`).
+   It was rejecting + retrying any trajectory where the planner never touched the
+   block — re-conditioning the training distribution on contact (the residual form
+   of the original hybrid-collector proxy). The collector is goal-directed by the
+   planner's cost function, so a low-contact trajectory is real "planner
+   struggled" signal, not noise.
+2. **`--collect-num-act-stepped` made FUNCTIONAL.** New `collect_nas` param on
+   `load_regime_trajectories`; the closed_loop loop now `range(0, n_chunks,
+   collect_nas)` and executes up to `frameskip*collect_nas` raw actions per
+   replan (capped at `traj_len`). Previously it replanned every model-chunk and
+   discarded all but the first planned chunk — collection did not match eval CEM
+   cadence (the C-1 mismatch).
+3. **CEM config** to `N=300, iterations=10 (P0-C), nas=2` — via
+   `modal/modal_phase0.py::p0g_collect` (new, L4 not T4 — CEM is compute-bound),
+   `--collect-num-samples 300 --collect-iterations 10 --collect-num-act-stepped 2`.
+4. **Determinism** — automatic via V3-4 (`run_e0.py` imports `_determinism`).
+- **Smoke DONE 2026-08-29** (pandereshubham; record: `phase0_v3/p0g_smoke_record/`).
+  All 4 fixes confirmed live: contact filter OFF printed; nas=2 cadence verified
+  (replans at chunk 1→3→5 = 3 CEM searches/traj, was 5); contacts 14–19/traj;
+  **66.8 s/traj on L4** (~22 s/CEM search at N=300/it=10). Also uploaded the
+  missing `rel_actions.pth` (73 MB) to pandereshubham's `atlas-data` volume.
+- **Determinism residual found in the smoke:** `_determinism.py` fixes the FORWARD
+  path (phase0_measure ×2 → 0/48 differ) but NOT gradient training — a 20-step
+  chart fine-tune run in two processes gives different weights (~1e-2). Not a
+  missing-kernel case (`warn_only=False` doesn't raise); CUDA backward reductions.
+  Does not block P0-G (runs once → output IS the artifact); G7-B stays a
+  per-seed distribution. Documented in `scripts/_determinism.py`.
+- **Full-P0-G projection:** 216 trajs → ~$3.6, ~2.3 h (2 concurrent regime calls).
+  Awaiting explicit launch approval.
+
+### V3-6 — P0-G pre-launch fixes, phase 1 (`P0G_FIX_PLAN.md` §2.1, §2.2, §3.1, §3.2)
+
+Session 2026-08-29. Work order `research_audit/P0G_FIX_PLAN.md` §2–§4, first four
+items only (user: phased). **Not authorised** and NOT touched: `CLAUDE.md` §1.7
+values, the R1 scope decision (§4.2), E1/E4 collector defaults (§4.3),
+`run_e0_planning.py`'s planning loop (matched, not corrected).
+
+**Environment caveat for every falsification test below:** the frozen
+`dino_wm_pusht` checkpoint could not be loaded locally this session — `torch.hub`
+hangs on a network sub-download and `hubconf` pulls `clusterscope`→`fcntl`
+(Unix-only) on Windows. So model-in-the-loop falsification (running the collector,
+instrumenting `plan_length`, the KS cross-check on real chunks) was NOT run. What
+*was* run is the model-free layer of each test: the arithmetic the fix changes,
+and the real `sample_dataset_init_goal` sampler (no model). The remaining checks
+must run on Modal / a Linux box before launch.
+
+**§3.1 [P4] — collector planning lookahead** (`run_e0.py`, `closed_loop` branch,
+grep `n_replans_target = max((n_chunks * frameskip)`). `agent.act(steps_left=...)`
+now uses run_e0_planning.py's loose convention
+`(n_replans_target - replan_idx) * collect_nas` with `n_replans_target =
+raw_steps // collect_nas`, instead of `max(n_chunks - chunk_idx, 1)`.
+- FALSIFICATION (arithmetic, RAN): at `traj_len=25, frameskip=5, nas=2` the OLD
+  formula gives `steps_left = [5, 3, 1]` → `plan_length = min(6, ·) = [5, 3, 1]`;
+  at `traj_len=30`, OLD `[6, 4, 2]`. NEW gives `[24, 22, 20]` / `[30, 28, 26]` →
+  `plan_length = [6, 6, 6]`, matching the eval reference
+  (`run_e0_planning.py:288` → `[6, 6, 6]`). Bug reproduced, fix confirmed at the
+  arithmetic level.
+- NOT RUN: the plan's instrumented check (print `agent._prev_elite_losses_mean`
+  shape in collector vs one eval episode). Blocked on model load.
+- Consequence per plan: collection ~1.7× slower; §2.2 timeout / cost line must be
+  re-measured on the smoke. Not done (no smoke).
+
+**§3.2 [P5] — episode length + goal separation** (`run_e0.py` `closed_loop`
+branch: `sample_dataset_init_goal(... traj_len=GOAL_TRAJ_LEN ...)`, was
+`traj_len=traj_len`; plus a `min(demo_seq_lengths) >= GOAL_TRAJ_LEN` assert;
+`GOAL_TRAJ_LEN` imported from `run_e0_planning`). `modal/modal_phase0.py`:
+`traj_len` / `eval_traj_len` default 25 → 30.
+- FALSIFICATION (real sampler, RAN — no model needed): 200 seeds each, `states.pth`
+  from `data/pusht_noise/train`. OLD (`traj_len=25`): block-separation median
+  75.7 px, mean 83.2. NEW (`GOAL_TRAJ_LEN=31`): median 82.9, mean 89.7. Real eval
+  distribution (`atlas_out/e0_planning_nas2/baseline_R2.jsonl`
+  `init_block_pos_diff`, n=20): median 77.9, mean 94.9. The fix moves collection
+  toward eval (median gap 2.2 → 5.0 the other way… medians nearly coincide; mean
+  gap 11.7 → 5.2). `min(demo_seq_lengths) = 49 ≥ 31`, so no episode-filter change
+  is needed — assert added and holds. Sample constancy: same 200 seeds both arms,
+  only `traj_len` differs.
+- NOT RUN: a formal KS test vs a fresh eval `episodes.jsonl`; n=20 on the eval
+  side is low power anyway.
+
+**§2.1 [P9, P2c] — persist trajectories + T=2 chunk dump + `--load-trajs`**
+(`run_e0.py`). New: `--load-trajs`, `--collect-only`, `_traj_guard()`,
+`dump_regime_chunks()`. In the regime loop, trajectories are loaded from
+`trajs_{regime}.pt` (in `--load-trajs` or, on resume, in `--out`) when present
+and the stored `_traj_guard` fingerprint matches; otherwise collected then
+`torch.save`d, and (closed_loop) `chunks_{regime}.jsonl` is written — one row per
+`T=collect_nas` sliding window with `umf_c0` (via `score.rollout_umf` on the
+pristine predictor), `latent_disp`, `block_disp_px`.
+- FALSIFICATION (RAN, model-free): BEFORE — pre-edit `main()` wrote only
+  `chart_*/loss_*/results.json/e0_seed_manifest.json` (grep confirms; no
+  `trajs_*` / `chunks_*` anywhere). AFTER — `_traj_guard` roundtrips through
+  `torch.save`/`load`; a changed `--collect-iterations` (10→30) flips the guard
+  (`300x10 nas=2` → `300x30 nas=2`) and the load path raises `ValueError`
+  ("protocol mismatch"). encoder_output kept fp32 (size to be measured on the
+  smoke before switching to `.half()`).
+- NOT RUN: `dump_regime_chunks` end-to-end (needs `rollout_umf` → the model); the
+  plan's smoke that confirms "re-run with `--load-trajs` → ZERO CEM searches";
+  the production step-rate measurement that would justify §2.2's timeout.
+- Resume: `traj_file.exists()` in `--out` short-circuits collection. The plan's
+  fuller "collection skipped iff trajs AND chart exist" restructure is partially
+  done (trajs-exist is enough to skip collection; per-kind chart resume is
+  unchanged downstream).
+
+**§2.2 [P2, P2c] — split the Modal function** (`modal/modal_phase0.py`).
+`p0g_collect` (was collect+finetune, `timeout=3600*8`) split into `p0g_collect`
+(`--collect-only`, `timeout=3600*6`, ONE regime per call) and `p0g_finetune`
+(`--load-trajs`, `timeout=3600*10`). Local entrypoints `p0g-collect` /
+`p0g-finetune`. `--num-test-trajs 8` baked into `_P0G_COMMON` (this also lands
+§3.3 P3, noted here — a fine-tune re-run cannot silently drop it). Old
+`SMOKE_SUMMARY.md` `$3.6 / 4.5 h` projection called out as superseded in the code
+comment; the replacement figure needs the un-run step-rate measurement.
+- FALSIFICATION: none required for a structural split (per plan). Timeout
+  arithmetic that justifies the new values is from `P0G_REVIEW.md` P2 (~13.6 h
+  combined), NOT re-measured this session.
+- NOT DONE: `SMOKE_SUMMARY.md` supersession note (plan §1.5 / §2.2.4) — deferred
+  with the rest of the smoke-dependent work.
+
+`scripts/run_e0.py::main` under `--collect-only` still writes an empty
+`results.json` + the (still useful) seed manifest, then the matplotlib block
+no-ops on empty data. Harmless; noted.
+
+### V3-7 — P0-G pre-launch fixes, phase 2 (`P0G_FIX_PLAN.md` §3.3, §3.4, §4.1; §4.2 prepared)
+
+Session 2026-08-29, continued. Same environment caveat as V3-6 (frozen checkpoint
+does not load locally → model-in-the-loop falsification NOT run; model-free layer
+run and reported).
+
+**§3.4 [P1, P1b] — regime-ordering contamination (the highest-stakes fix).**
+- Operational half DONE in V3-6: `p0g_collect` takes a single `regime: str`,
+  entrypoint says "run twice".
+- Code half (this session): `run_e0.py` regime loop now does
+  `wm.predictor.load_state_dict(pristine_predictor_state)` at the TOP of the loop,
+  before collection (grep `P1 / v3 §5.2: on-policy collection MUST plan`).
+  Previously the only pristine reload was inside `for kind` (after that regime's
+  collection); `Chart.restore_()` for ln_act/full re-applies TRAINED weights
+  (`atlas/chart.py:126-127`, confirmed at source + its own docstring
+  `restore_pretrained_` FIX_SPEC C4). Object identity verified by reading:
+  `collector_agent` ← `wrapper`; `wm = wrapper.model`; so `wm.predictor` is the
+  agent's predictor and an in-place `load_state_dict` is seen.
+- New `--debug-predictor-fingerprint` flag: prints sha256 of predictor params
+  before each regime's collection — the plan's falsification test, made runnable
+  later without re-patching. Expected: `--regimes R0,R2` → IDENTICAL fingerprints
+  after the fix, DIFFERENT before.
+- NOT RUN: that fingerprint test (needs model load).
+
+**§3.3 [P3] — disjoint test split.**
+- Launcher half DONE in V3-6 (`--num-test-trajs 8` in `_P0G_COMMON`;
+  `num_test_trajs` param on `p0g_collect` + entrypoint so it can't be re-pinned
+  to 0).
+- Label half (this session): `run_e0.py` `results.json` now carries
+  `eval_umf_source` ∈ {`"test"`, `"val_ALIASED"`, `"error"`} in BOTH the resume
+  and the fresh branch; the stale `# from the disjoint TEST set (A4)` comment is
+  corrected to condition on it. `eval_umf` is no longer silently aliased to
+  `val_umf` under a comment claiming otherwise — the aliasing is now labelled.
+- NOT RUN: the plan's `eval_umf != val_umf` + observed-bias-and-sign check (needs
+  a fine-tune with 8 test trajs → model). Repo's prior measurement of this bias
+  (`FIXLOG` A4: +0.077…+0.157 on R0 cells) stands as the expectation.
+
+**§4.1 [P16] — determinism-asymmetry check.** No production code. `modal_phase0.py`
+`p0g_finetune` gained a `load_subdir` param so one cached collection can feed two
+fine-tune runs writing to separate `--out` dirs (`det_run1` / `det_run2`), per
+§1.7 "never reuse an output dir". Docstring carries the exact procedure.
+- NOT RUN (needs model + GPU + a real collection first). P16 remains
+  reasoning-only; not marked refuted/confirmed in `P0G_REVIEW.md` (the plan says
+  only do that after running).
+
+**§4.2 🛑 [P13] — R1 scope. DECIDED: R1 DROPPED — explicit human sign-off
+2026-08-29** ("you can drop R1 … if time permits then we will run the
+experiments"). Written into `IMPLEMENTATION_PLAN_V3.md` §8.1 (Arms + decision
+rule now over `{R2}`) and §8.3 (R0/R1 cell-B replicate struck). P0-G runs R2
+only; `p0g_collect` already defaults to `regime="R2"`.
+*(Note: an earlier version of this entry recorded the drop off an
+`AskUserQuestion` selection, which a Stop hook flagged as not a valid §1.8
+sign-off. That was reverted, the question re-put in prose, and the drop
+re-applied only after the user's explicit text confirmation above.)*
+Re-verified P13b (model-free, real `sample_dataset_init_goal`
++ `states.pth`, `RandomState(seed)` on both sides):
+- **R1 collection train seeds share 50/100 eval tasks** — NOT the sub-agent's
+  39/100. Mechanism: R1 `seed_base = 0`, collection seeds `{0,2,…,198}`; eval
+  seeds `{0,…,99}`; the 50 even eval seeds are reused verbatim as collection
+  seeds → identical `sample_dataset_init_goal` draw → identical (init, goal) task.
+- The V3-6 §3.2 fix **increases** this overlap (15/100 → 50/100) because
+  collection now uses the same `traj_len = GOAL_TRAJ_LEN = 31` as eval, so the
+  same seed lands on the same episode.
+- R2 and R0: **0/100** (seed_base 1000 / 2000, no even-seed reuse).
+- Conclusion for the user: if R1 is kept, `seed_base["R1"]` MUST move (e.g. to
+  3000) before any collection. `p0g_collect` currently defaults to `regime="R2"`
+  only, so nothing is live yet.
+
+### V3-8 — P0-G pre-launch fixes, phase 3 (`P0G_FIX_PLAN.md` §4.3, §4.4, §4.6)
+
+Session 2026-08-29, continued. Same environment caveat (checkpoint does not load
+locally → model-in-the-loop tests deferred). All model-free checks below RAN.
+
+**§4.3 [P7] — E1/E4 collector `source`. Made explicit, NOT changed (scope
+decision, still needs sign-off).** `run_e1.py:292` and `run_e4.py:233` (and
+`smoke_e4.py:105`) called `load_regime_trajectories(...)` with no `source=` →
+signature default `"scripted"`, the retired goal-free contact-seeking walk. Now
+pass `source="scripted"` explicitly with a comment; `run_e1.py` writes
+`e1_run_meta.json` (`gate_source`, `motion_gate`); `run_e4.py` summary gains
+`"gate_source"`. **The trade-off for the human (STILL OPEN):** matching the
+charts P0-G produces means calibrating the motion gate on `source="closed_loop"`
+too — which costs one CEM search per gate trajectory (E4: 30 trajs → ~30 extra
+searches per arm). Not done here; needs a decision like §4.2.
+
+**§4.4 [P8, P10, P10b] — the reported metric, additive.** `evaluate_e0_chart`
+rewritten to return a **dict** (was `(loss, umf)`) and now also computes:
+- **P8:** `umf_chunkT{nas}` — mean UMF over T=`collect_nas` sliding windows, on
+  τ's scale (≈0.262), alongside the trajectory-T `umf`. `umf` calls are additive
+  (`atlas/score.py::umf` untouched, §1.2).
+- **P10:** `umf_ungated` / `umf_chunkT{nas}_ungated` — same, `motion_gate=None`,
+  so the gate's (optimistic) effect is visible not baked in.
+- **P10b:** `n_trajs`, `n_umf`, `n_umf_chunkT{nas}`, `n_windows` recorded — `umf`
+  and `loss` were means over different subsets with nothing logging which.
+`results.json` gains these via `_umf_detail_fields()` (both the fresh and resume
+branches) plus `motion_gate_value` + `motion_gate_rule` (the rule string names it
+RETIRED per §6.6). 4 call sites updated to the dict return; no external callers.
+- FALSIFICATION (RAN, model-free): `_umf_detail_fields({})` → all-None + the rule
+  string; on a fake eval dict → correct keys/values. The plan's "set the gate
+  high, confirm n=2 while loss is over 3" check needs the model — NOT run.
+
+**§4.6 P21 — three stale docstrings.** `atlas/regimes.py` module docstring said
+"R2 = shape.elasticity raised" — inverted from `REGIME_CONFIGS` (`{"damping":
+0.5}`) — now corrected (R2 = `space.damping 0.5`), and the "re-targeted onto …
+shape.elasticity (R2)" line fixed to `space.damping`. `run_e0.py`
+`--collect-num-act-stepped` help rewritten (the "this flag is a no-op" CAVEAT is
+obsolete — it's the v3 §5.2 fix and works) **and its default 1 → 2** (the §3.6
+value; behaviour change for a bare `run_e0.py --data-source closed_loop`, but
+`modal_phase0.py` passes it explicitly so P0-G is unaffected). `--data-source`
+help's "replanning every model chunk" → "every --collect-num-act-stepped chunks".
+
+**§4.6 P12 / P18 / P19 / P20 — manifest provenance.**
+- **P12:** `n_contacts` per trajectory now in `e0_seed_manifest.json` (was
+  stdout-only, so §15-2's pre-registered R2 damping check was unreadable from
+  artifacts). Debug print label `"Real-demo replay contact rate"` → conditional
+  (`"on-policy planner"` for closed_loop) + names the §15-2 fallback rule.
+- **P18:** `sample_dataset_init_goal` gained optional `return_indices=True` (4-tuple,
+  additive — `run_e0_planning.py::run_episode` untouched, back-compat verified);
+  `run_e0.py` closed_loop branch now records real `episode_idx`/`offset` (were
+  `null`). Unblocks `scripts/audit_e0_train_planning_overlap.py` on on-policy
+  manifests.
+- **P19:** runtime assertion that train/val/test seed intervals are disjoint
+  within and across regimes (`seen_seeds` dict). Silently collided at
+  `num_trajs >= 501`; now fails loudly.
+- **P20:** `modal_phase0.py` reads the git SHA on the CLIENT (`_local_git_sha()`
+  in the `@app.local_entrypoint`) and passes it as `ATLAS_GIT_SHA`;
+  `_determinism.settings_dict` prefers that env var over the (failing on Modal)
+  `git rev-parse`. `phase0` / `p0g_collect` / `p0g_finetune` + all 3 entrypoints
+  wired.
+- FALSIFICATION (RAN): P18 `return_indices` 4-tuple + 2-tuple back-compat both
+  verified against real `states.pth`; P21 regimes docstring vs `REGIME_CONFIGS`
+  now agree (grep); compile-clean across all 7 touched files.
+
+**NOT DONE this phase:** §4.5 (C-1/C-2 chart acceptance checks — a runbook that
+executes AFTER a real collection; deferred), P15/P15b (doc-only, deferred),
+P17/P22 (cosmetic, deferred).
+
+### V3-9 — P0-G addendum: fix the two defects the V3-6/7/8 review found (`P0G_FIX_PLAN §7`)
+
+Session 2026-08-29. `P0G_FIX_PLAN.md` §7 (ADDENDUM) flagged two bugs introduced
+by the earlier fixes. Both falsification tests are model-free.
+
+**§7-B1 🔴 — `--load-trajs` guard rejected every `p0g_finetune`.**
+`p0g_finetune` emitted only `--regimes/--load-trajs/--steps/--out` + `_P0G_COMMON`,
+so 4 of `_traj_guard`'s 9 fields fell back to argparse defaults ≠ what
+`p0g_collect` stored.
+- FALSIFICATION (RAN, model-free): rebuilt both arg namespaces via
+  `run_e0._build_parser()` from the two Modal command lines →
+  `_traj_guard` **NOT equal**, mismatched fields exactly as §7-B1 predicted:
+  `train_traj_len (30,25)`, `eval_traj_len (30,50)`, `num_train_trajs (100,20)`,
+  `collect_cem ('300x10 nas=2','300x30 nas=2')`.
+- FIX: new `scripts/_p0g_spec.py` (no `modal` import) holds `_P0G_DEFAULTS` +
+  `_p0g_flags()` + `_P0G_COMMON`; `modal_phase0.py` imports them; **both**
+  `p0g_collect` and `p0g_finetune` default all 8 collection params off
+  `_P0G_DEFAULTS` and emit `*_p0g_flags(...)`. `--num-test-trajs` moved out of
+  `_P0G_COMMON` (emitted once). `run_e0.py::main()` refactored: parser extracted
+  to `_build_parser()` (main() unchanged behaviour).
+- FALSIFICATION AFTER (RAN): `_traj_guard` **equal**. Landed as a permanent
+  regression test: `tests/test_p0g_guard.py` (passes; full suite 22/22).
+- The guard was NOT weakened (§7-B1 forbids it).
+
+**§7-B2 🟠 — the T=nas windowed UMF (P8) was gated by the trajectory-scale gate.**
+`evaluate_e0_chart` passed `motion_gate` (10th pct of T=6 `‖z_6−z_0‖`) into the
+T=2 windowed `umf()` calls — §6.6's "calibrated at a granularity it is not
+applied at", reintroduced.
+- FALSIFICATION: the exact test (`compute_motion_gate(traj_disps)` vs
+  `chunk_disps` from a real `trajs_R2.pt`) **could NOT be run — no `trajs_R2.pt`
+  exists yet** (collection has not run). Ran a SYNTHETIC substitute instead
+  (directed-motion latents, static component cancels, T_model=6, N=256, D=384,
+  100 trajs, real `compute_motion_gate`): traj-scale gate 284 vs T=2 window
+  p90=97 → **BEFORE gates 100% of windows; AFTER (chunk-scale gate) gates 10%**.
+  Mechanism confirmed; real-data over-gating **fraction is unverified** — owed
+  once collection produces `trajs_R2.pt`. Real phase0 proxy T=2 disps (R2
+  p10≈164/p50≈237) make ≥50% over-gating the conservative real expectation.
+  Not treating B2 as refuted: the mismatch is real by construction (the code
+  literally passes a T=6 threshold to T=2 calls) and §6.6 mandates the fix
+  regardless of magnitude.
+- FIX: `run_e0.py::main()` computes `chunk_motion_gate = compute_motion_gate(
+  chunk_displacements)` (10th pct of T=`nas` train-window disps) beside
+  `motion_gate`; `evaluate_e0_chart` gains `chunk_motion_gate` param used **only**
+  for the windowed calls. `_umf_detail_fields` records both
+  (`motion_gate_value`, `motion_gate_chunk_value`). `eval_umf_chunkT{nas}_ungated`
+  kept as the always-interpretable number.
+
+**§7-C operational notes actioned:**
+- C-1: `--num-test-trajs` is now a real Modal param (default 8); smoke docstrings
+  updated to `--num-test-trajs 2`.
+- C-2: `SMOKE_SUMMARY.md` gained a SUPERSEDED block — `66.8 s/traj` / `$3.6` are
+  stale-low; ~135 s/traj is a first-order **estimate** (not measured); re-measure
+  on next smoke. Same note in `modal_phase0.py`.
+- C-3: `p0g_collect` / entrypoint docstrings now state R0 collection is REQUIRED
+  (τ / σ_r over R0 chunks) and is a separate `--regime R0` call.
+
+**V3-9 bucket-2 pass (static + mock-tensor, no model) — 2026-08-29.** Before a
+Modal smoke, exercised the new code paths with mocked `umf`/`rollout_umf`/
+`_open_loop_rollout` and fake trajectory dicts:
+- `evaluate_e0_chart` T_model=6/chunk_nas=2 → **15 windows over 3 trajs** (correct);
+  traj-scale gate at 999 → `n_umf=0` → `umf=nan` (gate fires); windowed `umf`
+  calls get exactly `enc[3,N,D] / acts[2,10] / proprio[1,1,P,D]` — matches the
+  traj-level convention and `umf`'s shape contract.
+- Edge `T_model < chunk_nas` (Tm=1, nas=2) → 0 windows, `umf_chunkT2=nan`, no
+  IndexError. Added a `chunk_displacements.numel()==0 → chunk_motion_gate=None`
+  guard in `main()` for the same edge.
+- `dump_regime_chunks`: correct row count (Σ per traj of `T−nas+1`),
+  `block_disp_px` numeric with `block_pose` / `None` without.
+- `--collect-only` continue sits after the gate computations (gates logged on the
+  collect run — useful for the τ/gate re-derivation — then exits before the kind
+  loop); empty `results` → `results.json`/T5-md/plot all no-op cleanly.
+- P19 seed-disjointness assertion does NOT false-fire at the P0-G launch config
+  (R0/R2 train/val/test intervals all disjoint; R0∩R2 empty) — checked from the
+  seed-generation expression.
+- `_traj_guard` computed once and used for BOTH `--load-trajs` and the
+  auto-resume `traj_file.exists()` branch (line 897/907).
+- `run_e4.py` `GATE_SOURCE` is defined before both the profile path and the
+  summary dict; `run_e1.py` `e1_run_meta.json` write has `motion_gate` +
+  `GATE_SOURCE` in scope.
+**Not covered** (needs the model): real tensor shapes through `_make_z_ctxt` /
+`_open_loop_rollout` on sliced windows, `dump_regime_chunks` `rollout_umf` on a
+real pristine predictor, the collector loop itself.
+
+### New Phase-0 diagnostic scripts (not experiment code)
+
+`scripts/phase0_measure.py`, `scripts/phase0_g7_groupA.py`,
+`scripts/phase0_g7_groupB.py`, `modal/modal_phase0.py` — forward-only P0-A/B/D/E
+and G7 calibration diagnostics. Write only to `phase0_v3/`. No production path
+touched.
+
 ---
 
 ## Deliberately NOT fixed
