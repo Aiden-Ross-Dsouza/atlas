@@ -2894,6 +2894,120 @@ container hits.
 **The full sharded pipeline (parallel collect -> merge) is now proven
 end-to-end on real Modal infrastructure**, not just unit-tested locally.
 
+### V3-13 — real P0-G launch (2026-08-30): a second real bug, found on the first N=100 run
+
+Session launched the actual N=100 collection: `p0g-collect-sharded --regime R0
+--num-trajs 100 --num-shards 4 --out-subdir p0g_onpolicy` and the identical
+command for `--regime R2`, both concurrently. **User caught the local network
+blip** (`getaddrinfo failed`, ~8.5 min in) killing both local CLI orchestrators;
+confirmed via `modal app list` that `--detach` did its job — both apps stayed
+`ephemeral (detached)` with all 4 shards still running. Collection finished
+cleanly for all 8 shards (2 regimes x 4 shards); merge triggered manually via
+`p0g-merge-shards` (built for exactly this recovery case).
+
+**Bug: R0 and R2 were launched with the SAME `--out-subdir p0g_onpolicy`.**
+Their shard directories therefore collided: `p0g_onpolicy_shard0` etc. held
+BOTH regimes' files. `trajs_{regime}.pt`, `chunks_{regime}.jsonl`,
+`block_static_{regime}.json`, `gate_calibration_{regime}.json` are all
+regime-namespaced filenames — **confirmed safe**, both regimes' copies coexist
+correctly (verified via `modal volume ls`). But `e0_seed_manifest.json`,
+`results.json`, `results.md`, `e0_loss_curves.png/pdf` are NOT
+regime-namespaced — two regimes writing concurrently into the same shard dir
+race to the same path, last writer wins. First R2 merge attempt failed with
+`KeyError: 'R2'` — the manifest R2's merge read had been overwritten by R0's
+process and only had an `"R0"` top-level key.
+- FIX: `merge_p0g_shards.py`'s manifest step no longer reads shard dirs'
+  `e0_seed_manifest.json` at all — it reconstructs the manifest directly from
+  the trajectory objects already loaded from the (safe, regime-namespaced)
+  `trajs_{regime}.pt` files, which carry `seed`/`episode_idx`/`offset`/
+  `n_contacts` per trajectory. `regime_config` is pulled from `merged_guard`,
+  not the racy file either.
+- FALSIFICATION: reproduced the exact failure mode locally (two shards each
+  given an `e0_seed_manifest.json` deliberately keyed `"R0"` instead of
+  `"R2"`, simulating the real collision) — BEFORE this would `KeyError`;
+  AFTER (with the fix) the merge succeeds and reconstructs the correct
+  manifest (`regime_config: {"damping": 0.5}`, correct seeds) purely from the
+  trajectory data, ignoring the corrupted file entirely.
+- Re-ran both real merges on Modal with the fix: **R2 succeeded** —
+  `ap-0mofApZVduVLRjPheZmi9l`, 100 train (seeds 1000-1198) / 8 val / 8 test /
+  540 chunks -> `phase0_v3/p0g_onpolicy/`. **R0 succeeded** —
+  `ap-xw41Z9Ypum91w17CkwJ6Fr`, 100 train (seeds 2000-2198) / 8 val / 8 test /
+  540 chunks -> `phase0_v3/p0g_onpolicy_r0/` (deliberately a DIFFERENT final
+  out-subdir than R2's, so this collision cannot recur between the two
+  regimes' MERGED outputs even though their SHARD dirs still overlapped).
+
+**Standing lesson, not yet enforced in code:** two regimes sharded
+concurrently must use distinct `--out-subdir` values (or the code should
+reject a collision) — this was a real gap in the sharding feature's design,
+caught only because it was actually run at real N, not at smoke scale (the
+smokes never ran two regimes' shards into the same subdir simultaneously).
+**Not fixed defensively here** (e.g. an assertion in `p0g_collect` rejecting a
+directory that already holds another regime's un-namespaced files) — flagged,
+not silently patched further, since the actual run's data came through intact
+and a broader fix needs its own falsification pass rather than being bolted
+on under time pressure.
+
+**Real N=100 collection numbers (both regimes, on-policy, τ/gate NOT yet
+adopted — pending human sign-off per §15-5):**
+
+| | R0 | R2 |
+|---|---|---|
+| motion_gate (T=6, 10pct) | 180.7 | 287.9 |
+| chunk_motion_gate (T=2, 10pct) | 104.4 | 155.5 |
+| block-static trajectories | 11/116 (9%) | 7/116 (6%) |
+| block-static chunks (n_static/540) | 143 (26%) | 60 (11%) |
+| P95-over-block-static gate (§6.6) | 187.5 | 197.1 |
+| false-pass, 10pct gate | 7.0% | 0.0% |
+| false-pass, P95-static gate | 5.6% | 5.0% |
+
+### V3-14 — R2 fine-tune, first real run: a third bug, direct fallout from the V3-13 fix
+
+Launched `p0g-finetune --regime R2 --load-subdir p0g_onpolicy --out-subdir
+p0g_onpolicy` on the merged N=100 R2 data. **Crashed on the very first forward
+pass:**
+
+```
+RuntimeError: Expected all tensors to be on the same device, but found at
+least two devices, cpu and cuda:0! (... F.conv1d, action_encoder)
+```
+
+**Root cause: direct fallout from V3-13's own fix.** `merge_p0g_shards.py`
+loads shard files with `map_location="cpu"` (correct fix for the CPU-only
+merge container) and then `torch.save`s the merged blob — so the MERGED
+`trajs_R2.pt` has CPU tensors, unlike a direct single-shard collection file
+(which stays on whatever device collected it, `cuda:0` on an L4). `run_e0.py`
+`main()`'s `--load-trajs` path (`blob = torch.load(src_file,
+weights_only=False)`) never moved loaded tensors onto `device` — it implicitly
+assumed the file's tensors were already on the right device, which was true
+for every case tested before (`p0g_finetune` always loading a same-container
+collection or an unmerged single-shard file) but false for a merged file. The
+predictor is on `cuda:0`; the merged trajectory's `encoder_output`/`actions`/
+`proprio` arrived on `cpu`; first forward pass errors.
+
+**Fix:** `--load-trajs` now loads with `map_location="cpu"` explicitly (so
+behaviour doesn't depend on the file's origin) and then a new `_to_device()`
+helper moves each trajectory's three tensor fields (`encoder_output`,
+`actions`, `proprio`) onto `device` — non-tensor fields (`seed`,
+`episode_idx`, `offset`, `n_contacts`, `block_pose`) are left alone. This
+makes the load path correct regardless of whether the source file came from a
+GPU collection container or a CPU-only merge.
+- FALSIFICATION: could not reproduce the exact crash locally (no GPU-vs-CPU
+  mismatch reachable without the model), but verified the fix's mechanics
+  directly against a real trajectory blob (the smoke's `trajs_R2.pt`, which is
+  itself GPU-saved, confirming collection output really does differ from
+  merge output as diagnosed): `_to_device` correctly moves all three tensor
+  fields and leaves `seed`/`episode_idx`/`n_contacts` untouched.
+- Relaunched the real fine-tune with the fix; result pending.
+
+**Pattern worth naming:** this is the second bug in a row where a fix for one
+container (CPU-only merge) broke an assumption held by a DIFFERENT container
+(GPU fine-tune) reading the same file format. Neither smoke run ever exercised
+a fine-tune loading a MERGED (as opposed to single-shard) trajectory file —
+the earlier fine-tune smoke loaded directly from an unsharded, unmerged
+`p0g_collect` output. A `--load-trajs` smoke against a merged file would have
+caught this before real spend; noted for the next feature added to this
+pipeline.
+
 ### New Phase-0 diagnostic scripts (not experiment code)
 
 `scripts/phase0_measure.py`, `scripts/phase0_g7_groupA.py`,
