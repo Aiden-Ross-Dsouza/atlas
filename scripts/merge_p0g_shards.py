@@ -129,29 +129,30 @@ def main() -> None:
                     n_chunks += 1
     print(f"Merged {n_chunks} chunk rows -> {args.out_dir / f'chunks_{regime}.jsonl'}")
 
-    # Seed manifest: concatenate train rows across shards (already known
-    # disjoint above); val/test rows from whichever shard actually collected
-    # them.
-    manifests = []
-    for d, blob in blobs:
-        m_path = d / "e0_seed_manifest.json"
-        manifests.append((d, json.loads(m_path.read_text())[regime] if m_path.exists() else None))
-    primary = next((m for d, m in manifests if m is not None), None)
-    if primary is None:
-        raise FileNotFoundError("No shard has an e0_seed_manifest.json -- cannot merge.")
+    # Seed manifest: reconstructed DIRECTLY from the trajectory objects already
+    # loaded above (each carries seed/episode_idx/offset/n_contacts), NOT from
+    # shard dirs' own e0_seed_manifest.json files. Those are NOT regime-
+    # namespaced (unlike trajs_{regime}.pt / chunks_{regime}.jsonl) -- two
+    # regimes launched concurrently into the same --out-subdir (as happened
+    # here: R0 and R2 both used "p0g_onpolicy") race to the SAME path in a
+    # shared shard dir, and whichever finishes last silently overwrites the
+    # other's manifest. The trajectory .pt files are safe (regime-namespaced);
+    # only this reconstruction-from-source approach is trustworthy under that
+    # collision. Real bug, found via this exact merge failing with
+    # `KeyError: 'R2'` on a manifest that had been overwritten with R0's.
+    def _row(t: dict) -> dict:
+        return {"seed": t["seed"], "episode_idx": t["episode_idx"],
+                "offset": t["offset"], "n_contacts": t.get("n_contacts")}
     merged_manifest = {
-        "source": primary["source"], "regime_config": primary["regime_config"],
-        "train": sorted(
-            (row for d, m in manifests if m is not None for row in m["train"]),
-            key=lambda r: r["seed"]),
-        "eval": next((m["eval"] for d, m in manifests
-                     if m is not None and m["eval"]), []),
-        "test": next((m["test"] for d, m in manifests
-                     if m is not None and m["test"]), []),
+        "source": "closed_loop", "regime_config": merged_guard["regime_config"],
+        "train": sorted((_row(t) for t in all_train), key=lambda r: r["seed"]),
+        "eval": sorted((_row(t) for t in val_trajectories), key=lambda r: r["seed"]),
+        "test": sorted((_row(t) for t in test_trajectories), key=lambda r: r["seed"]),
     }
     (args.out_dir / "e0_seed_manifest.json").write_text(
         json.dumps({regime: merged_manifest}, indent=2))
-    print(f"Wrote merged manifest -> {args.out_dir / 'e0_seed_manifest.json'}")
+    print(f"Wrote merged manifest (reconstructed from trajectory objects, not shard "
+          f"e0_seed_manifest.json files) -> {args.out_dir / 'e0_seed_manifest.json'}")
 
     # Recompute gates + reports on the MERGED set -- per-shard values were
     # calibrated on a subset and must not be reported as final.
