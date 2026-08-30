@@ -2936,6 +2936,261 @@ process and only had an `"R0"` top-level key.
   out-subdir than R2's, so this collision cannot recur between the two
   regimes' MERGED outputs even though their SHARD dirs still overlapped).
 
+### V3-15 — external review of the real R2 chart: two more real bugs, plus a confirmed non-bug
+
+Session's own summary of the real R2 chart's numbers was independently re-audited
+by a second reviewer (a different Claude session/model, relayed by the user).
+Every claim checked directly against the actual downloaded artifacts before
+acting on it, per §1.9.
+
+**Checked and CONFIRMED CORRECT (not bugs):**
+1. **Contact/block-static distribution.** `block_static_R2.json` (6/1/0
+   train/val/test static trajectories) cross-checked against
+   `e0_seed_manifest.json`'s zero-contact seeds independently — exact match
+   (6, 1, 0). Two independently-computed diagnostics agree.
+2. **Early-stopping checkpoint restoration.** Read `atlas/harness.py:235-241`
+   directly: `chart._params = best_params` is restored before `chart.save()`
+   and return. The step-250 (best-val) checkpoint is genuinely what
+   `eval_loss`/`eval_umf` were computed on, not the more-overfit step-375
+   weights the raw loss curve's tail might suggest.
+
+**Bug 4 (real, and worse than the reviewer's own framing): `derive_and_report_
+motion_gate` was called with the WRONG gate at every call site.** The function
+compares a gate threshold against `latent_disp` values in `chunks_{regime}.jsonl`,
+which are ALWAYS T=nas=2 windows. Both call sites (`run_e0.py:1219` and
+`merge_p0g_shards.py:165`, which I copy-pasted from the same source) passed
+`motion_gate` -- the T=6 whole-trajectory-scale 10th-pct value -- instead of
+`chunk_motion_gate` -- the T=2 value the §7-B2 fix exists specifically to
+supply for windowed comparisons. Same class of bug as §7-B2 itself, just not
+caught there because that fix only touched `evaluate_e0_chart`'s windowed UMF
+calls, not this reporting function.
+- QUANTIFIED IMPACT on the real N=100 R2 merge (540 chunks, 60 block-static):
+  **WRONG gate (287.9, as originally reported):** false_pass_rate = **0.0%**,
+  but only **37.8%** of ALL chunks clear it at all -- the "perfect" false-pass
+  rate was an artifact of a threshold so oversized for T=2 data that it
+  rejects most real chunks too, not evidence of good calibration. **CORRECT
+  gate (155.5):** false_pass_rate = **25.0%**, 89.8% of chunks clear it. The
+  sign-off evidence in `gate_calibration_R2.json` was reporting a materially
+  better-looking number than the retired rule actually earns at the scale
+  it's applied at.
+- FIX: both call sites now pass `chunk_motion_gate`. Re-derived
+  `gate_calibration_R2.json` locally from the already-downloaded real
+  `chunks_R2.jsonl` (no Modal re-run needed -- pure post-hoc computation):
+  `gate_10pct_RETIRED: 155.52, false_pass: 0.25` / `gate_p95_static: 197.12,
+  false_pass: 0.05` -- **this is the report now on disk and the one to use
+  for the §15-5 sign-off**, not the earlier (wrong-scale) version.
+
+**Bug 5 (real, minor): `results.json`'s `train_loss` field described a
+DIFFERENT model snapshot than `eval_loss`/`eval_umf`.** `run_e0_finetune`
+returns the best-val checkpoint (confirmed correct above), but `main()` read
+`train_loss` from `loss_{kind}_{regime}.json[-1]` -- the FINAL step's loss,
+which for this run is step 375 (0.184), not step 250 (0.222) where the
+returned/evaluated chart actually came from. Cross-checked directly:
+`loss_ln_act_R2.json[249] = 0.2223`.
+- FIX: `atlas/harness.py::run_e0_finetune` now tracks `best_train_loss`
+  (captured at the same point `best_params` is captured) and writes it into
+  `val_loss_{kind}_{regime}.json`. New `run_e0.py::_reported_train_loss()`
+  helper prefers that value, both at the fresh-finetune site and the resume
+  site, falling back to the final-step loss only when no val_trajectories
+  were used (unaffected case). FALSIFICATION: verified the helper returns the
+  injected `best_train_loss` when present, and falls back correctly on a
+  stale file lacking the field (this session's own real
+  `val_loss_ln_act_R2.json`, downloaded before the fix landed, correctly
+  fails over to the old final-step value -- expected, not a bug).
+- Local `phase0_v3/p0g_onpolicy/results.json` and `val_loss_ln_act_R2.json`
+  **manually patched** with the correct value (0.2223) rather than re-running
+  the ~35-min/~$5 fine-tune purely to regenerate one metadata field --
+  documented here rather than silently edited.
+
+**Also verified, not a bug but a real finding worth carrying forward:** the
+reviewer's frozen-baseline comparison. This run's T=2 eval UMF (0.558, the
+τ-comparable scale) sits almost exactly on top of the SMOKE's frozen-`c₀`
+T=2 UMF on R2 (median 0.568, independently re-derived here from
+`phase0_v3/p0g_smoke_v3/chunks_R2.jsonl`: n=35, median=0.568 -- confirmed
+exact). Not a clean paired comparison (different populations: smoke's 7
+train+val trajectories under frozen c₀, vs this run's 8 disjoint test
+trajectories under the trained chart) -- but close enough that `ln_act`
+(10,764 params) should NOT be assumed to have meaningfully fixed the R2 shift
+at the τ-relevant granularity until a same-test-set frozen-baseline UMF is
+measured for a real paired number. **Not done in this session** (needs the
+model). Recommended before this chart goes anywhere near §4.5's C-1/C-2 or
+any downstream experiment.
+
+### V3-16 — same-test-set frozen-baseline UMF (closes V3-15's open item)
+
+Ran the check V3-15 flagged as needed: frozen-`c₀` UMF on the SAME 8 disjoint
+test trajectories the trained chart was evaluated on (not a different
+population this time). Reused the existing pipeline exactly, no new code:
+`p0g-finetune --regime R2 --steps 0 --load-subdir p0g_onpolicy --out-subdir
+p0g_onpolicy_frozen_check`. At `n_steps=0` `run_e0_finetune`'s training loop
+never executes (`for step in tqdm(range(0))`), so `best_params` stays `None`
+and the function falls to `chart.update_from_predictor_(predictor)` —
+snapshotting the untouched, never-trained predictor state, i.e. genuinely
+frozen `c₀`. Verified this control-flow read (`harness.py:240-244`) before
+spending GPU time on it. Modal app `ap-k4cuprPnxCkfWQDZ785EkY`, exit 0. Full
+artifacts (incl. `chart_ln_act_R2.pt` — the identity/no-op chart, low value
+but archived per §1.7) downloaded to `phase0_v3/p0g_onpolicy_frozen_check/`.
+
+**Real, clean, paired result — same 8 test trajectories, same gates, both arms:**
+
+| | Frozen `c₀` (this check) | Trained `ln_act` (V3-14/15) |
+|---|---:|---:|
+| Eval UMF (trajectory-scale, T≈6) | 0.5568 | 0.3313 |
+| **Eval UMF (T=2, τ-comparable)** | **0.6753** | **0.5583** |
+| Eval Loss | 0.8337 | 0.4721 |
+
+The chart genuinely helps at both scales: ~40% UMF reduction at trajectory
+scale, ~17% at the τ-relevant T=2 scale. This **retires V3-15's open concern**
+— the earlier "0.558 trained vs 0.568 frozen-smoke, barely different" read was
+an artifact of comparing across different populations (7 smoke train+val
+trajectories vs these 8 real disjoint test trajectories); the real frozen
+baseline on the actual test set is 0.675, not 0.568, and against that the
+trained chart's improvement is real. **Still true and unchanged:** 0.558 is
+still well above τ≈0.262 by the §6.1 threshold, so "does the adapter help at
+all" (yes) and "does it clear τ" (no) remain two separate answers.
+
+**Not yet done:** §4.5 C-1 (cost-ranking check) and C-2 (real planning
+catastrophe screen) — UMF improvement alone is not evidence of planning
+improvement in this substrate (N1, N4, N11, `lora4`×R1 all documented the
+opposite in this repo already). This chart is not cleared for E0′/E1/E2 until
+those run.
+
+### V3-17 — §4.5 C-1 mechanism check: CLEAR POSITIVE for the on-policy chart
+
+`P0G_FIX_PLAN.md` §4.5 C-1: recompute the within-episode CEM
+cost-vs-true-distance Spearman ρ with the real P0-G chart applied, per-seed
+(NOT pooled — the doc names pooled ρ as a specific trap: it's inflated by
+across-seed goal-difficulty variance, not within-episode discrimination).
+Ran `scripts/diagnose_cem_costs.py` via `modal_e0_planning.py::diagnose_cem_costs`
+(`--kinds baseline,ln_act --regime R2 --seeds 0..19 --num-samples 300`,
+`--charts-root phase0_v3 --charts-subdir p0g_onpolicy` — the new charts_root
+override; `iterations=1` since capture_iteration=first only needs iteration 0).
+Modal app `ap-kBlTmRFZLbhJrDs6TvG3mO`, exit 0, ~26 min, ~$0.35. Also found +
+fixed a real inefficiency: `modal_e0_planning.py`'s image `ignore` list was
+missing `phase0_v3`, uploading 661MB of local trajectory data on every build.
+Also switched its `.remote()` calls to `.spawn()` (V3-14 local-kill lesson).
+Result: `phase0_v3/cost_ranking_p0g_R2/cost_ranking_R2_seeds0-...-19.json`
+(downloaded + archived).
+
+**Per-seed ρ (the number that matters):**
+
+| arm | per-seed ρ mean ± sd | 95% CI | n positive | best_by_cost true dist |
+|---|---|---|---|---|
+| frozen `c₀` (baseline) | **+0.0014 ± 0.303** | [−0.132, +0.134] | 9/20 | 82.8 px |
+| **P0-G on-policy `ln_act`** | **+0.276 ± 0.181** | **[+0.197, +0.355]** | **19/20** | **46.0 px** |
+| (comparator: dataset-trained `ln_act`, N11) | +0.014 ± 0.294 | ~spans 0 | — | — |
+
+- Baseline reproduces the historical comparator exactly (0.0014). No signal.
+- **The P0-G chart's CI clearly excludes zero; its mean is ~14× the ±0.05
+  red-flag threshold.** C-1's RED FLAG (P0G_FIX_PLAN §4.5: "ρ remains
+  indistinguishable from baseline, mean inside ±0.05, CI spanning zero") does
+  NOT fire.
+- **This is the result the whole P0-G experiment was built to get.** The
+  *dataset*-trained `ln_act` (old open-loop-replay collector) was
+  indistinguishable from baseline at this check (N11: 0.014 ± 0.287). The
+  on-policy collector produced a chart that genuinely restores the
+  cost-ranking discrimination CEM's planner actually uses under R2 — and the
+  candidate the planner's cost function ranks best now lands 46 px from goal
+  on average vs the frozen model's 82.8 px.
+- Pooled ρ was NOT used for the verdict (reported for the record only:
+  baseline pooled 0.252, chart pooled 0.436 — both inflated by across-seed
+  variance exactly as the doc's trap warning says; the per-seed 0.001 vs 0.276
+  is the honest contrast).
+
+**External re-verification (second Claude session, same day), fully confirmed:**
+1. **Raw 20 per-seed ρ values printed and hand-averaged**: mean 0.2759, matches
+   `mean_of_per_seed_rhos` in the file to 4 decimals.
+2. **Actual pooled ρ independently recomputed** from the raw concatenated 6000
+   candidates (not read from the file): **0.4359** — genuinely different from
+   the per-seed mean (0.276) by 0.16, and matches the file's own separately-
+   stored `pooled_spearman_rho` field exactly. **This rules out the specific
+   trap named in P0G_FIX_PLAN §4.5** (mistaking the pooled, across-seed-
+   variance-inflated number for the per-seed one) — the reported 0.276 is
+   real per-seed data, verified two independent ways.
+2. **Found a real, smaller inconsistency while checking:** this FIXLOG entry's
+   comparator "dataset-trained ln_act ρ = 0.014 ± 0.294" vs
+   `P0G_FIX_PLAN.md`/`EVIDENCE_LEDGER.md` N11's "± 0.287" — traced to source:
+   0.294 is `np.std(seed_rhos, ddof=1)` (sample sd), 0.287 is `ddof=0`
+   (population sd), both computed from the same 20 raw
+   `atlas_out/cost_ranking_R2_v2/*.json` values. **`scripts/diagnose_cem_costs.py`
+   itself uses `ddof=1`** (confirmed at source, the line computing
+   `sd_of_seed_rhos`) — the actual pipeline that produced today's 0.181 sd
+   too. So 0.294 (this entry, ddof=1) is the convention-correct comparator;
+   0.287 (P0G_FIX_PLAN/EVIDENCE_LEDGER N11) is off-convention relative to the
+   code. Not fixed here (out of this entry's scope, and N11 predates this
+   script's current form) — flagged for whoever next touches N11.
+
+### V3-18 — §4.5 C-2 catastrophe screen: RED FLAG FIRES. Chart BLOCKED.
+
+Ran the real closed-loop planning screen: `run_e0_planning --kind ln_act
+--regime R2 --regime-config '{"damping":0.5}' --episodes 20 --num-samples 300
+--iterations 10 --horizon 6 --num-act-stepped 2 --charts-root phase0_v3
+--charts-subdir p0g_onpolicy --out-root phase0_v3 --out-subdir c2_p0g_R2
+--num-shards 4`, matching the paired baseline's config exactly (verified field
+by field against `phase0_v3/p0c/p0c_it10_baseline_R2.jsonl`'s first record
+before launch: damping=0.5, nas=2/3 replans/30 steps, horizon=6 default).
+Modal app `ap-I6ebmKsjJeHPAQm1a2vZp6`, 4 concurrent shards, all exit 0, merged
+cleanly (`merge_planning_shards.py`'s own contiguity/dedup check passed — 20
+unique episode indices 0-19). ~13 min wall-clock (4-way sharded), ~$0.50.
+Result + shard files downloaded to `phase0_v3/c2_p0g_R2/`.
+
+Ran `scripts/c2_planning_screen.py` (written + self-tested earlier this
+session) against the real paired baseline
+(`phase0_v3/p0c/p0c_it10_baseline_R2.jsonl`, n=20, SR 10/20):
+
+| | on-policy `ln_act` chart | frozen `c₀` baseline |
+|---|---:|---:|
+| SR | **1/20 (5%)** | 10/20 (50%) |
+| Δ SR | **−0.450**, 95% CI **[−0.650, −0.250]** | |
+| McNemar p | **0.0039** | |
+| discordant split | 0 chart-only, **9 baseline-only**, 1 both-succeed, 10 both-fail | |
+| knock-aways (overshoot) | 1 | 4 |
+| mean final block dist | 57.4px | 54.8px |
+
+**RED FLAG 1 (SR <= 5/20) FIRES.** Not a power-limited null — the 95% CI
+excludes zero by a wide margin, well past what n=20 is powered to detect
+(~25-30pp; this is 45pp). RED FLAG 2 (overshoot mechanism unmoved) does NOT
+fire (knock-aways went DOWN, 4->1) -- but that is not reassuring against a
+9-0 discordant split. **VERDICT: BLOCK per §4.5 -- this chart must not go
+near E0'/E1/E2.**
+
+**Directly contradicts C-1's prediction, and that tension is the finding, not
+noise to resolve here.** C-1 (V3-17) showed this exact chart substantially
+improves the CEM cost function's within-episode ranking under R2 (per-seed rho
+0.001->0.276, CI clear of zero, best-by-cost true distance 83px->46px). C-2
+shows that when that improved ranking drives REAL closed-loop planning
+(replanning across 3 chunks/episode, not a single frozen candidate batch),
+success collapses. Same dissociation this project has already documented for
+UMF (N1: 44/100 vs 43/100 despite falling UMF; N11: `lora4` best local UMF,
+worst SR) and for `lora4`xR1 (better UMF, 4/10 vs 8/10) -- now shown for
+cost-ranking too. A single-shot mechanism check does not guarantee closed-loop
+outcomes; C-1 and C-2 measure genuinely different things and this result is
+exactly why the plan requires both, not either.
+
+**Additional, unresolved observation (not the headline, but real and worth
+carrying forward):** 9/20 episodes show `block_pos_diff == init_block_pos_diff`
+exactly (contacts 0 or 1) -- the block essentially never moved. Striking next
+to C-1's finding that this exact chart ranks candidates better under R2. Not
+explained here; a real candidate hypothesis for a follow-up investigation
+(e.g. does the chart's improved single-batch ranking degrade over the 3
+sequential replans a real episode requires, in a way C-1's one-shot design
+can't see?), not resolved by anything run this session.
+
+**Kendall tau(UMF, success) = -0.316 (p=0.099, n=20)** -- logged for the
+record (`ln_act_R2_summary.json`, `merge_planning_shards.py`'s own computation,
+unmodified script). Not significant at n=20, and its NEGATIVE sign is the
+opposite of what "UMF tracks success" would predict -- one more data point in
+the same direction as N1/N4/N11's UMF-does-not-track-planning finding, not
+independent corroboration of it (small n, same underlying mechanism).
+
+**§4.5 is now fully closed for this chart.** C-1 passed (mechanism restored);
+C-2 blocked (real planning collapsed). Net: **this on-policy `ln_act`×R2
+chart is NOT cleared for any downstream experiment.** The honest write-up is
+that P0-G's collector genuinely fixed the cost-ranking-mechanism failure mode
+C-1 tests for, while simultaneously producing a chart that is worse than doing
+nothing at real closed-loop planning -- a result worth reporting for what it
+is, not explaining away.
+
 **Standing lesson, not yet enforced in code:** two regimes sharded
 concurrently must use distinct `--out-subdir` values (or the code should
 reject a collision) — this was a real gap in the sharding feature's design,
@@ -3007,6 +3262,169 @@ the earlier fine-tune smoke loaded directly from an unsharded, unmerged
 `p0g_collect` output. A `--load-trajs` smoke against a merged file would have
 caught this before real spend; noted for the next feature added to this
 pipeline.
+
+### V3-19 — C-2 mechanism study: all three hypotheses REFUTED; the real mechanism is variance compression against a threshold objective
+
+**Date:** 2026-08-30. Nine Modal runs (~$3.0, L4) + two local analyses. Follows
+`research_audit/C2_FAILURE_DIAGNOSIS.md` Part 5, which proposed three experiments
+to convert V3-18's unexplained C-1/C-2 contradiction into a measured mechanism.
+**All three hypotheses were refuted.** A fourth, unplanned run resolved it.
+
+**Code changed (one file, additive):** `scripts/run_e0_planning.py` gained
+`--objective-alpha` (default **0.1** = the substrate's previously-hardcoded value),
+threaded through `modal/modal_e0_planning.py`. FALSIFICATION, model-free: BEFORE
+the flag, `--objective-alpha 0.0` → `error: unrecognized arguments` (exit 2). AFTER,
+`build_cfg(300,10,6,2)` is compared field-by-field against the literal pre-patch cfg
+dict → **identical**, so every prior run is unaffected; `build_cfg(...,
+objective_alpha=0.0)` yields `alpha=0.0`. `run_episode`'s planning loop untouched
+(§1.2). New read-only analysis: `scripts/c2_mechanism_analysis.py`,
+`scripts/c2_widen_offline_umf.py`. `atlas/score.py` and `atlas/stats.py` unmodified.
+
+---
+
+#### 0. Loose end from the close-out audit: the 1/20 is definitively real
+
+Recounted the four raw shard files by hand (the close-out audit's five bug-checks
+verified *pairing*, never the *merge*). `ln_act_R2_shard{0..3}.jsonl`: 5 rows each,
+episodes `[0-4][5-9][10-14][15-19]`, **20 distinct, zero duplicates**, `success` is
+a real `bool` (not a truthy string). **Exactly one success: episode 6.** The merged
+`ln_act_R2.jsonl` is row-for-row identical to the shard union (`merged[e] == shard[e]`
+for all 20). Independent McNemar cell recount from raw files: n10=0, n01=9, n11=1,
+n00=10, sum 20 — reproducing `c2_screen_summary.json` exactly.
+`scripts/c2_mechanism_analysis.py`, written independently of
+`scripts/c2_planning_screen.py`, reproduces −0.450, CI [−0.65,−0.25], p=0.0039.
+
+#### 1. All three proposed mechanisms REFUTED
+
+Every cell below is 20 paired episodes, seeds 0–19, `damping=0.5`, N=300, horizon=6,
+`min_block_pos_diff=40`, `max_agent_block_dist=160`. Task pairing **asserted**
+(`init_block_pos_diff` and `init_agent_block_dist` equal to 1e-9) in every comparison.
+
+| hypothesis | prediction if true | result | verdict |
+|---|---|---|---|
+| §3.1 CEM exploitation over iterations | chart recovers when CEM optimises less | it=1 **1/20** vs 7/20 (p=0.031); it=3 **0/20** vs 8/20 (p=0.0078); it=10 **1/20** vs 10/20 (p=0.0039) | **REFUTED** |
+| §3.2 unsupervised proprio head | chart recovers at `alpha=0` | **2/20** vs 9/20, ΔSR −0.35, p=0.016 | **REFUTED** |
+| §3.1 at convergence (C-1 `--capture-iteration last`) | chart's converged candidates worse in ground truth | chart elite-10 **56.8 px** vs frozen **123.8 px**, chart better **19/20**, p<0.0001; gap *widens* from −21.8 px at iter-0 to −67.0 px at convergence | **REFUTED, and backwards** |
+
+A framing error of my own, found and corrected: C-1's headline metric is
+`block_pos_diff` **only**, while success is `pos_diff < 20px` **AND**
+`angle_diff < 20°` (`run_e0_planning.py:239`). Checked whether orientation was the
+hidden cause — it is not: in every cell `pos<20px` count ≈ `success` count
+(e.g. it=10 frozen: pos 10/20, angle 14/20, both 10/20). **Position is binding.**
+
+#### 2. The offline improvement is NOT a small-sample artifact (local, free)
+
+The checkpoint *does* load locally with CUDA (contradicting a prior session's note),
+so the acceptance number was recomputed paired-per-window over the whole archived
+`trajs_R2.pt` instead of the 40 test windows it rested on:
+
+| population | chart | frozen | Δ (paired bootstrap, n=10000) |
+|---|---:|---:|---|
+| test (n=40) | 0.5583 | 0.6753 | −0.1170 [−0.182,−0.039] = −17.3% |
+| train (n=500) | 0.4761 | 0.6251 | −0.1490 [−0.171,−0.126] = −23.8% |
+| **all (n=580)** | **0.4863** | **0.6275** | **−0.1412 [−0.162,−0.119] = −22.5%, better in 474/580** |
+
+The test-split values reproduce `phase0_v3/p0g_onpolicy/results.json`'s
+`eval_umf_chunkT2` to 4 dp on different hardware in a separate process. **This
+closes the close-out audit's V-3 caveat** ("verified against artifact, not
+re-executed") and B-5's "never rerun and diffed" for this number.
+
+#### 3. THE MECHANISM: variance compression against a threshold objective
+
+Adding a `nas=6` cell (execute the whole 6-model-step plan, 1 replan — the substrate's
+own validated cadence) isolated it. Pooled over all five paired cells (100 paired
+episodes; the cells share the same 20 tasks, so this is **descriptive, not 100
+independent samples**):
+
+| | mean final dist | sd | **<20px (success)** | in [20,60) | >100px |
+|---|---:|---:|---:|---:|---:|
+| chart | **58.9 px** | **32.7** | **9/100** | **49** | **8** |
+| frozen `c0` | **58.2 px** | **53.1** | **46/100** | 13 | 16 |
+
+**The means are the same** (paired Δ +0.7 px, Wilcoxon p=0.093). **The spreads are
+not** (Levene p=0.00060). The frozen model's outcome distribution is bimodal — it
+either lands under 20 px or overshoots badly. The chart's is compressed into the
+middle. At `nas=6` the frozen model's `[20,60)` band is literally **empty (0/20)**
+while the chart puts **8/20** there.
+
+**The chart converts catastrophic overshoots into near-misses, and near-misses into
+misses.** Because success is a threshold at 20 px, compressing the distribution
+toward its own mean destroys success while improving — or at minimum not harming —
+every mean statistic. Per-episode at `nas=6`: on far tasks the chart is dramatically
+better (ep2 65 vs 231 px; ep5 62 vs 163; ep3 51 vs 145) and converts none of it;
+on near tasks the frozen model lands 10/11 under 20 px while the chart lands at
+23.9 / 25.7 / 20.6 / 29.8 px — near-misses.
+
+**This explains every prior observation at once**, including two I had mis-attributed
+in `C2_FAILURE_DIAGNOSIS.md`:
+- Why offline UMF improved 22.5% — UMF is a *mean* normalised latent error.
+- Why C-1's ρ and mean candidate distance improved — both *mean* statistics.
+- Why SR collapsed — SR is a *threshold*, and no mean statistic constrains it.
+- Why fewer CEM iterations didn't help, why `alpha=0` didn't help, and why the
+  failure was present at replan 1: none of those touch the distribution's shape.
+- **Correction to §2.2 of `C2_FAILURE_DIAGNOSIS.md`:** the chart's inflated
+  closed-loop UMF (1.113 at nas=2) is largely a *consequence* of the block not
+  moving (UMF's denominator is latent displacement), not an independent failure.
+  At `nas=6` the chart's UMF is **0.543** vs frozen 0.440 — nearly normal.
+
+**A second, separable effect (replan cadence).** At `nas=2` the chart shows an
+inaction pathology absent at `nas=6`: zero-contact episodes **4/20 → 0/20**,
+block-static(<0.5px) **8/20 → 1/20**, contacts 2.25 → 3.35, SR **1/20 → 5/20**.
+The frozen model is nearly unaffected (10/20 → 11/20). Consistent with the chart
+producing back-loaded plans whose contact phase falls outside the first `nas=2`
+executed steps, so a short cadence perpetually re-plans the approach and never
+executes the push. **Stated as the best-supported reading of the cadence
+interaction, not as an independently verified mechanism** — the candidate action
+sequences are not persisted by `diagnose_cem_costs.py`, so plan-phase structure was
+not directly inspected.
+
+#### 4. What this means
+
+`P0G_FIX_PLAN.md` §4.5's BLOCK verdict on this chart **stands and is strengthened**:
+the chart is worse at the task at every cadence and every CEM budget tested. But
+V3-18's framing ("worse than doing nothing at real closed-loop planning") is now
+**too coarse and should be superseded**: the chart achieves the same mean final block
+distance as the frozen model and is substantially better on far tasks. It is worse
+*at the success criterion*, for a specific and now-measured reason.
+
+**The generalised finding, which is bigger than this chart:** every acceptance
+statistic this project uses — UMF (§6.1's τ included), C-1's Spearman ρ, mean final
+distance — is a **mean** statistic. Push-T success is a **threshold**. A mean
+statistic cannot detect variance compression, and variance compression is exactly
+what a small adapter fitted with an unweighted MSE latent loss produces. This is a
+structural gap in the acceptance criterion. **Whether the compression itself
+generalises to other charts is NOT established** — see the retraction note below.
+
+**RETRACTED same-day, before it was relied on: a cross-chart generality table.** A sweep over
+every planning JSONL on disk suggested 8/9 charts compress the outcome distribution (sd ratio
+< 1), with only the P0-G chart compressing severely (0.46 / 0.51 vs 0.73–1.01). **That
+comparison is not admissible and is withdrawn.** The `e0_planning_n100`, `e0_v3_*`, `e0_v4_*`
+and `e0_v5_*` rows are dated 2026-08-25/26 — a *different chart generation*, trained by the
+dataset-replay / hybrid collectors **before every P0-G fix** (V3-6 §3.1 `steps_left`, §3.2
+`traj_len`, §3.3 test split, §3.4 regime contamination) — and evaluated at `iterations=30,
+nas=6`, not P0-G's `it=10, nas=2` (`e0_planning_n100` records `replans: 1`). Comparing sd
+*ratios* across those two groups varies collector, chart and planner protocol at once: the
+exact like-for-like defect class `P0_CLOSEOUT_AUDIT.md` property (d) names, recurring for the
+fifth time. The `lora4` / `full` rows additionally carry the known training-set-size confound
+(`CLAUDE.md` §0.1; `OPUS_REMAINING_TASKS.md` #12). The Spearman across all nine cells was null
+anyway (rho = 0.298, p = 0.436) and must not be quoted. Caught by the user on sight.
+
+**What still stands:** every cell in §3 above is the P0-G chart on the same 20 tasks against a
+protocol-matched paired baseline, so V3-19's mechanism is established **for this chart**.
+Generality across chart kinds and collectors is an OPEN question requiring same-protocol re-runs.
+
+**Artifacts** (all downloaded and archived per §1.7, nothing deleted):
+`phase0_v3/{c2_dose_it1,c2_dose_it3}_{baseline,ln_act}/`,
+`phase0_v3/c2_alpha0_{baseline,ln_act}/`, `phase0_v3/c2_nas6_{baseline,ln_act}/`,
+`phase0_v3/cost_ranking_p0g_R2_iterlast/`, `phase0_v3/c2_dose_response.json`,
+`phase0_v3/c2_alpha_ablation.json`, `phase0_v3/c2_widened_offline_umf.json`.
+
+**NOT run / NOT verified:** the back-loaded-plan reading of §3's cadence effect
+(needs persisted candidate actions); any R0 or R1 arm; any repeat launch of the same
+cell, so single-launch variance is still uncharacterised (P16 remains `PREPARED, NOT
+RUN`); `iterations>10` for the chart. The pooled 100-episode table reuses 20 tasks
+across five cells and is descriptive only — every p-value quoted per-cell is from
+that cell's own 20 paired episodes.
 
 ### New Phase-0 diagnostic scripts (not experiment code)
 
