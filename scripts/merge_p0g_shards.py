@@ -162,7 +162,7 @@ def main() -> None:
         "train": all_train, "val": val_trajectories, "test": test_trajectories,
     })
     derive_and_report_motion_gate(args.out_dir, regime,
-                                  args.out_dir / f"chunks_{regime}.jsonl", motion_gate)
+                                  args.out_dir / f"chunks_{regime}.jsonl", chunk_motion_gate)
 
     print(f"\n[OK] Merge complete: {len(all_train)} train / {len(val_trajectories)} val / "
           f"{len(test_trajectories)} test trajectories -> {args.out_dir}")

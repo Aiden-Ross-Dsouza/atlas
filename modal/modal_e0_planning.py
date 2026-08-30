@@ -34,7 +34,10 @@ image = (
         # /src, NOT under /atlas_root: that's the volume mount point, and Modal
         # refuses to mount a volume onto a path that already has image content.
         str(REPO_ROOT), remote_path="/src", copy=True,
-        ignore=[".venv", ".git", "data", "hub", "atlas_out", "graphify-out", "__pycache__", "logs"],
+        ignore=[".venv", ".git", "data", "hub", "atlas_out", "graphify-out", "__pycache__", "logs",
+                "phase0_v3"],  # accessed via the mounted volume at runtime, not the image build --
+                               # this was missing here (present in modal_phase0.py's ignore list)
+                               # and was uploading 661MB+ of local trajectory data on every build.
     )
     .run_commands(
         # vendor/jepa-wms installed explicitly first: pyproject.toml deliberately
@@ -86,6 +89,11 @@ def run_e0_planning(
     episode_start: int = 0,
     out_suffix: str = "",
     log_umf: bool = True,
+    charts_root: str = "atlas_out",
+    out_root: str = "atlas_out",
+    # C2_FAILURE_DIAGNOSIS.md 3.2 test: proprio weight in the planner cost.
+    # 0.1 = the substrate default, so every existing caller is unchanged.
+    objective_alpha: float = 0.1,
 ) -> None:
     """Defaults = the SUBSTRATE's own validated Push-T config (CEM 300x30,
     horizon 6, num_act_stepped 6 -> 30 raw steps/episode, 1 replan), the
@@ -110,7 +118,12 @@ def run_e0_planning(
     episode_start=50/episodes=100, out_suffix='_shard0'/'_shard1') -- see
     scripts/merge_planning_shards.py to combine them afterward. log_umf:
     on by default -- logs per-replan UMF of the executed chunk alongside
-    success, giving an episode-level (UMF, success) pair for free."""
+    success, giving an episode-level (UMF, success) pair for free.
+    charts_root/out_root (P0G_FIX_PLAN §4.5 C-2): override the "atlas_out"
+    prefix so charts_subdir/out_subdir can point under phase0_v3 -- e.g.
+    charts_root="phase0_v3", charts_subdir="p0g_onpolicy" plans with the real
+    on-policy P0-G chart at phase0_v3/p0g_onpolicy/chart_{kind}_{regime}.pt.
+    Default unchanged; every existing caller unaffected."""
     import subprocess
     import sys
     # Volumes are eventually consistent -- reload() picks up commits made by
@@ -124,11 +137,12 @@ def run_e0_planning(
            "--iterations", str(iterations),
            "--horizon", str(horizon),
            "--num-act-stepped", str(num_act_stepped),
-           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
-           "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}",
+           "--charts-dir", f"{ATLAS_MOUNT_PATH}/{charts_root}/{charts_subdir}",
+           "--out-dir", f"{ATLAS_MOUNT_PATH}/{out_root}/{out_subdir}",
            "--min-block-pos-diff", str(min_block_pos_diff),
            "--episode-start", str(episode_start),
-           "--out-suffix", out_suffix]
+           "--out-suffix", out_suffix,
+           "--objective-alpha", str(objective_alpha)]
     if regime_config is not None:
         cmd += ["--regime-config", regime_config]
     if max_agent_block_dist is not None:
@@ -145,7 +159,8 @@ def run_e0_planning(
     volumes={ATLAS_MOUNT_PATH: atlas_volume},
     timeout=600,
 )
-def merge_shards(kind: str, regime: str, out_subdir: str, shards: list[str]) -> None:
+def merge_shards(kind: str, regime: str, out_subdir: str, shards: list[str],
+                 out_root: str = "atlas_out") -> None:
     """Runs scripts/merge_planning_shards.py inside a container with the
     volume mounted, so combining shard outputs needs no local download."""
     import subprocess
@@ -154,7 +169,7 @@ def merge_shards(kind: str, regime: str, out_subdir: str, shards: list[str]) -> 
     subprocess.run(
         [sys.executable, "scripts/merge_planning_shards.py",
          "--kind", kind, "--regime", regime,
-         "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}",
+         "--out-dir", f"{ATLAS_MOUNT_PATH}/{out_root}/{out_subdir}",
          "--shards", *shards],
         check=True, cwd="/src",
     )
@@ -169,7 +184,9 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
           log_planner_diagnostics: bool = False, min_block_pos_diff: float = 40.0,
           max_agent_block_dist: float | None = None,
           episode_start: int = 0, out_suffix: str = "", log_umf: bool = True,
-          num_shards: int = 1) -> None:
+          num_shards: int = 1,
+          charts_root: str = "atlas_out", out_root: str = "atlas_out",
+          objective_alpha: float = 0.1) -> None:
     """num_shards > 1: splits [episode_start, episodes) into that many
     contiguous, near-equal ranges, launches each as its own CONCURRENT Modal
     container (via .spawn(), not sequential .remote() calls), waits for all
@@ -180,13 +197,19 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
     single faster GPU. E.g. --episodes 100 --num-shards 4 runs four L4s
     concurrently instead of one L4 for 4x as long, for the same total cost."""
     if num_shards <= 1:
-        run_e0_planning.remote(kind=kind, regime=regime, regime_config=regime_config, episodes=episodes,
-                                num_samples=num_samples, iterations=iterations, horizon=horizon,
-                                min_block_pos_diff=min_block_pos_diff,
-                                max_agent_block_dist=max_agent_block_dist,
-                                num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
-                                out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics,
-                                episode_start=episode_start, out_suffix=out_suffix, log_umf=log_umf)
+        # .spawn() not .remote() -- a bare .remote() was found NOT to survive a
+        # local process kill despite --detach (P0-G FIXLOG V3-14/15).
+        call = run_e0_planning.spawn(
+            kind=kind, regime=regime, regime_config=regime_config, episodes=episodes,
+            num_samples=num_samples, iterations=iterations, horizon=horizon,
+            min_block_pos_diff=min_block_pos_diff, max_agent_block_dist=max_agent_block_dist,
+            num_act_stepped=num_act_stepped, charts_subdir=charts_subdir,
+            out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics,
+            episode_start=episode_start, out_suffix=out_suffix, log_umf=log_umf,
+            charts_root=charts_root, out_root=out_root,
+            objective_alpha=objective_alpha)
+        print(f"Spawned run_e0_planning as function call {call.object_id}. "
+              f"Not waiting locally -- check `modal app logs` for progress/completion.")
         return
 
     total = episodes - episode_start
@@ -212,6 +235,8 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
             num_act_stepped=num_act_stepped, charts_subdir=charts_subdir, out_subdir=out_subdir,
             log_planner_diagnostics=log_planner_diagnostics,
             episode_start=s, out_suffix=suffix, log_umf=log_umf,
+            charts_root=charts_root, out_root=out_root,
+            objective_alpha=objective_alpha,
         )
         for (s, e), suffix in zip(bounds, shard_suffixes)
     ]
@@ -223,8 +248,9 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
     for call in tqdm(calls, desc=f"{kind}_{regime} shards", unit="shard"):
         call.get()
     print("All shards complete -- merging into the canonical file...")
-    merge_shards.remote(kind=kind, regime=regime, out_subdir=out_subdir, shards=shard_suffixes)
-    print(f"Merged: atlas_out/{out_subdir}/{kind}_{regime}.jsonl")
+    merge_shards.remote(kind=kind, regime=regime, out_subdir=out_subdir, shards=shard_suffixes,
+                        out_root=out_root)
+    print(f"Merged: {out_root}/{out_subdir}/{kind}_{regime}.jsonl")
 
 
 @app.function(
@@ -256,6 +282,8 @@ def diagnose_cem_costs(
     capture_iteration: str = "first",
     charts_subdir: str = "e0",
     out_subdir: str = "cost_ranking",
+    charts_root: str = "atlas_out",
+    out_root: str = "atlas_out",
 ) -> None:
     """scripts/diagnose_cem_costs.py -- cost-ranking diagnostic: for each
     fixed (init, goal) pair (one per seed in `seeds`, comma-separated, e.g.
@@ -271,7 +299,12 @@ def diagnose_cem_costs(
     dose-response sweep): JSON dict overriding this regime's default physics
     param, e.g. '{"damping": 0.25}' for an intermediate severity between
     R0's implicit 0 and R2's default 0.5 -- same mechanism as
-    run_e0_planning.py's identical flag."""
+    run_e0_planning.py's identical flag. charts_root/out_root (added for
+    P0G_FIX_PLAN §4.5 C-1): override the "atlas_out" prefix so charts_subdir/
+    out_subdir can point under phase0_v3 instead -- e.g. charts_root=
+    "phase0_v3", charts_subdir="p0g_onpolicy" loads the real on-policy P0-G
+    chart at phase0_v3/p0g_onpolicy/chart_ln_act_R2.pt. Default unchanged, so
+    every existing caller is unaffected."""
     import subprocess
     import sys
     atlas_volume.reload()
@@ -284,8 +317,8 @@ def diagnose_cem_costs(
            "--horizon", str(horizon),
            "--num-act-stepped", str(num_act_stepped),
            "--capture-iteration", capture_iteration,
-           "--charts-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{charts_subdir}",
-           "--out-dir", f"{ATLAS_MOUNT_PATH}/atlas_out/{out_subdir}"]
+           "--charts-dir", f"{ATLAS_MOUNT_PATH}/{charts_root}/{charts_subdir}",
+           "--out-dir", f"{ATLAS_MOUNT_PATH}/{out_root}/{out_subdir}"]
     if regime_config is not None:
         cmd += ["--regime-config", regime_config]
     subprocess.run(cmd, check=True, cwd="/src")
@@ -298,11 +331,20 @@ def diagnose_cem_costs_entrypoint(kinds: str = "baseline,ln_act", regime: str = 
                                     num_samples: int = 300, iterations: int = 30, horizon: int = 6,
                                     num_act_stepped: int = 6, capture_iteration: str = "first",
                                     charts_subdir: str = "e0",
-                                    out_subdir: str = "cost_ranking") -> None:
-    diagnose_cem_costs.remote(kinds=kinds, regime=regime, regime_config=regime_config, seeds=seeds,
-                               num_samples=num_samples, iterations=iterations, horizon=horizon,
-                               num_act_stepped=num_act_stepped, capture_iteration=capture_iteration,
-                               charts_subdir=charts_subdir, out_subdir=out_subdir)
+                                    out_subdir: str = "cost_ranking",
+                                    charts_root: str = "atlas_out",
+                                    out_root: str = "atlas_out") -> None:
+    # .spawn() not .remote() -- a bare .remote() was found NOT to survive a
+    # local process kill despite --detach (P0-G FIXLOG V3-14/V3-15), even
+    # though it usually does; .spawn() is the proven-robust pattern.
+    call = diagnose_cem_costs.spawn(
+        kinds=kinds, regime=regime, regime_config=regime_config, seeds=seeds,
+        num_samples=num_samples, iterations=iterations, horizon=horizon,
+        num_act_stepped=num_act_stepped, capture_iteration=capture_iteration,
+        charts_subdir=charts_subdir, out_subdir=out_subdir,
+        charts_root=charts_root, out_root=out_root)
+    print(f"Spawned diagnose_cem_costs as function call {call.object_id}. "
+          f"Not waiting locally -- check `modal app logs` for progress/completion.")
 
 
 @app.function(

@@ -151,6 +151,10 @@ def run_e0_finetune(
     loss_log: list[float] = []
     val_loss_log: list[dict] = []
     best_val_loss = float("inf")
+    best_train_loss: float | None = None  # train loss AT the best-val step -- the
+                                          # value that actually describes the chart
+                                          # returned/saved, not the final step's
+                                          # (possibly more-overfit) train loss.
     best_params: dict[str, torch.Tensor] | None = None
     checks_since_improvement = 0
     stopped_early_at: int | None = None
@@ -221,6 +225,7 @@ def run_e0_finetune(
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_train_loss = avg_loss
                 best_params = copy.deepcopy(chart._params)
                 checks_since_improvement = 0
             else:
@@ -247,6 +252,7 @@ def run_e0_finetune(
         (out_dir / f"val_loss_{kind}_{regime}.json").write_text(json.dumps({
             "val_loss_log": val_loss_log,
             "best_val_loss": best_val_loss,
+            "best_train_loss": best_train_loss,  # train loss AT the checkpoint used
             "stopped_early_at_step": stopped_early_at,
         }))
     return chart

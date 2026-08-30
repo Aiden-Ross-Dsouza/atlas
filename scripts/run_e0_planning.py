@@ -90,7 +90,8 @@ from atlas.chart import Chart  # noqa: E402
 from atlas.regimes import PhysicsRegime, REGIME_CONFIGS, set_regime_config  # noqa: E402
 
 
-def build_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: int) -> OmegaConf:
+def build_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: int,
+               objective_alpha: float = 0.1) -> OmegaConf:
     return OmegaConf.create({
         "local_seed": 0,
         "task_specification": {"obs": "rgb_state"},
@@ -105,7 +106,14 @@ def build_cfg(num_samples: int, iterations: int, horizon: int, num_act_stepped: 
             "repeat_actskip": False,
             "decode_each_iteration": False,
             "distribute_planner": False,
-            "planning_objective": {"objective_type": "L2", "sum_all_diffs": False, "alpha": 0.1},
+            # alpha weights the PROPRIO term in the planner cost
+            # (objectives.py: diff = diff_visual + alpha * diff_proprio).
+            # Default 0.1 = the substrate's own validated value, unchanged for every
+            # existing caller. Exposed only so C2_FAILURE_DIAGNOSIS.md §3.2 can be
+            # tested: the chart's fine-tune loss is VISUAL-ONLY (harness.py:183), so
+            # nothing constrains the proprio head it degrades here.
+            "planning_objective": {"objective_type": "L2", "sum_all_diffs": False,
+                                    "alpha": objective_alpha},
         },
     })
 
@@ -393,6 +401,15 @@ def main() -> None:
                               "before PhysicsRegime is constructed; logged into the summary JSON "
                               "and every per-episode record so cells stay attributable. Omit to "
                               "use REGIME_CONFIGS' existing default for --regime.")
+    parser.add_argument("--objective-alpha", type=float, default=0.1,
+                         help="Weight on the PROPRIO term in the CEM planner cost "
+                              "(objectives.py: diff_visual + alpha*diff_proprio). "
+                              "Default 0.1 = the substrate's validated value; every "
+                              "prior run used it, so the default is byte-identical to "
+                              "before this flag existed. --objective-alpha 0 ablates "
+                              "the proprio term -- the C2_FAILURE_DIAGNOSIS.md §3.2 test, "
+                              "since chart fine-tuning supervises VISUAL latents only "
+                              "and leaves the proprio head unconstrained.")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--num-samples", type=int, default=300,
@@ -480,7 +497,8 @@ def main() -> None:
         chart = Chart.load(str(chart_path), wm.predictor)
         chart.apply_(wm.predictor)
 
-    cfg = build_cfg(args.num_samples, args.iterations, args.horizon, args.num_act_stepped)
+    cfg = build_cfg(args.num_samples, args.iterations, args.horizon, args.num_act_stepped,
+                     objective_alpha=args.objective_alpha)
     agent = GC_Agent(cfg, model, dset=None, preprocessor=prep)
     agent.device = device
 
