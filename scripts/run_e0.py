@@ -926,6 +926,22 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _reported_train_loss(out_dir: Path, kind: str, regime: str, loss_log: list) -> float:
+    """The train loss that should be reported alongside eval_loss/eval_umf.
+    run_e0_finetune() returns the BEST-VAL checkpoint's weights, not the final
+    step's -- so the final entry of loss_{kind}_{regime}.json describes a
+    DIFFERENT (more overfit) snapshot than the one actually evaluated. Prefer
+    val_loss_{kind}_{regime}.json's best_train_loss (the train loss recorded
+    at the exact step best_params was captured); fall back to the final loss
+    only if that file doesn't exist (e.g. no val_trajectories were used)."""
+    val_loss_file = out_dir / f"val_loss_{kind}_{regime}.json"
+    if val_loss_file.exists():
+        d = json.loads(val_loss_file.read_text())
+        if d.get("best_train_loss") is not None:
+            return d["best_train_loss"]
+    return loss_log[-1] if loss_log else float("nan")
+
+
 def compute_motion_gates(train_trajectories: list[dict], nas: int,
                          verbose_label: str = "") -> tuple[float, float | None]:
     """Gate G6 (motion_gate) + §7-B2 (chunk_motion_gate), factored out of
@@ -1217,7 +1233,7 @@ def main() -> None:
             # alongside the retired 10th-pct value and each rule's realised
             # false-pass rate, for explicit human sign-off (§15-5). NOT adopted here.
             derive_and_report_motion_gate(args.out, regime,
-                                          args.out / f"chunks_{regime}.jsonl", motion_gate)
+                                          args.out / f"chunks_{regime}.jsonl", chunk_motion_gate)
 
         if args.collect_only:
             print(f"  [P2] --collect-only: trajectories for {regime} persisted, "
@@ -1238,7 +1254,7 @@ def main() -> None:
                 # [Resume support] Skip fine-tuning if results already exist on disk / volume
                 print(f"  ⏩ [Resume] {kind}_{regime} already completed. Loading cached result...", flush=True)
                 losses = json.loads(loss_file.read_text())
-                final_loss = losses[-1] if losses else float("nan")
+                final_loss = _reported_train_loss(args.out, kind, regime, losses)
                 try:
                     chart = Chart.load(chart_file, wm.predictor)
                     n_params = chart.n_params()  # real parameter count, not a tensor count (T12 #9)
@@ -1359,7 +1375,7 @@ def main() -> None:
             
             # Compute evaluation metrics
             losses = json.loads(loss_file.read_text())
-            final_loss = losses[-1] if losses else float("nan")
+            final_loss = _reported_train_loss(args.out, kind, regime, losses)
             results[regime][kind] = {
                 "train_loss": final_loss,
                 "eval_loss": eval_loss,
