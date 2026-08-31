@@ -245,7 +245,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
                  seq_lengths: list[int], log_planner_diagnostics: bool = False,
                  min_block_pos_diff: float = 40.0,
                  max_agent_block_dist: float = DEFAULT_MAX_AGENT_BLOCK_DIST,
-                 world_model=None, log_umf: bool = False) -> dict:
+                 world_model=None, log_umf: bool = False, settle_steps: int = 0) -> dict:
     device = agent.device
 
     rs = np.random.RandomState(seed)
@@ -280,6 +280,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
 
     elapsed = 0
     success = False
+    success_at_step = None  # raw step at which the pass-through criterion first fired
     replans = 0
     total_contacts = 0
     final_check = {"block_pos_diff": None, "block_angle_diff": None}
@@ -330,6 +331,7 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
             final_check = block_success(goal_state, info["state"])
             if final_check["success"]:
                 success = True
+                success_at_step = elapsed
                 break
 
         if log_umf and world_model is not None:
@@ -375,11 +377,49 @@ def run_episode(agent: GC_Agent, base_env: PushTEnv, wrapper: PushTWrapper, regi
         if success:
             break
     replan_pbar.close()
+
+    # FABLE5 Day 1.1 (criterion validity). The success criterion above fires per raw
+    # step and breaks immediately (pass-through). Under R2 (space.damping=0.5) the
+    # block glides, so a transient crossing can count even if the block sails on.
+    # settle_steps > 0: from wherever the episode left the env (right after a
+    # pass-through crossing, OR at max_steps for a non-success), hold position for
+    # settle_steps raw steps (relative=True default => a zero action is "hold",
+    # pusht_env.py:481-483; step() does not touch space.damping) and re-check
+    # block_success. Applied to EVERY episode so the settled distance is one
+    # measurement across the whole arm, not a substitution only on successes.
+    # settled_trace records block_success at checkpoints so settle-count sensitivity
+    # is answerable from a single run.
+    settle_info = None
+    if settle_steps > 0:
+        checkpoints = sorted({c for c in (1, 5, 15, 30, 45, settle_steps) if 1 <= c <= settle_steps})
+        trace = []
+        settled_state = info["state"]  # last state the episode loop reached
+        stepped = 0
+        for cp in checkpoints:
+            while stepped < cp:
+                _, _, _, si = base_env.step(np.zeros(2, dtype=np.float32))
+                settled_state = si["state"]
+                stepped += 1
+            bc = block_success(goal_state, settled_state)
+            trace.append({"step": cp, "block_pos_diff": bc["block_pos_diff"],
+                          "block_angle_diff": bc["block_angle_diff"], "success": bool(bc["success"])})
+        settled_check = block_success(goal_state, settled_state)
+        settle_info = {
+            "success_at_step": success_at_step,
+            "passthrough_success": bool(success),
+            "settled_success": bool(settled_check["success"]),
+            "settled_block_pos_diff": settled_check["block_pos_diff"],
+            "settled_block_angle_diff": settled_check["block_angle_diff"],
+            "settled_trace": trace,
+        }
+
     result = {"success": success, "steps": elapsed, "replans": replans, "wall_time": time.time() - t_start,
               "init_block_pos_diff": init_block_pos_diff, "init_block_angle_diff": init_block_angle_diff,
               "init_agent_block_dist": init_agent_block_dist,
               "total_contacts": total_contacts,
               **{k: v for k, v in final_check.items() if k != "success"}}
+    if settle_info is not None:
+        result.update(settle_info)
     if log_planner_diagnostics:
         result["planner_diagnostics"] = planner_diagnostics
     if log_umf:
@@ -426,6 +466,17 @@ def main() -> None:
     parser.add_argument("--charts-dir", type=Path, default=atlas.OUT_DIR / "e0")
     parser.add_argument("--out-dir", type=Path, default=atlas.OUT_DIR / "e0_planning",
                          help="Where to write per-episode JSONL + summary JSON.")
+    parser.add_argument("--settle-steps", type=int, default=0,
+                         help="FABLE5 six-day plan Day 1.1 (criterion-validity check). Default 0 = "
+                              "byte-identical current behaviour. When >0: for EVERY episode, from "
+                              "wherever the episode left the env (right after a pass-through crossing, "
+                              "or at max_steps otherwise), step this many raw times with a zero "
+                              "(hold-position) action and re-check block_success. Records "
+                              "passthrough_success / success_at_step / settled_success / "
+                              "settled_block_pos_diff / settled_block_angle_diff / settled_trace "
+                              "(block_success at checkpoints 1/5/15/30/45/N). Isolates transient "
+                              "goal-window crossings under R2's gliding physics. No planning-loop "
+                              "decision changes; `success` / `block_pos_diff` keep pass-through semantics.")
     parser.add_argument("--log-planner-diagnostics", action="store_true",
                          help="Log CEM's per-iteration elite-cost mean/std (free -- already computed).")
     parser.add_argument("--no-log-umf", action="store_true",
@@ -581,7 +632,8 @@ def main() -> None:
                                       log_planner_diagnostics=args.log_planner_diagnostics,
                                       min_block_pos_diff=args.min_block_pos_diff,
                                       max_agent_block_dist=args.max_agent_block_dist,
-                                      world_model=model, log_umf=not args.no_log_umf)
+                                      world_model=model, log_umf=not args.no_log_umf,
+                                      settle_steps=args.settle_steps)
                 results.append(result)
                 f.write(json.dumps({"episode": ep, "kind": args.kind, "regime": args.regime,
                                      "regime_config": resolved_regime_cfg, **result}) + "\n")
@@ -597,6 +649,11 @@ def main() -> None:
 
     success_rate = sum(r["success"] for r in all_records) / len(all_records)
     mean_time = sum(r["wall_time"] for r in all_records) / len(all_records)
+    settled_records = [r for r in all_records if "settled_success" in r]
+    settled_success_rate = (
+        sum(r["settled_success"] for r in settled_records) / len(settled_records)
+        if settled_records else None
+    )
     # Peak GPU memory below reflects ONLY this process's own run (this
     # invocation's episodes, if any were run) -- torch's peak-memory-allocated
     # stat is process-local and can't retroactively recover a peak from an
@@ -621,6 +678,9 @@ def main() -> None:
         "num_act_stepped": args.num_act_stepped,
         "min_block_pos_diff": args.min_block_pos_diff, "max_agent_block_dist": args.max_agent_block_dist,
         "success_rate": success_rate, "mean_wall_time_s": mean_time, "peak_gpu_memory_gb": peak_mem_gb,
+        "settle_steps": args.settle_steps,
+        "settled_success_rate": settled_success_rate,
+        "settled_episodes_with_value": len(settled_records),
         "log_umf": not args.no_log_umf,
         "umf_mean_of_means": (sum(umf_means) / len(umf_means)) if umf_means else None,
         "umf_episodes_with_value": len(umf_means),

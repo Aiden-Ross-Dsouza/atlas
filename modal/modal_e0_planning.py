@@ -94,6 +94,8 @@ def run_e0_planning(
     # C2_FAILURE_DIAGNOSIS.md 3.2 test: proprio weight in the planner cost.
     # 0.1 = the substrate default, so every existing caller is unchanged.
     objective_alpha: float = 0.1,
+    # FABLE5 six-day plan Day 1.1: post-success settle tail. 0 = unchanged.
+    settle_steps: int = 0,
 ) -> None:
     """Defaults = the SUBSTRATE's own validated Push-T config (CEM 300x30,
     horizon 6, num_act_stepped 6 -> 30 raw steps/episode, 1 replan), the
@@ -147,6 +149,8 @@ def run_e0_planning(
         cmd += ["--regime-config", regime_config]
     if max_agent_block_dist is not None:
         cmd += ["--max-agent-block-dist", str(max_agent_block_dist)]
+    if settle_steps:
+        cmd += ["--settle-steps", str(settle_steps)]
     if log_planner_diagnostics:
         cmd.append("--log-planner-diagnostics")
     if not log_umf:
@@ -186,7 +190,7 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
           episode_start: int = 0, out_suffix: str = "", log_umf: bool = True,
           num_shards: int = 1,
           charts_root: str = "atlas_out", out_root: str = "atlas_out",
-          objective_alpha: float = 0.1) -> None:
+          objective_alpha: float = 0.1, settle_steps: int = 0) -> None:
     """num_shards > 1: splits [episode_start, episodes) into that many
     contiguous, near-equal ranges, launches each as its own CONCURRENT Modal
     container (via .spawn(), not sequential .remote() calls), waits for all
@@ -207,7 +211,7 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
             out_subdir=out_subdir, log_planner_diagnostics=log_planner_diagnostics,
             episode_start=episode_start, out_suffix=out_suffix, log_umf=log_umf,
             charts_root=charts_root, out_root=out_root,
-            objective_alpha=objective_alpha)
+            objective_alpha=objective_alpha, settle_steps=settle_steps)
         print(f"Spawned run_e0_planning as function call {call.object_id}. "
               f"Not waiting locally -- check `modal app logs` for progress/completion.")
         return
@@ -236,7 +240,7 @@ def main(kind: str = "ln_act", regime: str = "R1", regime_config: str | None = N
             log_planner_diagnostics=log_planner_diagnostics,
             episode_start=s, out_suffix=suffix, log_umf=log_umf,
             charts_root=charts_root, out_root=out_root,
-            objective_alpha=objective_alpha,
+            objective_alpha=objective_alpha, settle_steps=settle_steps,
         )
         for (s, e), suffix in zip(bounds, shard_suffixes)
     ]

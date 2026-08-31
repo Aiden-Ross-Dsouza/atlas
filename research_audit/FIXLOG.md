@@ -3435,6 +3435,226 @@ touched.
 
 ---
 
+### V3-20 — `--settle-steps` flag on `run_e0_planning.py` (FABLE5 six-day plan Day 1.1, criterion-validity check)
+
+**Date:** 2026-08-30. Authorised by `research_audit/DAY1_EXECUTION_PROMPT.md` ("You ARE
+authorised to: add the `--settle-steps` flag"). Additive only — the planning-loop
+decisions are untouched; only the post-success tail is extended.
+
+**Defect being probed (not a code bug — a measurement-validity gap):**
+`run_e0_planning.py::run_episode` evaluates `block_success` after every raw env step
+and `break`s immediately on the first crossing (`run_e0_planning.py:~331`). Under R2
+(`space.damping = 0.5`) the block glides, so a transient crossing counts as success
+even if the block would have sailed out of the 20 px window. `FABLE5_VALIDATION.md`
+§4.1 measures this as asymmetric in the frozen arm's favour (frozen successes fire at
+mean step 7.7 of 30 at nas=2, chart at 21.0 — the frozen arm leaves ~2× the unexecuted
+glide budget). This decides whether the paper's headline is "50%→5%" or something smaller.
+
+**Change (one file + its Modal wrapper, additive):**
+- `scripts/run_e0_planning.py`: new `--settle-steps N` (default **0** = byte-identical
+  prior behaviour). `run_episode` gains `settle_steps: int = 0`. On a pass-through
+  success, before breaking: step the env `N` more raw times with `base_env.step(np.zeros(2))`
+  (a zero action = "hold position" — `relative=True` default, `pusht_env.py:481-483`),
+  re-run `block_success`, and record `success_at_step`, `passthrough_success`,
+  `settled_success`, `settled_block_pos_diff`, `settled_block_angle_diff` in the episode
+  record. Summary JSON gains `settle_steps` / `settled_success_rate` /
+  `settled_episodes_with_value` (always present; `settled_success_rate` is `null` when
+  no settle data). When `settle_steps == 0`, **no** per-episode field is added.
+- `modal/modal_e0_planning.py`: `settle_steps` threaded through `run_e0_planning`, its
+  cmd builder (`--settle-steps` appended only when non-zero), the `main` entrypoint, and
+  both `.spawn()` paths.
+- `atlas/score.py`, `atlas/stats.py` unmodified.
+
+**FALSIFICATION (model-free where possible):**
+- BEFORE: `.venv/Scripts/python.exe scripts/run_e0_planning.py --kind baseline --regime R2
+  --settle-steps 15 --episodes 1` → `run_e0_planning.py: error: unrecognized arguments:
+  --settle-steps 15`, **exit 2**. Confirmed to fail.
+- AFTER (flag recognised): `--settle-steps` appears in `--help`.
+- AFTER (default byte-identity): a local smoke (`--kind baseline --regime R2
+  --regime-config '{"damping":0.5}' --num-samples 8 --iterations 2 --num-act-stepped 2`,
+  flag omitted) produced a per-episode record whose key set is **identical** to archived
+  `phase0_v3/c2_p0g_R2/ln_act_R2.jsonl`'s (`['block_angle_diff', 'block_pos_diff',
+  'episode', 'init_agent_block_dist', 'init_block_angle_diff', 'init_block_pos_diff',
+  'kind', 'regime', 'regime_config', 'replans', 'steps', 'success', 'total_contacts',
+  'umf_mean', 'umf_per_replan', 'wall_time']`). The 3 new summary-JSON keys are additive
+  and disclosed here, not silent.
+
+**Claims affected:** the C-2 headline SR (N1-adjacent / RQ0); `FABLE5_VALIDATION.md` §4.1.
+**Re-run needed:** yes — 4 settle-check arms (`c2_settle_{baseline,ln_act}_{nas2,nas6}`,
+20 paired episodes each, `--settle-steps 15`), launched + completed 2026-08-30 (detached, L4).
+**Verified by:** main session (BEFORE exit code + AFTER key-set diff run directly).
+
+**Result + CORRECTION (2026-08-31):** settled SR = 0/20 in all 4 arms (0 of 27
+pass-through successes survive a 15-step hold). The first write-up concluded "0/20 vs
+0/20 → no dissociation" — a **floor-effect error** (Opus review; re-derived here). On
+settled *distance* the dissociation **reverses**: nas=6 chart ends the block closer
+(all-20 64.0 vs 101.5 px, p=0.011; neither-succeeded subset 69.2 vs 131.5, 8/9,
+p=0.0078). nas=2 weak (cross-launch pairing unreliable at nas=2; clean subset n.s.).
+Full account: `FABLE5_DAY1_RESULTS.md` (correction block) + `EVIDENCE_LEDGER.md` row
+`C2-settle` + `scripts/c2_settle_analysis.py`. A follow-up re-run applying settle to
+*every* episode (not just successes) + a longer settle + an R0 control is drafted,
+pending approval.
+
+**Also this session (read-only, no production path):** `scripts/c2_threshold_sweep.py`
+— recomputes all 5 archived C-2 cells from raw JSONLs (every count reproduces
+`FABLE5_VALIDATION.md` §1.1), writes SR-vs-position-radius curves, final-distance ECDFs,
+and a paired-bootstrap CI on the chart/frozen sd-ratio. Result: sd-ratio CI excludes 1
+in every pool (headline 0.46 [0.28, 0.76]; nas6 0.51 [0.32, 0.75]; nas2-pool 0.64
+[0.48, 0.80]). SR-vs-radius curves cross at ~30 px at nas=6; at nas=2 the chart never
+reaches the frozen arm within [10, 60] px (the nas=2 inaction pathology, FIXLOG V3-19 §3).
+
+---
+
+### V3-21 — `--settle-steps` extended to every episode + `settled_trace` (FABLE5 Day 1.1 re-run, addresses the V3-20 correction)
+
+**Date:** 2026-08-31. Follows the V3-20 correction (floor-effect error) and the
+external-review recommendation to make the settled-distance comparison clean.
+
+**Change (`scripts/run_e0_planning.py`, additive):** when `--settle-steps N > 0`, the
+hold-position tail now runs for **every** episode (not only pass-through successes) —
+from wherever the episode left the env (right after a crossing, or at `max_steps`). New
+per-episode field `settled_trace` = `block_success` at checkpoints {1,5,15,30,45,N}∩[1,N]
+so settle-count sensitivity is answerable from one run. `passthrough_success` /
+`success_at_step` / `settled_success` / `settled_block_pos_diff` / `settled_block_angle_diff`
+now present on every episode when `N>0`. `success` and `block_pos_diff` unchanged
+(pass-through semantics). The in-loop settle block from V3-20 was moved after
+`replan_pbar.close()`, not modified — the success-path settle steps from the identical
+state (`info["state"]` right after the break). `modal/modal_e0_planning.py` already
+threads `settle_steps`; no wrapper change.
+
+**FALSIFICATION:**
+- BEFORE (archived V3-20 runs): `settled_block_pos_diff` present on exactly the N
+  successful episodes only — `c2_settle_baseline_nas2` 9 fields / 9 successes,
+  `c2_settle_ln_act_nas6` 5 / 5. Confirmed.
+- AFTER: local smoke (`--kind baseline --regime R2 --regime-config '{"damping":0.5}'
+  --episodes 3 --num-samples 8 --iterations 2 --num-act-stepped 2 --settle-steps 15`,
+  0 successes) → all 3 episodes carry `settled_block_pos_diff` + `settled_trace`
+  (steps [1,5,15]). `--settle-steps 0` still adds no per-episode field (unchanged).
+- AFTER bit-identity (pending, built into the re-run): re-running `c2_settle_baseline_nas6`
+  (deterministic at nas=6) must reproduce the archived 11 successful episodes'
+  `settled_block_pos_diff` exactly.
+
+**Re-run:** 5 arms launched + completed 2026-08-31 (L4, ~$1.9): `c2_settle2_{baseline,ln_act}_{nas2,nas6}`
++ `c2_settle2_R0_baseline_nas6` (R0 control). `--settle-steps 40`.
+**Verified by:** main session (BEFORE field-count on archived data + AFTER smoke, run directly).
+
+**Results (2026-08-31):**
+- **Falsification PASSED** — 11/11 successful episodes of `c2_settle2_baseline_nas6`
+  reproduce archived `c2_settle_baseline_nas6` `settled_block_pos_diff` exactly at the
+  `settled_trace` step-15 checkpoint. Refactor confirmed inert on the success path.
+- **R0 control PASSED** — baseline R0 nas=6: pass-through 19/20, settled 19/20. Real
+  successes survive the 40-step hold ⇒ the settle-check nukes crossings only where the
+  block is genuinely gliding (R2), not where it stops (R0).
+- **Settled distance** (clean, every episode): nas=2 chart 77.6 vs frozen 137.3 px,
+  Δ−59.8 [−84.9,−36.0], 17/20, **p=0.0002**; nas=6 Δ−27.8 [−58.5,+4.5], **p=0.064 n.s.**
+  Re-inverts the settle1 read (nas=2 now the significant cadence, not nas=6). Full
+  analysis in `FABLE5_DAY1_RESULTS.md` §1.1-R + `scripts/c2_settle2_analysis.py`.
+
+---
+
+### V3-22 — DEFECT FOUND, NOT FIXED: `run_e4.py` defaults to `nas=1`, which collapses UMF into its own ablation baseline
+
+**Date:** 2026-08-31. Found while re-examining whether E3+E4 should run before the
+Sept 5 deadline. **No code was changed** — E4 is deferred (see the E4 note below), so
+this is logged as a defect of record, not a fix.
+
+**Defect.** `scripts/run_e4.py:80` sets `CEM_NUM_ACT_STEPPED = 1` (comment at `:225-228`
+confirms the intent: "ONE model-step chunk when num_act_stepped=1"). Its inline
+justification cites `E0_RECOVERY_PLAN.md` P5, which **predates**
+`IMPLEMENTATION_PLAN_V3.md` §3.2. V3 §3.2 excludes `nas=1` on scientific, not budget,
+grounds, and §3.3's option table records option **D** (`nas=1`) as "Rejected — §3.2
+(UMF = e1)". The harness default is therefore stale relative to the adopted config
+(option E, `nas=2`).
+
+**Why it matters — verified at source this session, not taken from the plan:**
+
+```
+atlas/score.py:107    umf       = ||z_hat_0 - z_1||^2 / SUM_k ||z_k - z_0||^2
+atlas/router.py:167   _e1_score = ||z_hat_0 - z_1||^2
+```
+
+`score.py:78` sets `T = actions.shape[0]`. At `T = 1` the UMF denominator is a function
+of the **encoded observations only**, hence identical for every chart scored on a given
+chunk. So `argmin_c UMF(c) = argmin_c e1(c)` exactly. E4's `atlas` routing arm and its
+own pre-registered `e1` ablation baseline would select the same chart on every replan.
+RQ1 asks whether a multi-step normalised fitness score beats a one-step error; at
+`nas=1` that question has no content.
+
+**Failure class.** This is §7.1's named class — a parameter chosen for one purpose
+(fit 6 replans into a 30-raw-step episode) silently rendering a *different* mechanism
+inert. It is the same shape as B3 (motion gate calibrated at the wrong chunk size) and
+as the `m`-normaliser inertness at K=2.
+
+**The fix, when E4 is revived (one flag, do not apply now):** `run_e4.py:162` already
+exposes `--num-act-stepped`; pass `2`. That yields `30 // (2*5) = 3` replans/episode —
+exactly the >=3 the §3.1 invariant table requires for SCORE -> ROUTE -> REFINE -> SCORE,
+and V3's adopted option E. B3's fix already derives the motion gate from
+`FRAMESKIP * args.num_act_stepped`, so the gate recalibrates automatically. Cost at
+`nas=2` is **half** `nas=1`'s (3 replans vs 6). The stale default itself should be
+changed to `2` at that time, with the `E0_RECOVERY_PLAN.md` P5 comment updated to cite
+V3 §3.2.
+
+**Claims affected:** none. E4 has never produced an episode
+(`atlas_out/` contains no `e4` directory — re-confirmed 2026-08-31).
+
+**Verified by:** main session — read `run_e4.py:80,162,225-228`, `atlas/score.py:70-115`,
+`atlas/router.py:150-167`, `IMPLEMENTATION_PLAN_V3.md` §3.2 + §3.3 table directly.
+
+---
+
+### E4 DEFERRAL — the original kill premise is RETIRED; the decision stands on different grounds
+
+**Date:** 2026-08-31. Recorded here because the reasoning chain, not just the outcome,
+must survive to the archival version.
+
+**The premise that killed E4 is no longer true.** `FABLE5_VALIDATION.md` §6 retired
+E3+E4 on the argument: *"With a library whose only non-identity chart destroys control,
+the stream would demonstrate ATLAS < frozen."* That rests entirely on the C-2
+pass-through headline (chart 1/20 vs frozen 10/20). **The Day-1 settle-check reversed
+that finding** — on the settle-validated metric the chart is significantly *better*
+(nas=2 settled distance 77.6 vs 137.3 px, 17/20, p=0.0002; V3-21). The E4 decision was
+never reopened after the settle-check landed. **Any future session must not cite
+FABLE5_VALIDATION §6's stated reason as the reason.**
+
+**What is true about E4, as of this date:**
+- **Fully implemented and smoke-tested.** `scripts/run_e4.py` (401 lines), 7 arms;
+  `atlas/harness_e4.py` (525); `atlas/streams.py` S2 = R0 <-> R2 paired on regime-visit
+  slot (`seg_idx % 2`), which is the correct pairing for recall; `modal/modal_e4.py`
+  already fans out one container per (arm, seed_run) with a merge function. FIXLOG's
+  own B3/B4 entries record an end-to-end run: 12 episodes logged, summary written, no
+  traceback.
+- **Blocked on V3-22 above** (`nas=1` -> UMF = e1) until the flag is changed. One flag.
+- **Metric problem, real and cheap to fix.** `harness_e4.py:381-384` breaks on the first
+  `block_success` and records `block_pos_diff` at that instant — the pass-through
+  criterion the settle-check invalidated under R2. Every E4 quantity (plasticity,
+  retention, recall, forgetting) is a difference in it. Fix = port `--settle-steps` from
+  `run_e0_planning.py` (V3-20/21 pattern, already validated).
+- **Power is asymmetric, not absent.** Under R2 settled SR is 0/20 for both arms, so
+  E4's B-segments have no power on SR (settled *distance* would have to be pre-registered
+  as primary). Its A-segments are R0, where the frozen planner genuinely works (13/20 at
+  nas=2, 19/20 at nas=6, all successes settle-surviving) — so the
+  retention/forgetting half is measurable off the floor. G7 Group B's prediction-unit
+  hint for that effect is small (refine 0.168 vs full 0.163).
+
+**Why it is deferred anyway (the grounds that actually hold):**
+1. **Wall clock, not cost.** Sept 1-2 is fully committed to the damping ladder, the N=50
+   replication, and the damping-0.1 chart. E4 needs a metric port + smoke + launch +
+   analysis + a new results section: ~2 of 5 remaining days.
+2. **It would consume the adversarial pass (Day 4).** This project has shipped a
+   fabricated citation and a floor-effect statistical error, each caught by a review pass
+   that had time to run.
+3. **Underpowered as sizeable.** 4 arms x 6 segments x 10 episodes x 1 seed = n=10/cell,
+   single seed, in a project with documented cross-launch variance.
+4. **Wrong paper.** The draft is an evaluation-methodology paper; E4 is the ATLAS
+   continual-learning claim. Two papers in eight pages is penalised.
+
+**Status: DEFERRED to the archival version, not cancelled.** E4 at `nas=2`, with the
+settle metric ported, plus `damping=0.1` as the primary regime and a second environment,
+is the 2027 archival paper. Revive from this note, not from
+`FABLE5_VALIDATION.md` §6.
+
+---
+
 ## Deliberately NOT fixed
 
 Recorded so a future session does not "helpfully" fix them and invalidate the
