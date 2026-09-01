@@ -315,7 +315,10 @@ GOAL_TRAJ_LEN    = 31         (unchanged)
 | **R1** | `shape.friction`, agent **and** block shapes | **2.0** | tangential contact impulse; changes the rotation/translation split of a push | UMF ratio 1.67x; frozen SR −20pp |
 | **R2** | `space.damping` | **0.5** | post-contact glide; the block keeps travelling after the pusher leaves | UMF ratio 2.47x; frozen SR −40pp; systematic goal **overshoot** |
 
-Sources: `atlas/regimes.py:55–66`; calibration table `E0_RECOVERY_PLAN.md` §0.4–§0.5.
+Sources: `atlas/regimes.py:55–66`; calibration table `E0_RECOVERY_PLAN.md` §0.4–§0.5
+— **that file was deleted at commit f65f95a; recover with `git show f65f95a^:E0_RECOVERY_PLAN.md`**
+(FABLE5_VALIDATION.md §1.3). The regime-calibration numbers it holds (frozen R0 86.7% vs
+R2 46.7%, n=15, 2026-08-25 protocol; contact 38.5→13.3/episode) are cited from that git object.
 
 **Three dead axes, do not revisit.** `body.mass`/`body.moment` — cancels exactly against a kinematic
 pusher at any scale (`REGIME_DESIGN_REVIEW.md`, four independent confirmations). `shape.elasticity` —
@@ -340,10 +343,24 @@ moved", which is a different phenomenon than the one RQ2 is about.
 
 **Open, deliberately not closed here (§15-2):** the contact-count collapse under damping 0.5 (38.5 →
 13.3 per episode) is real but confounded, because it was measured under open-loop expert replay
-(`E0_RECOVERY_PLAN.md` §0.4). The C.3 collector re-measures it on-policy for free, and that
-measurement is the check — if the planner's contact count under R2 stays near R0's while replay's
-collapsed, the collapse was a collector artifact. If it does not, `damping=0.1` (the milder rung,
-already characterised) is the pre-registered fallback.
+(`E0_RECOVERY_PLAN.md` §0.4 — deleted, `git show f65f95a^:E0_RECOVERY_PLAN.md`). The C.3 collector
+re-measures it on-policy for free, and that measurement is the check — if the planner's contact count
+under R2 stays near R0's while replay's collapsed, the collapse was a collector artifact. If it does
+not, `damping=0.1` (the milder rung, already characterised) is the pre-registered fallback.
+
+**B-2 DECISION, 2026-08-31 (FABLE5 Day 1.8 — recorded, not deferred further):** the on-policy P0-G
+collector *did* re-measure contact under R2 = **4.5 contacts/trajectory** (`phase0_v3/p0g_onpolicy/`
+guard / `chunks_R2.jsonl`), well below R0's on-policy rate and *below* the confounded replay figure
+that triggered §15-2's concern — i.e. the collapse is **not** a pure collector artifact; it is real
+on-policy. Per the pre-registered rule the fallback `damping=0.1` should have been triggered. **It
+was not, and will not be** — rationale: (a) FABLE5 retired the routing/stream experiments that
+`damping` severity was being tuned *for*; (b) the C-2 result and the 1.1-R settle-check are both
+*about* R2's overshoot/glide behaviour, which `damping=0.5` produces and `0.1` would mute; (c)
+changing the regime now would orphan every C-1/C-2/settle number on disk. **The paper's limitations
+section must disclose:** R2 `damping=0.5` is a global extrapolation shift (all 18,685 training demos
+at `damping=0`), the on-policy contact rate under it is ~4.5/traj (low), the pre-registered
+contact-collapse fallback was measured as triggered and deliberately not applied, and the chart
+trained on that low-contact data plausibly feeds the compression/inaction behaviour reported.
 
 ---
 
@@ -674,6 +691,197 @@ column-normalised heatmap. Under C.3 this acquires a second, load-bearing purpos
 measurement of the on-policy/off-policy caveat that §5.2 states. Report it as such, not only as a
 reply to the "charts are judged on the selected chart's own data" objection.
 **Cost:** K² x ~10 chunk-generating episodes; ~$8 at K=3.
+
+---
+
+### 8.6 ADDENDUM 2026-08-30 — FABLE5 six-day plan (supersedes the E1/E2/E3+E4 launches above)
+
+V3-18/V3-19 (see `FIXLOG.md`) closed E0′'s RQ0 question in the negative and worse:
+the on-policy `ln_act`×R2 chart improves every mean-based statistic (held-out UMF
+−22.5%, CEM ρ 0.001→0.28, elite-set 124→57 px) while collapsing paired closed-loop
+threshold success (1/20 vs 10/20, McNemar p=0.0039). `research_audit/FABLE5_VALIDATION.md`
+(2026-08-30) is the blind-spot pass; `research_audit/FABLE5_SIX_DAY_PLAN.md` is the
+resulting Aug 30 → Sep 5 plan. **E1, E2, E3+E4, E5 as specified in §8.1–8.5 do NOT
+run** (rationale: `FABLE5_VALIDATION.md` §6 — every experiment presupposing UMF-selected
+charts carry competence is now uninterpretable). The Phase-0 freeze pipeline (§11.1
+τ/q/m/n_probe/K_max/σ_r/G7-asserting) also does **not** run (`FABLE5_SIX_DAY_PLAN.md` §1).
+
+**Day 1 experiments — pre-registered here before launch (2026-08-30):**
+
+- **1.1 Settle-check (criterion validity).** New additive `--settle-steps` flag on
+  `run_e0_planning.py` (FALSIFICATION in `FIXLOG.md`). On a pass-through success, hold
+  position N=15 raw steps with a zero action and re-check `block_success`. Runs: frozen
+  R2 it=10/nas=2, and both nas=6 arms (baseline + ln_act), 20 episodes, `--settle-steps 15`.
+  **Decision rule:** report both pass-through SR and settled SR. If the frozen arm's
+  settled SR is ≥2 episodes below its pass-through SR, criterion validity leads the
+  evaluation section and the abstract uses settled numbers (pass-through footnoted);
+  otherwise pass-through stands and this is a robustness confirmation.
+- **1.7 Headline at N=50 paired, fresh tasks (replication).** Episodes 20–49 (disjoint
+  from every existing cell), frozen + ln_act chart, R2 damping=0.5, it=10/nas=2 AND nas=6.
+  **Decision rule:** the 20–49 set must reproduce the *direction* (chart SR below frozen,
+  sd-ratio < 1) at both cadences. If it does not, **STOP and report** — that is a
+  seed-set-fragility finding and the paper pivots to it. Do NOT merge 20–49 into 0–19
+  and average it away.
+- **1.2 R0 anchor.** (a) frozen baseline R0 (no regime-config), it=10/nas=2, 20 eps;
+  (b) ln_act (the R2 chart) on R0, same protocol — cost of a false-positive route.
+  Purely descriptive anchors, no decision rule.
+- **1.3 Repeat the headline chart cell.** ln_act R2 damping=0.5, it=10/nas=2, 20 eps,
+  fresh launch. **Decision rule:** if it differs from the archived 1/20 by >2 successes,
+  single-launch variance becomes a stated limitation and the N=50 result is the headline.
+- **1.4 R0 UMF crosscheck (B-6).** Re-download `trajs_R0.pt`, score the P0-G chart and
+  frozen c₀ on R0's T=2 windows (mirror of `c2_widened_offline_umf.json`). Descriptive.
+
+Every run `--detach`, archived under `phase0_v3/`, ledgered in `EVIDENCE_LEDGER.md`
+the same day. Experiments freeze end of Day 4.
+
+**1.10 damping=0.1 milder-shift check — pre-registered 2026-08-31 (external review + user).**
+`DAY1_CADENCE_METRIC_ANALYSIS.md` §3: the R2 contact collapse (frozen 15.1/ep on R0 → 6.0 on R2,
+−60%; training data −74%) is dominated by the *regime*, not cadence or chart. §15-2's pre-registered
+contact-collapse fallback is `damping=0.1`, measured-triggered, never applied (B-2). Test whether a
+milder shift restores planner engagement and whether the prediction/control dissociation survives it.
+- **Runs:** frozen `c₀` at `--regime R2 --regime-config '{"damping": 0.1}'`, it=10, N=300, H=6,
+  `--settle-steps 40`, seeds 0–19, at **nas=2 and nas=6**. (`c2_settle2_dmp01_baseline_nas{2,6}`.)
+  Chart arm deferred — only run if the frozen arm shows restored engagement.
+- **Metrics reported:** contacts/episode, pass-through SR, **settled SR**, settled block-distance —
+  each vs the `damping=0.5` frozen arm (1.1-R) and the R0 frozen arm (1.2).
+- **Decision rule (pre-registered):**
+  (a) if frozen contacts at 0.1 are **≥ ~10/ep** (near R0's 15) AND settled SR **> 0** → engagement
+      is restored; `damping=0.1` becomes the regime the chart should be trained/evaluated in, and
+      the R2 (`0.5`) numbers are reported as "an over-severe shift" limitation.
+  (b) if frozen contacts stay **< ~7/ep** and settled SR **= 0** → the collapse is not a
+      severity artifact of `0.5` specifically; R2 as a family disengages the planner. Report
+      `damping=0.5` as-is with the collapse disclosed, and the milder-shift check as a negative
+      control that rules out the "we just picked too hard a number" objection.
+  (c) intermediate → report both, no regime change without explicit sign-off (§15).
+- **Cost:** ~$0.5 (2 × 20 episodes, L4).
+
+---
+
+**1.9 R0-chart control — pre-registered 2026-08-31 (user proposal; supported by external review).**
+The C-2 dissociation and 1.1-R "less destructive" reading are stated *for R2*. A reviewer will ask
+whether the on-policy-collect + L2-fine-tune recipe produces the same signature in *any* regime, or
+specifically under the R2 shift. Control: train `ln_act` on the P0-G **R0** on-policy trajectories
+(`phase0_v3/p0g_onpolicy_r0/trajs_R0.pt`, volume copy — same recipe/params as the R2 chart:
+N=300, it=10, nas=2, 100 trajs, steps 2000 + early stopping), evaluate held-out UMF and (conditionally)
+closed-loop control on R0 vs frozen c₀.
+- **Stage 1 (precursor, ~$1, launched):** `p0g_finetune --regime R0`, then offline widened-UMF on
+  R0 chunks (`scripts/c2_widen_offline_umf.py`, forward-only).
+- **Pre-registered gate:** if the R0-chart's held-out UMF improvement over c₀ is **< 5%**, the
+  control is **declared void** (c₀ already models R0 — its UMF there is 0.254 vs 0.627 on R2, so
+  little headroom exists) and **no closed-loop screen runs**. The 1.4 interpretation then stays
+  "specialisation vs no-headroom: undetermined" and the corresponding paper sentence is not written.
+- **Stage 2 (only if Stage-1 gate passes, ~$1):** R0-chart vs c₀, 20 paired episodes on R0,
+  it=10, nas=2 **and** nas=6 (mirror the settle protocol). Report settled block-distance Δ + the
+  neither-succeeded subset, same as 1.1-R. **Power note:** baseline R0 SR ≈ 95% (19/20), so SR is
+  ceiling-limited for detecting *benefit* — a null SR with a real UMF gain is the informative
+  outcome (it would show the recipe's compression signature is regime-general).
+
+---
+
+**1.1-R settle-check RE-RUN — pre-registered 2026-08-31 (after the V3-20 floor-effect
+correction; FIXLOG V3-20/V3-21).** The first settle-check found settled SR = 0/20 in
+all 4 arms and wrongly concluded "no dissociation" — a floor effect at the 20 px
+threshold. On settled *distance* the dissociation reverses (nas=6 chart 64.0 vs frozen
+101.5 px, p=0.011; neither-succeeded subset p=0.0078). This re-run makes the
+measurement clean.
+- **Code:** `--settle-steps` now applies to every episode + records `settled_trace`
+  (checkpoints 1/5/15/30/45/N). `--settle-steps 40`.
+- **Runs:** 5 arms, 20 episodes each — `c2_settle2_{baseline,ln_act}_{nas2,nas6}` (R2
+  `damping=0.5`, it=10) + `c2_settle2_R0_baseline_nas6` (R0 control, no regime-config).
+- **Primary metric:** paired Δ of the settled block-distance (Wilcoxon + bootstrap CI),
+  reported per cadence, with the neither-succeeded subset as the confound-free cut.
+  **Not** settled SR (floors). nas=6 is the headline cadence; nas=2 is secondary
+  (cross-launch reproducibility limitation, see 1.1-R non-determinism note).
+- **R0 control decision rule:** under R0, settled SR should ≈ pass-through SR (real
+  successes survive). If R0 settled SR also collapses, the settle mechanism itself is
+  suspect and the whole check is reconsidered before any settled number is published.
+- **Falsification built in:** `c2_settle2_baseline_nas6` must reproduce the archived
+  `c2_settle_baseline_nas6` 11 successful episodes' `settled_block_pos_diff` exactly
+  (nas=6 is deterministic).
+- **Cost:** ≈ $1.9 (L4).
+
+---
+
+### 8.7 ADDENDUM 2026-08-31 — FINAL FIVE-DAY PLAN Day 1 (supersedes the FABLE5 six-day experiment list)
+
+`research_audit/FINAL_FIVE_DAY_PLAN.md` is now the operative experiment plan (Aug 31 → Sep 5
+AoE). It retains every governance rule of §8.6. Day 1 launches, pre-registered here **before
+launch** (2026-08-31), all via `modal/modal_e0_planning.py::main`, `--detach`, on Modal
+profile `aiden-dsouza-201323`, archived under `phase0_v3/`, standing config `it=10, N=300,
+H=6, --settle-steps 40`, charts `--charts-root phase0_v3 --charts-subdir p0g_onpolicy`:
+
+- **1.B — R2 adapter screened at `damping=0.1` (cheap fallback for 1.A).** The existing
+  `p0g_onpolicy` `ln_act` R2 chart vs frozen `c₀` at `--regime R2 --regime-config
+  '{"damping":0.1}'`, nas=2 and nas=6, seeds 0–19. Frozen arm already on disk
+  (`c2_settle2_dmp01_baseline_nas{2,6}`, it=10/N=300/settle-40 — verified this session:
+  pass-through SR 0.55/0.70, settled 0.10/0.20). New: the chart arm only.
+  Artifact `phase0_v3/dmp01_transfer_ln_act_nas{2,6}/`.
+  **Decision rule:** report settled block-distance paired Δ (Wilcoxon + bootstrap CI) and
+  settled SR, chart vs frozen, per cadence. Caveat travels with any null: chart trained at
+  damping 0.5, tested at 0.1 → a null is ambiguous between "effect is severity-specific" and
+  "adapter is off-distribution." If 1.A lands, 1.A supersedes this; 1.B becomes a
+  transfer-robustness footnote.
+- **1.C — damping dose ladder (frozen `c₀` only).** `damping ∈ {0.05, 0.2, 0.3}` × nas ∈
+  {2,6}, seeds 0–19, settle-40. 6 new cells. Artifact
+  `phase0_v3/ladder_dmp{005,02,03}_baseline_nas{2,6}/`.
+  **Decision rule (H1):** the claim is **monotone divergence** — pass-through SR falls more
+  slowly than settled SR as damping rises. If the two fall together at some intermediate
+  damping, report it verbatim ("criterion valid in a band, fails outside it"). **Do not drop
+  points.** Also recompute coast (residual momentum) at each new damping for H6.
+- **1.D — N=50 replication on disjoint tasks.** `--episode-start 20 --episodes 50` (tasks
+  20–49, disjoint from every existing cell), frozen + `ln_act` chart, R2 `damping=0.5`, nas=2
+  and nas=6, settle-40. Artifact `phase0_v3/n50_{baseline,ln_act}_nas{2,6}_ep20-49/`.
+  **Pre-registered replication target:** settled block-distance at nas=2 (chart < frozen).
+  **Decision rule:** if the direction replicates on 20–49, merge and report paired n=50,
+  disclosing the two-launch structure. If not, **report both sets separately** and §4's claim
+  weakens to "significant in one of two task sets." **Do not average it away.** §3 (H1–H3) is
+  frozen-baseline-only and unaffected.
+- **1.A — `damping=0.1` on-policy chart collection (longest pole).** `modal_phase0.py` P0-G
+  collector at `damping=0.1`, same recipe as the R2 collection (100 train / 8 val / 8 test,
+  CEM 300×10 nas=2, `_determinism.py` active, `total_contacts>0` filter OFF).
+  Artifact `phase0_v3/p0g_onpolicy_dmp01/`. **Hard abort:** if the chart is not trained AND
+  screened by EOD Day 2, drop it — 1.B is the guaranteed fallback.
+
+**1.E (`--no-early-stop` flag) is CUT** — not deprioritised. Reasons recorded in the plan §1.E:
+redundant with 1.G.2's matched-compute subset, measures a protocol nobody deploys, and early
+termination is the phenomenon (1.G.5), not a confound. No code change to a protected file
+(`atlas/score.py::umf`, `atlas/stats.py` existing fns, the planning loop) is in scope.
+
+**THE ONE RULE:** experiments freeze at EOD Day 2 (Sept 1). Days 3–5 are writing and checking.
+
+---
+
+### 8.8 ADDENDUM 2026-09-01 — FINAL FIVE-DAY REVISION-2 launches (pre-registered before launch)
+
+Per `FINAL_FIVE_DAY_PLAN.md` REVISION 2 §R2.2. All on Modal profile
+`aiden-dsouza-201323` (`MODAL_PROFILE` pinned per command), `--detach`, archived under
+`phase0_v3/`, standing config `it=10, N=300, H=6, --settle-steps 40`, charts
+`--charts-root phase0_v3 --charts-subdir p0g_onpolicy --out-root phase0_v3`.
+
+- **A — controller-family rank inversion.** 8 new planning cells, R2 `damping=0.5`, N=300,
+  H=6, **nas=2**, `--settle-steps 40`, seeds 0–19, `--kind {baseline,ln_act}`:
+  `--iterations ∈ {1,3,30}` (6 cells) + `--objective-alpha 0` (2 cells, `--iterations 10`).
+  With `it=10/nas=2` and `it=10/nas=6` already on disk (`c2_settle2_*`) this makes **12
+  controllers**. Artifacts `phase0_v3/fam_it{1,3,30}_{baseline,ln_act}_nas2/`,
+  `phase0_v3/fam_alpha0_{baseline,ln_act}_nas2/`. **No code change** — `--iterations`,
+  `--objective-alpha`, `--num-act-stepped` are all live flags (Modal wrapper params exist).
+  **Pre-registered decision rule:** rank all 12 controllers by (i) pass-through SR and (ii)
+  mean settled block-distance; report **Kendall τ between the two orderings with a
+  permutation CI**, and the per-pair inversions. τ near 0/negative → the two criteria induce
+  systematically different orderings over a controller family (§4 upgrades from anecdote to
+  measurement). τ near 1 → the criteria largely agree and the inversions are confined to
+  pairs differing in outcome variance (makes H7 the precise scope condition). **Both branches
+  are reported as-is.**
+- **B — n=100 on the headline.** `--kind {baseline,ln_act} --regime R2 --regime-config
+  '{"damping":0.5}' --episode-start 50 --episodes 100` (⇒ 50 episodes, tasks 50–99, disjoint
+  from 0–19 and 20–49), **nas=2 only**. Artifact `phase0_v3/n100_{baseline,ln_act}_nas2_ep50-99/`.
+  **Pre-registered decision rule:** report the three task sets (0–19, 20–49, 50–99)
+  **separately and merged (paired n=100)**, whatever they show. Primary metric = paired settled
+  block-distance (Wilcoxon + bootstrap CI), and the neither-**pass-through**-succeeded clean
+  subset (R2.0-a convention). If 50–99 does **not** replicate the direction (chart settled
+  distance < frozen), §4 weakens to "significant in two of three task sets" and task-set
+  variance becomes a stated limitation — **do not average it away**. §3 (H1–H3) is
+  frozen-baseline-only and unaffected either way.
 
 ---
 

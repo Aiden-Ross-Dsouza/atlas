@@ -3667,3 +3667,45 @@ archive.
 | `scripts/run_e0_planning.py`'s planning loop | Produced every planning-success number on disk. |
 | `atlas_out/e0/results.json`, `e0_pre_regime_fix_2026-08-22/` | Record `params=26/12/69` (parameter *group* counts, an older bug). Historical and already superseded — left as the archive of what was actually run. |
 | The `full` × R1 chart | Never trained; a prior explicit decision not to. Its absence means the pre-registered "≥90% of full's gain" rule is *undefined* for R1, which must be reported as such, not as "not met". |
+
+---
+
+### V3-23 — DEFECT OF RECORD, NOT FIXED: `PushTEnv(block_cog=)` and `shape=` are inert; FABLE5 REVISION-2 item E abandoned per its own gate
+
+**Date:** 2026-09-01. Item E (momentum negative control) needed a **momentum-free dynamics
+shift**: `PushTEnv` T-block centre-of-gravity offset at `damping=0`, so the world model
+mispredicts but the block still stops dead.
+
+**Change made and REVERTED:** an additive `--block-cog "x,y"` flag was added to
+`scripts/run_e0_planning.py` (argparse + `PushTEnv(block_cog=...)` at the env-construction line
++ conditional per-episode/summary `block_cog` field) and mirrored in
+`modal/modal_e0_planning.py`. **Falsification passed:** BEFORE `--block-cog` → `exit 2`
+(unrecognized); AFTER, a no-flag run's per-episode record key-set is byte-identical to archived
+`phase0_v3/c2_settle2_R0_baseline_nas2` and the `block_cog` field appears only when the flag is
+passed. Both files then `git checkout`-reverted (verified `py_compile` clean) — **no ATLAS or
+substrate code is changed by this entry.**
+
+**Defect.** `pymunk.Body.center_of_gravity` set at runtime (which is what
+`PushTEnv.reset()` does: `self.block.center_of_gravity = self.block_cog`) is **inert unless
+`Body.moment` is also recomputed about the new CoG.** Verified directly: reset the env with
+`block_cog ∈ {None, (0,110), (40,45)}`, apply identical push actions for 25 steps → **byte-
+identical block trajectories** (end pose 349.0/231.0/−2.54 in all three). `shape ∈
+{I,L,Z,square,small_tee}` likewise produces no trajectory change (the `shape` arg does not
+re-route `_setup`'s `add_tee` in the code path exercised here). Setting `block.moment` alongside
+`center_of_gravity` **does** move the block — so a real CoG shift needs
+`pymunk.moment_for_poly(mass, verts, offset=-cog)` summed over the two T-sub-shapes, plus a
+G4-style reality check that the shift is genuine and momentum-free.
+
+**Failure class:** identical to the R1 mass bug (`REGIME_DESIGN_REVIEW.md`) — a physics knob
+that is algebraically inert in this pymunk setup, discovered only by a direct
+apply-identical-actions test.
+
+**Decision:** **item E abandoned per its own pre-registered gate** ("if the flag's falsification
+smoke is not clean within 90 minutes, abandon E — it is upside, not a dependency"). The
+momentum mechanism is instead established by **item C** (`N14-coast-model`): the closed-form
+free-coast integral of `space.damping`, which derives the settled-SR collapse and predicts it
+to ±1 episode — a stronger form of the same argument.
+
+**Claims affected:** none. No E artifact was ever produced.
+**Verified by:** main session — BEFORE/AFTER falsification run directly; the inertness
+demonstrated with a standalone `PushTEnv` apply-identical-actions script.
